@@ -44,6 +44,23 @@
  */
 #define STATUS_CAPACITY_EXCEEDED (-2)
 
+/*
+ * Returned when an export is called with arguments it cannot honour: a bulk
+ * count past BULK_CAPACITY, or a staging pointer this module does not own.
+ *
+ * Distinct from STATUS_CAPACITY_EXCEEDED, which describes a well-formed
+ * request the table has no room for. Nothing is applied, so the table is
+ * left exactly as it was.
+ */
+#define STATUS_INVALID_ARGUMENT (-3)
+
+/*
+ * delete_many() reports how many keys it removed, so it has no room for a
+ * negative status. A removal count can never exceed BULK_CAPACITY, which
+ * makes UINT32_MAX unambiguous as a failure sentinel.
+ */
+#define DELETE_MANY_FAILED 0xffffffffu
+
 /* Control values scanned per SIMD probe; also the probe stride. */
 #define GROUP_WIDTH 16u
 
@@ -65,6 +82,23 @@
  * almost always resolves a lookup in its first iteration.
  */
 #define MAX_LIVE(capacity) (((capacity) * 7u) >> 3)
+
+/*
+ * Live-entry share above which spent growth is reclaimed by doubling rather
+ * than by compacting in place, as 25/32 (78.125%).
+ *
+ * Below the line a rehash at the same capacity recovers enough tombstoned
+ * slots to be worth the scan. At or above it there are too few tombstones
+ * left to recover: compacting at the 7/8 load factor hands back a single
+ * slot, so the very next insert rehashes again and steady-state churn — a
+ * cache evicting as fast as it fills — degrades to a full table scan per
+ * insert. Abseil's raw_hash_set draws the line in the same place.
+ *
+ * Kept in 64 bits so both products stay exact however far MAX_CAPACITY is
+ * raised; at today's ceiling they still fit a uint32_t.
+ */
+#define SHOULD_GROW(size, capacity) \
+  ((uint64_t)(size) * 32u > (uint64_t)(capacity) * 25u)
 
 /*
  * Key and both value lanes share one 12-byte record.
@@ -134,6 +168,28 @@ static uint32_t g_bulk_keys[BULK_CAPACITY];
 static uint32_t g_bulk_vals_lo[BULK_CAPACITY];
 static uint32_t g_bulk_vals_hi[BULK_CAPACITY];
 static uint8_t  g_bulk_flags[BULK_CAPACITY];
+
+/*
+ * True when `ptr` is the address of the staging buffer it is meant to be.
+ *
+ * The bulk exports take addresses, which makes every one of them a write
+ * primitive aimed anywhere in linear memory unless it is checked. There is
+ * no range to check against: the only legitimate value for each argument is
+ * the single buffer below, whose address the caller obtained from this
+ * module in the first place. So the test is equality, not containment.
+ *
+ * This has to live here rather than in the JavaScript binding. The binding
+ * is one caller among however many hold the instance, and an exported
+ * function is reachable by all of them.
+ */
+static inline uint32_t is_bulk_ptr(uint32_t ptr, const void *buffer) {
+  return ptr == (uint32_t)(uintptr_t)buffer;
+}
+
+/* True when a bulk batch fits the staging buffers. */
+static inline uint32_t bulk_count_ok(uint32_t count) {
+  return count <= BULK_CAPACITY;
+}
 
 /*
  * Freestanding builds have no libc, but clang still lowers bulk stores to
@@ -241,8 +297,20 @@ static void initialize_bank(uint32_t bank, uint32_t capacity) {
  *
  * Probing is quadratic over whole groups: the visited group indices are the
  * triangular numbers modulo the group count, which for a power-of-two
- * capacity enumerates every group exactly once before repeating. So the
- * loop terminates even on a table with no EMPTY slot left.
+ * capacity enumerates every group exactly once before repeating.
+ *
+ * Enumerating every group is not the same as leaving the loop: the only
+ * exits are a key match and an EMPTY byte, so a control array holding
+ * neither would spin forever, and WebAssembly has no interrupt to break out
+ * with — the calling thread would be wedged for good. g_growth_left keeps at
+ * least capacity/8 slots EMPTY, which makes that state unreachable, but the
+ * sequence is bounded anyway.
+ *
+ * The bound rides on `step` rather than a separate counter. `step` advances
+ * by GROUP_WIDTH per group, so after k groups it holds (k + 1) * GROUP_WIDTH
+ * and passes `capacity` exactly once the whole sequence has been walked.
+ * Reusing a value already live costs nothing measurable: an interleaved A/B
+ * against an unbounded build put the difference inside run-to-run noise.
  *
  * A group containing an EMPTY slot ends the search: an insert would have
  * stopped there, so the key cannot lie further along the sequence. Note
@@ -278,6 +346,7 @@ static uint32_t find_slot(
 
     position = (position + step) & mask;
     step += GROUP_WIDTH;
+    if (step > mask + 1u) return UINT32_MAX;
   }
 }
 
@@ -290,6 +359,10 @@ static uint32_t find_slot(
  * live duplicate further along the same probe sequence.
  *
  * Terminates because g_growth_left keeps at least capacity/8 slots EMPTY.
+ * The probe sequence is bounded anyway, the same way find_slot bounds its
+ * own. If that invariant ever stops holding, the first tombstone is the only
+ * slot left to take, and taking it is sound: the caller has already
+ * established that the key is absent.
  */
 static uint32_t find_insert_slot(uint32_t bank, uint32_t mask, uint32_t hash) {
   const uint8_t *control = g_ctrl[bank];
@@ -315,6 +388,7 @@ static uint32_t find_insert_slot(uint32_t bank, uint32_t mask, uint32_t hash) {
 
     position = (position + step) & mask;
     step += GROUP_WIDTH;
+    if (step > mask + 1u) return first_deleted;
   }
 }
 
@@ -398,9 +472,15 @@ static int32_t ensure_insert_space(void) {
 
   uint32_t next_capacity = g_capacity;
 
-  if (g_size >= MAX_LIVE(g_capacity)) {
-    if (g_capacity >= MAX_CAPACITY) return STATUS_CAPACITY_EXCEEDED;
+  if (SHOULD_GROW(g_size, g_capacity) && g_capacity < MAX_CAPACITY) {
     next_capacity = g_capacity << 1u;
+  } else if (g_size >= MAX_LIVE(g_capacity)) {
+    /*
+     * Only the load factor decides that the table is full, so the ceiling
+     * stays MAX_LIVE(MAX_CAPACITY) entries. A table already at MAX_CAPACITY
+     * cannot grow, and falls through to an in-place compaction instead.
+     */
+    return STATUS_CAPACITY_EXCEEDED;
   }
 
   return rehash(next_capacity);
@@ -432,6 +512,14 @@ static int32_t set_one(uint32_t key, uint32_t lo, uint32_t hi) {
   if (space_status != STATUS_OK) return space_status;
 
   const uint32_t slot = find_insert_slot(g_active_bank, g_mask, hash);
+
+  /*
+   * find_insert_slot() reports UINT32_MAX only if it walked the whole probe
+   * sequence without seeing an EMPTY or a DELETED slot, which g_growth_left
+   * makes unreachable. Refusing the insert is what keeps that sentinel from
+   * being used as a slot index if the invariant ever breaks.
+   */
+  if (slot == UINT32_MAX) return STATUS_CAPACITY_EXCEEDED;
 
   /* Reusing a tombstone consumes no growth: the slot was already spent. */
   if (g_ctrl[g_active_bank][slot] == CTRL_EMPTY) g_growth_left--;
@@ -579,6 +667,15 @@ int32_t set_many(
   uint32_t vals_hi_ptr,
   uint32_t count
 ) {
+  if (
+    !bulk_count_ok(count) ||
+    !is_bulk_ptr(keys_ptr, g_bulk_keys) ||
+    !is_bulk_ptr(vals_lo_ptr, g_bulk_vals_lo) ||
+    !is_bulk_ptr(vals_hi_ptr, g_bulk_vals_hi)
+  ) {
+    return STATUS_INVALID_ARGUMENT;
+  }
+
   const uint32_t *keys = (const uint32_t *)(uintptr_t)keys_ptr;
   const uint32_t *los = (const uint32_t *)(uintptr_t)vals_lo_ptr;
   const uint32_t *his = (const uint32_t *)(uintptr_t)vals_hi_ptr;
@@ -614,13 +711,23 @@ int32_t set_many(
  * from a previous batch.
  */
 __attribute__((export_name("get_many")))
-void get_many(
+int32_t get_many(
   uint32_t keys_ptr,
   uint32_t vals_lo_ptr,
   uint32_t vals_hi_ptr,
   uint32_t found_ptr,
   uint32_t count
 ) {
+  if (
+    !bulk_count_ok(count) ||
+    !is_bulk_ptr(keys_ptr, g_bulk_keys) ||
+    !is_bulk_ptr(vals_lo_ptr, g_bulk_vals_lo) ||
+    !is_bulk_ptr(vals_hi_ptr, g_bulk_vals_hi) ||
+    !is_bulk_ptr(found_ptr, g_bulk_flags)
+  ) {
+    return STATUS_INVALID_ARGUMENT;
+  }
+
   const uint32_t *keys = (const uint32_t *)(uintptr_t)keys_ptr;
   uint32_t *los = (uint32_t *)(uintptr_t)vals_lo_ptr;
   uint32_t *his = (uint32_t *)(uintptr_t)vals_hi_ptr;
@@ -630,7 +737,7 @@ void get_many(
     for (uint32_t i = 0; i < count; i++) {
       los[i] = 0; his[i] = 0; found[i] = 0;
     }
-    return;
+    return STATUS_OK;
   }
 
   for (uint32_t i = 0; i < count; i++) {
@@ -646,6 +753,8 @@ void get_many(
       found[i] = 1;
     }
   }
+
+  return STATUS_OK;
 }
 
 /*
@@ -661,6 +770,14 @@ uint32_t delete_many(
   uint32_t deleted_ptr,
   uint32_t count
 ) {
+  if (
+    !bulk_count_ok(count) ||
+    !is_bulk_ptr(keys_ptr, g_bulk_keys) ||
+    !is_bulk_ptr(deleted_ptr, g_bulk_flags)
+  ) {
+    return DELETE_MANY_FAILED;
+  }
+
   const uint32_t *keys = (const uint32_t *)(uintptr_t)keys_ptr;
   uint8_t *deleted = (uint8_t *)(uintptr_t)deleted_ptr;
   uint32_t removed = 0;

@@ -51,6 +51,23 @@
 #define MAX_LIVE(capacity) (((capacity) * 7u) >> 3)
 
 /*
+ * Live-entry share above which spent growth is reclaimed by doubling rather
+ * than by compacting in place, as 25/32 (78.125%).
+ *
+ * Below the line a rehash at the same capacity recovers enough tombstoned
+ * slots to be worth the scan. At or above it there are too few tombstones
+ * left to recover: compacting at the 7/8 load factor hands back a single
+ * slot, so the very next insert rehashes again and steady-state churn — a
+ * cache evicting as fast as it fills — degrades to a full table scan per
+ * insert. Abseil's raw_hash_set draws the line in the same place.
+ *
+ * Kept in 64 bits so both products stay exact however far MAX_CAPACITY is
+ * raised; at today's ceiling they still fit a uint32_t.
+ */
+#define SHOULD_GROW(size, capacity) \
+  ((uint64_t)(size) * 32u > (uint64_t)(capacity) * 25u)
+
+/*
  * Key and value share one 8-byte record.
  *
  * A lookup is a chain of dependent loads: control byte, then the key to
@@ -210,8 +227,20 @@ static void initialize_bank(uint32_t bank, uint32_t capacity) {
  *
  * Probing is quadratic over whole groups: the visited group indices are the
  * triangular numbers modulo the group count, which for a power-of-two
- * capacity enumerates every group exactly once before repeating. So the
- * loop terminates even on a table with no EMPTY slot left.
+ * capacity enumerates every group exactly once before repeating.
+ *
+ * Enumerating every group is not the same as leaving the loop: the only
+ * exits are a key match and an EMPTY byte, so a control array holding
+ * neither would spin forever, and WebAssembly has no interrupt to break out
+ * with — the calling thread would be wedged for good. g_growth_left keeps at
+ * least capacity/8 slots EMPTY, which makes that state unreachable, but the
+ * sequence is bounded anyway.
+ *
+ * The bound rides on `step` rather than a separate counter. `step` advances
+ * by GROUP_WIDTH per group, so after k groups it holds (k + 1) * GROUP_WIDTH
+ * and passes `capacity` exactly once the whole sequence has been walked.
+ * Reusing a value already live costs nothing measurable: an interleaved A/B
+ * against an unbounded build put the difference inside run-to-run noise.
  *
  * A group containing an EMPTY slot ends the search: an insert would have
  * stopped there, so the key cannot lie further along the sequence. Note
@@ -247,6 +276,7 @@ static uint32_t find_slot(
 
     position = (position + step) & mask;
     step += GROUP_WIDTH;
+    if (step > mask + 1u) return UINT32_MAX;
   }
 }
 
@@ -259,6 +289,10 @@ static uint32_t find_slot(
  * live duplicate further along the same probe sequence.
  *
  * Terminates because g_growth_left keeps at least capacity/8 slots EMPTY.
+ * The probe sequence is bounded anyway, the same way find_slot bounds its
+ * own. If that invariant ever stops holding, the first tombstone is the only
+ * slot left to take, and taking it is sound: the caller has already
+ * established that the key is absent.
  */
 static uint32_t find_insert_slot(uint32_t bank, uint32_t mask, uint32_t hash) {
   const uint8_t *control = g_ctrl[bank];
@@ -284,6 +318,7 @@ static uint32_t find_insert_slot(uint32_t bank, uint32_t mask, uint32_t hash) {
 
     position = (position + step) & mask;
     step += GROUP_WIDTH;
+    if (step > mask + 1u) return first_deleted;
   }
 }
 
@@ -364,9 +399,15 @@ static int32_t ensure_insert_space(void) {
 
   uint32_t next_capacity = g_capacity;
 
-  if (g_size >= MAX_LIVE(g_capacity)) {
-    if (g_capacity >= MAX_CAPACITY) return STATUS_CAPACITY_EXCEEDED;
+  if (SHOULD_GROW(g_size, g_capacity) && g_capacity < MAX_CAPACITY) {
     next_capacity = g_capacity << 1u;
+  } else if (g_size >= MAX_LIVE(g_capacity)) {
+    /*
+     * Only the load factor decides that the table is full, so the ceiling
+     * stays MAX_LIVE(MAX_CAPACITY) entries. A table already at MAX_CAPACITY
+     * cannot grow, and falls through to an in-place compaction instead.
+     */
+    return STATUS_CAPACITY_EXCEEDED;
   }
 
   return rehash(next_capacity);
@@ -483,6 +524,14 @@ int32_t set(uint32_t key, uint32_t value) {
   if (space_status != STATUS_OK) return space_status;
 
   const uint32_t slot = find_insert_slot(g_active_bank, g_mask, hash);
+
+  /*
+   * find_insert_slot() reports UINT32_MAX only if it walked the whole probe
+   * sequence without seeing an EMPTY or a DELETED slot, which g_growth_left
+   * makes unreachable. Refusing the insert is what keeps that sentinel from
+   * being used as a slot index if the invariant ever breaks.
+   */
+  if (slot == UINT32_MAX) return STATUS_CAPACITY_EXCEEDED;
 
   /* Reusing a tombstone consumes no growth: the slot was already spent. */
   if (g_ctrl[g_active_bank][slot] == CTRL_EMPTY) g_growth_left--;

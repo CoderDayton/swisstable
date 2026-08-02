@@ -9,35 +9,116 @@ import {
 } from "../src/index.ts";
 
 describe("bulk argument types", () => {
-  // TypeScript rejects these statically -- hence the casts. The guards exist
-  // for JavaScript callers and for `any` paths, where every typed array has
-  // subarray and length, so the wrong element type would otherwise be copied
-  // into the staging buffer and reinterpreted: wrong answers, not an error.
-  test("rejects a typed array of the wrong element type", async () => {
+  // Every accepted source has to agree on what a key means, whatever its
+  // element type: the value is taken as a 32-bit integer, and a negative one
+  // is its unsigned bit pattern.
+  test("every numeric source addresses the same keys", async () => {
     const table = await SwissU32ToU64.create(100);
-    table.set(1, 111, 0);
+    const zeros = new Uint32Array(3);
 
-    expect(() => table.getMany(new Int32Array([1]) as never)).toThrow(TypeError);
-    expect(() => table.getMany(new Float64Array([1]) as never)).toThrow(TypeError);
-    expect(() => table.deleteMany(new Int32Array([1]) as never)).toThrow(TypeError);
-    expect(() =>
-      table.setMany(
-        new Int32Array([1]) as never,
-        new Uint32Array([1]),
-        new Uint32Array([1]),
-      ),
-    ).toThrow(TypeError);
+    table.setMany(new Uint32Array([1, 2, 3]), new Uint32Array([10, 20, 30]), zeros);
+
+    const expected = [10, 20, 30];
+    const sources = [
+      new Uint32Array([1, 2, 3]),
+      new Int32Array([1, 2, 3]),
+      new Uint16Array([1, 2, 3]),
+      new Int16Array([1, 2, 3]),
+      new Uint8Array([1, 2, 3]),
+      new Uint8ClampedArray([1, 2, 3]),
+      new Int8Array([1, 2, 3]),
+      new Float64Array([1, 2, 3]),
+      new Float32Array([1, 2, 3]),
+      new BigUint64Array([1n, 2n, 3n]),
+      new BigInt64Array([1n, 2n, 3n]),
+      [1, 2, 3],
+      [1n, 2n, 3n],
+    ] as const;
+
+    for (const source of sources) {
+      const got = table.getMany(source);
+      expect(Array.from(got.valsLo)).toEqual(expected);
+      expect(Array.from(got.found)).toEqual([1, 1, 1]);
+    }
   });
 
-  test("rejects plain arrays and nullish arguments by name", async () => {
+  // -1 as int32 is the same 32 bits as 4294967295 as uint32.
+  test("negative values are their unsigned bit pattern", async () => {
     const table = await SwissU32ToU64.create(100);
 
-    expect(() => table.getMany([1, 2] as never)).toThrow("keys must be a Uint32Array");
+    table.setMany(new Int32Array([-1, -2147483648]), new Uint32Array([7, 8]), new Uint32Array(2));
+
+    expect(table.get(0xffff_ffff)).toEqual({ lo: 7, hi: 0 });
+    expect(table.get(0x8000_0000)).toEqual({ lo: 8, hi: 0 });
+
+    expect(Array.from(table.getMany([-1, -2147483648]).valsLo)).toEqual([7, 8]);
+    expect(table.deleteMany(new Float64Array([-1])).removedCount).toBe(1);
+  });
+
+  // The lossy conversions a bulk `set` would have performed silently.
+  test("rejects elements that are not 32-bit integers", async () => {
+    const table = await SwissU32ToU64.create(100);
+
+    expect(() => table.getMany(new Float64Array([1.5]))).toThrow("keys[0]");
+    expect(() => table.getMany(new Float64Array([2 ** 32]))).toThrow(RangeError);
+    expect(() => table.getMany(new Float64Array([-(2 ** 31) - 1]))).toThrow(RangeError);
+    expect(() => table.getMany([1, 2.5])).toThrow("keys[1]");
+    expect(() => table.getMany([1, Number.NaN])).toThrow(RangeError);
+    expect(() => table.getMany(new BigInt64Array([2n ** 32n]))).toThrow(RangeError);
+    expect(() => table.getMany([1, "2"] as never)).toThrow("keys[1] must be a number");
+  });
+
+  // A float32 has 24 mantissa bits, so the element the table would have seen
+  // is not the one the caller wrote — and the rounded stand-in is itself a
+  // valid key, which is what makes accepting it dangerous.
+  test("rejects Float32Array elements past its exact integer range", async () => {
+    const table = await SwissU32ToU64.create(100);
+
+    expect(new Float32Array([2 ** 24 + 2])[0]).toBe(2 ** 24 + 2);
+
+    expect(() => table.getMany(new Float32Array([2 ** 24 + 2]))).toThrow(RangeError);
+    expect(() => table.getMany(new Float32Array([2 ** 32 - 1]))).toThrow("keys[0]");
+    expect(() => table.getMany(new Float32Array([-(2 ** 24) - 2]))).toThrow(RangeError);
+
+    // The exactly representable range still works, negatives included.
+    expect(() => table.getMany(new Float32Array([2 ** 24, -1, 0]))).not.toThrow();
+
+    // 2**24 + 1 is the one value the check cannot catch: it rounds *into* the
+    // exact range, arriving indistinguishable from a genuine 2**24.
+    expect(new Float32Array([2 ** 24 + 1])[0]).toBe(2 ** 24);
+  });
+
+  // The whole batch is checked before the first chunk is written, so where
+  // the bad element sits does not change what the table ends up holding.
+  test("a rejected element past maxBatch applies nothing", async () => {
+    const table = await SwissU32ToU64.create(100);
+    const total = table.maxBatch + 1;
+
+    const keys: number[] = Array.from({ length: total }, (_, i) => i);
+    keys[total - 1] = 1.5;
+
+    expect(() =>
+      table.setMany(keys, new Uint32Array(total), new Uint32Array(total)),
+    ).toThrow(`keys[${total - 1}]`);
+    expect(table.size).toBe(0);
+
+    table.setMany(new Uint32Array([1]), new Uint32Array([7]), new Uint32Array(1));
+
+    expect(() => table.deleteMany(keys)).toThrow(RangeError);
+    expect(table.size).toBe(1);
+  });
+
+  test("rejects unsupported sequences by name", async () => {
+    const table = await SwissU32ToU64.create(100);
+
     expect(() => table.getMany(undefined as never)).toThrow(TypeError);
     expect(() => table.deleteMany(null as never)).toThrow(TypeError);
+    expect(() => table.getMany({ length: 2 } as never)).toThrow(
+      "keys must be an array or typed array of numbers",
+    );
     expect(() =>
-      table.setMany(new Uint32Array(1), [1] as never, new Uint32Array(1)),
-    ).toThrow("valsLo must be a Uint32Array");
+      table.setMany(new Uint32Array(1), "ab" as never, new Uint32Array(1)),
+    ).toThrow("valsLo must be an array or typed array of numbers");
   });
 
   test("still accepts a subarray view", async () => {

@@ -9,6 +9,8 @@
  * @packageDocumentation
  */
 
+export type { BulkU32Source } from "./abi.ts";
+
 export type { WasmSource } from "./wasm.ts";
 
 export { SwissU32ToU32 } from "./swiss-u32.ts";

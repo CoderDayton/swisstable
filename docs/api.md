@@ -20,12 +20,50 @@ error:
 | Argument | Requirement | On violation |
 | --- | --- | --- |
 | Keys, values, `expectedEntries`, `entries` | Unsigned 32-bit integer | `RangeError` naming the parameter |
-| Bulk `keys`, `valsLo`, `valsHi` | `Uint32Array` exactly | `TypeError` — another typed array would be reinterpreted, not converted |
+| Bulk `keys`, `valsLo`, `valsHi` | Any array or typed array of 32-bit integers | `TypeError` for the container, `RangeError` naming the element index |
 | `span` | Object with u32 `offset` and `length` | `TypeError`, then `RangeError` naming `span.offset` / `span.length` |
 | Interner keys and parts | `string` | `TypeError` — a non-string would break `resolve`'s return type |
 | `new InternedSwissMap(table)` | Object with `set`/`get`/`has`/`delete` | `TypeError` at construction, not at first use |
 
-Bulk arguments are checked once per call, never per key.
+The container of a bulk argument is checked once per call. Whether its
+elements are checked too depends on the source — see below.
+
+### Bulk sources
+
+The bulk methods take any numeric sequence, typed as `BulkU32Source`: every
+integer typed array, `Float32Array`/`Float64Array`, `BigInt64Array`/
+`BigUint64Array`, and plain arrays of `number` or `bigint`. Every element must
+be an integer in `[-2**31, 2**32 - 1]`; a negative value is its unsigned bit
+pattern, so `-1` and `4294967295` are the same key from any source.
+
+Integer typed arrays are the fast path and are copied wholesale, never
+inspected element by element. The others cannot be: a float array truncates
+silently on a bulk copy (`1.5` to `1`, `2**32` to `0`) and a BigInt array
+cannot be copied at all, so their elements are converted individually and
+validated. That cost is real and you only pay it for a source that needs it:
+
+| Source | `getMany` over 100k keys |
+| --- | --- |
+| `Uint32Array`, `Int32Array` | 8.1 ns/key |
+| `Float64Array` | 8.9 ns/key |
+| plain `number[]` | 16.9 ns/key |
+| `BigUint64Array` | 82.9 ns/key |
+
+If you control the data, keep it in a `Uint32Array`. The rest exist so
+interop is possible, not so it is free.
+
+`Float32Array` is the one source that cannot carry the whole key range: with
+24 bits of mantissa, a value past `2**24` was already rounded before the
+library saw it (`16777217` is stored as `16777216`). The rounded value is
+still a 32-bit integer, so it would pass validation and address the wrong key
+— `Float32Array` elements are therefore restricted to `[-2**24, 2**24]` and
+anything beyond is a `RangeError`. Use `Float64Array` for large keys.
+
+A batch longer than `maxBatch` is chunked, but a rejected element still
+applies nothing: `setMany` and `deleteMany` validate a multi-chunk batch
+before the first call. A capacity ceiling is the one failure that is not
+atomic — `setMany` keeps the chunks that preceded it, the same way the module
+reports a ceiling hit partway through a single chunk.
 
 
 **Keys and values are strictly unsigned 32-bit.** Negatives, fractions,

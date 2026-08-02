@@ -1,4 +1,12 @@
-import { asKeyArray, asWasmI32, assertStatus } from "./abi.ts";
+import {
+  DELETE_MANY_FAILED,
+  asWasmI32,
+  assertStatus,
+  bulkLength,
+  stageU32,
+  validateU32,
+} from "./abi.ts";
+import type { BulkU32Source } from "./abi.ts";
 import { embeddedModule } from "./embedded.ts";
 import { SWISS_U64_WASM_BASE64 } from "./generated/swiss_u64.ts";
 import { instantiate } from "./wasm.ts";
@@ -42,16 +50,24 @@ export interface SwissU64WasmExports {
     count: number,
   ): number;
 
-  /** Looks up `count` staged keys, writing lanes and presence flags in place. */
+  /**
+   * Looks up `count` staged keys, writing lanes and presence flags in place.
+   *
+   * Returns a status code: the module rejects a count past its staging
+   * capacity, or a pointer it does not own, rather than writing through it.
+   */
   get_many(
     keysPtr: number,
     valsLoPtr: number,
     valsHiPtr: number,
     foundPtr: number,
     count: number,
-  ): void;
+  ): number;
 
-  /** Removes `count` staged keys, returning how many were present. */
+  /**
+   * Removes `count` staged keys, returning how many were present, or -1 if
+   * the module rejected the arguments. See {@link SwissU64WasmExports.get_many}.
+   */
   delete_many(keysPtr: number, deletedPtr: number, count: number): number;
 
   /** Maximum keys the module's staging buffers hold in one call. */
@@ -493,28 +509,44 @@ export class SwissU32ToU64 {
    * @param keys - Unsigned 32-bit keys.
    * @param valsLo - Low lanes, parallel to `keys`.
    * @param valsHi - High lanes, parallel to `keys`.
-   * @throws {RangeError} If the three arrays differ in length, or if the
-   *   inserts would exceed the compiled capacity.
+   * @throws {RangeError} If the three arrays differ in length, if an element
+   *   is not a 32-bit integer, or if the inserts would exceed the compiled
+   *   capacity. A rejected element applies nothing, whatever its position;
+   *   a capacity ceiling is not atomic across chunks, the same way the module
+   *   reports one hit partway through a single chunk.
    */
-  setMany(keys: Uint32Array, valsLo: Uint32Array, valsHi: Uint32Array): void {
-    asKeyArray(keys, "keys");
-    asKeyArray(valsLo, "valsLo");
-    asKeyArray(valsHi, "valsHi");
+  setMany(
+    keys: BulkU32Source,
+    valsLo: BulkU32Source,
+    valsHi: BulkU32Source,
+  ): void {
+    const total = bulkLength(keys, "keys");
 
-    const total = keys.length;
-
-    if (valsLo.length !== total || valsHi.length !== total) {
+    if (
+      bulkLength(valsLo, "valsLo") !== total ||
+      bulkLength(valsHi, "valsHi") !== total
+    ) {
       throw new RangeError("setMany: key/value array length mismatch");
     }
 
     const { maxBatch } = this.scratch;
 
+    // One chunk stages every element before the single WASM call, so a bad
+    // element already rejects the whole batch. Past that, the elements have
+    // to be checked up front: otherwise element 69_999 of a 70_000-pair
+    // batch would throw with the first 65_536 pairs already inserted.
+    if (total > maxBatch) {
+      validateU32(keys, 0, total, "keys");
+      validateU32(valsLo, 0, total, "valsLo");
+      validateU32(valsHi, 0, total, "valsHi");
+    }
+
     for (let offset = 0; offset < total; offset += maxBatch) {
       const chunk = Math.min(maxBatch, total - offset);
 
-      this.scratch.keys.set(keys.subarray(offset, offset + chunk));
-      this.scratch.valsLo.set(valsLo.subarray(offset, offset + chunk));
-      this.scratch.valsHi.set(valsHi.subarray(offset, offset + chunk));
+      stageU32(keys, this.scratch.keys, offset, chunk, "keys");
+      stageU32(valsLo, this.scratch.valsLo, offset, chunk, "valsLo");
+      stageU32(valsHi, this.scratch.valsHi, offset, chunk, "valsHi");
 
       assertStatus(
         this.wasm.set_many(
@@ -539,10 +571,8 @@ export class SwissU32ToU64 {
    * @returns Parallel result arrays, each of `keys.length`, freshly
    *   allocated once per call.
    */
-  getMany(keys: Uint32Array): BulkGetResult {
-    asKeyArray(keys, "keys");
-
-    const total = keys.length;
+  getMany(keys: BulkU32Source): BulkGetResult {
+    const total = bulkLength(keys, "keys");
 
     const valsLo = new Uint32Array(total);
     const valsHi = new Uint32Array(total);
@@ -553,14 +583,18 @@ export class SwissU32ToU64 {
     for (let offset = 0; offset < total; offset += maxBatch) {
       const chunk = Math.min(maxBatch, total - offset);
 
-      this.scratch.keys.set(keys.subarray(offset, offset + chunk));
+      stageU32(keys, this.scratch.keys, offset, chunk, "keys");
 
-      this.wasm.get_many(
-        this.scratch.keysPtr,
-        this.scratch.valsLoPtr,
-        this.scratch.valsHiPtr,
-        this.scratch.foundPtr,
-        chunk,
+      assertStatus(
+        this.wasm.get_many(
+          this.scratch.keysPtr,
+          this.scratch.valsLoPtr,
+          this.scratch.valsHiPtr,
+          this.scratch.foundPtr,
+          chunk,
+        ),
+        "get_many",
+        "SwissU32ToU64",
       );
 
       valsLo.set(this.scratch.valsLo.subarray(0, chunk), offset);
@@ -579,28 +613,38 @@ export class SwissU32ToU64 {
    *
    * @param keys - Unsigned 32-bit keys.
    * @returns Per-key removal flags and the total removed.
+   * @throws {RangeError} If an element is not a 32-bit integer. Nothing is
+   *   removed, whatever the element's position.
    */
-  deleteMany(keys: Uint32Array): BulkDeleteResult {
-    asKeyArray(keys, "keys");
-
-    const total = keys.length;
+  deleteMany(keys: BulkU32Source): BulkDeleteResult {
+    const total = bulkLength(keys, "keys");
     const deleted = new Uint8Array(total);
     let removedCount = 0;
 
     const { maxBatch } = this.scratch;
 
+    // Removals land chunk by chunk, so a bad element in a later chunk would
+    // otherwise throw with the earlier chunks already gone. See setMany.
+    if (total > maxBatch) validateU32(keys, 0, total, "keys");
+
     for (let offset = 0; offset < total; offset += maxBatch) {
       const chunk = Math.min(maxBatch, total - offset);
 
-      this.scratch.keys.set(keys.subarray(offset, offset + chunk));
+      stageU32(keys, this.scratch.keys, offset, chunk, "keys");
 
       // The flag buffer carries removal flags here; nothing else reads it
       // between staging the keys and copying the flags out.
-      removedCount += this.wasm.delete_many(
+      const removed = this.wasm.delete_many(
         this.scratch.keysPtr,
         this.scratch.foundPtr,
         chunk,
       );
+
+      if (removed === DELETE_MANY_FAILED) {
+        throw new Error("delete_many rejected its arguments");
+      }
+
+      removedCount += removed;
 
       deleted.set(this.scratch.found.subarray(0, chunk), offset);
     }

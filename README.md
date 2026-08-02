@@ -1,5 +1,6 @@
 # swisstable
 
+[![CI](https://github.com/CoderDayton/swisstable/actions/workflows/ci.yml/badge.svg)](https://github.com/CoderDayton/swisstable/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Bun](https://img.shields.io/badge/bun-1.3%2B-black.svg)](https://bun.com)
 [![TypeScript](https://img.shields.io/badge/typescript-7.0%2B-3178c6.svg)](https://www.typescriptlang.org/)

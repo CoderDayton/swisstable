@@ -60,6 +60,29 @@ from empty, because growth rehashes through every doubling.
 Throws `TypeError` if the instance does not export the expected symbols, and
 `RangeError` if `expectedEntries` exceeds the compiled capacity.
 
+How you obtain the bytes is up to the runtime. On the server, resolve the
+package subpath rather than hardcoding a path into `node_modules`:
+
+```ts
+import { readFile } from "node:fs/promises";
+const wasm = await readFile(new URL(import.meta.resolve("swisstable/swiss_u32.wasm")));
+```
+
+In a browser or at the edge, fetch them:
+
+```ts
+const bytes = await (await fetch("/swiss_u32.wasm")).arrayBuffer();
+const table = await SwissU32ToU32.load(bytes);
+```
+
+When creating several tables, compile once and pass the module:
+
+```ts
+const module = await WebAssembly.compile(wasm);
+const forward = await SwissU32ToU32.load(module, 1_000);
+const reverse = await SwissU32ToU32.load(module, 1_000);
+```
+
 ### Accessors
 
 | Member | Returns | Notes |

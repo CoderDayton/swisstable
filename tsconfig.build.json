@@ -1,0 +1,33 @@
+// Publish build: emits JavaScript and declarations from src/ into dist/js.
+//
+// The editor/typecheck config (tsconfig.json) is bundler-mode and noEmit,
+// which is right for a Bun repo but produces nothing to publish. This one
+// overrides just enough to emit a package that plain Node can import.
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": "dist/js",
+    "rootDir": "src",
+
+    // Emit types alongside the JavaScript, plus maps back to the sources
+    // (which are published, so stepping into the library works).
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+
+    // Sources import each other with explicit .ts extensions. This rewrites
+    // those specifiers to .js on the way out, so the emitted ESM resolves
+    // under Node without a loader.
+    "rewriteRelativeImportExtensions": true,
+
+    // Consumers are not Bun-only, so the emitted types must not depend on
+    // bun-types being installed. TypeScript ships the WebAssembly globals
+    // only in lib.dom, so pull that in here purely to resolve them — the
+    // package uses no other DOM API, and the emitted .d.ts just references
+    // the ambient `WebAssembly` namespace that any host provides.
+    "lib": ["ESNext", "DOM"],
+    "types": []
+  },
+  "include": ["src"]
+}

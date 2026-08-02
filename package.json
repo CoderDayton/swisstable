@@ -1,0 +1,47 @@
+{
+  "name": "swisstable",
+  "version": "0.1.0",
+  "description": "WASM-resident SwissTable hash maps (u32 keys) with zero-callback hot paths and bulk transfer APIs",
+  "type": "module",
+  "license": "MIT",
+  "author": "vii",
+  "keywords": [
+    "swisstable",
+    "hashmap",
+    "wasm",
+    "simd",
+    "interner"
+  ],
+  "main": "./dist/js/index.js",
+  "module": "./dist/js/index.js",
+  "types": "./dist/js/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/js/index.d.ts",
+      "default": "./dist/js/index.js"
+    },
+    "./swiss_u32.wasm": "./dist/wasm/swiss_u32.wasm",
+    "./swiss_u64.wasm": "./dist/wasm/swiss_u64.wasm",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist/js",
+    "dist/wasm",
+    "src",
+    "native"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "bun run build:wasm && bun run build:js",
+    "build:wasm": "bun run scripts/build-wasm.ts",
+    "build:js": "tsc -p tsconfig.build.json",
+    "bench": "bun run scripts/bench.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "bun run build && bun run typecheck && bun test"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^7.0.2"
+  }
+}

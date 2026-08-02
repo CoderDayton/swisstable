@@ -1,0 +1,34 @@
+# Git hooks. Installed by `bunx lefthook install`, which the prepare script
+# runs on `bun install`.
+#
+# Every gate here finishes in well under a second, so both hooks run the real
+# checks rather than a reduced subset. Jobs are sequential so a failure names
+# the step that broke, and because the tests load what build:wasm produces.
+
+pre-commit:
+  parallel: false
+  jobs:
+    # The test suites instantiate dist/wasm/*.wasm, so this is a prerequisite
+    # rather than a check in its own right. ~200ms.
+    - name: build-wasm
+      run: bun run build:wasm
+
+    - name: typecheck
+      run: bun run typecheck
+
+    - name: test
+      run: bun test
+
+# The same gate CI runs, so a red build is caught before it is pushed rather
+# than a minute later in Actions.
+pre-push:
+  parallel: false
+  jobs:
+    - name: build
+      run: bun run build
+
+    - name: typecheck
+      run: bun run typecheck
+
+    - name: test
+      run: bun test

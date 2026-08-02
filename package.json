@@ -44,10 +44,12 @@
     "bench": "bun run scripts/bench.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
+    "prepare": "lefthook install",
     "prepublishOnly": "bun run build && bun run typecheck && bun test"
   },
   "devDependencies": {
     "@types/bun": "latest",
+    "lefthook": "^2.1.10",
     "typescript": "^7.0.2"
   }
 }

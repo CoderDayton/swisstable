@@ -12,6 +12,12 @@
     "simd",
     "interner"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/CoderDayton/swisstable.git"
+  },
+  "homepage": "https://github.com/CoderDayton/swisstable#readme",
+  "bugs": "https://github.com/CoderDayton/swisstable/issues",
   "main": "./dist/js/index.js",
   "module": "./dist/js/index.js",
   "types": "./dist/js/index.d.ts",

@@ -6,7 +6,7 @@ whole loop is build, test, typecheck, benchmark.
 ## Setup
 
 ```bash
-git clone https://github.com/vii/swisstable
+git clone https://github.com/CoderDayton/swisstable
 cd swisstable
 bun install
 bun run build

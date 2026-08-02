@@ -116,8 +116,9 @@ hardware are especially useful — the numbers above are from one machine.
 
 ```bash
 bun install
+bun run hooks      # lefthook pre-commit and pre-push gates
 bun run build      # compile native/*.c to dist/wasm/*.wasm
-bun test           # 41 tests across 4 suites
+bun test           # 55 tests across 5 suites
 bun run typecheck
 bun run bench
 ```

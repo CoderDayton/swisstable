@@ -234,6 +234,7 @@ means. A fresh one is created when omitted.
 
 | Member | Returns | Notes |
 | --- | --- | --- |
+| `size` | `number` | Live entries in the table, not strings interned. |
 | `interner` | `StringInterner` | Readonly. |
 | `table` | `NumericKeyTable<V>` | Readonly. |
 | `preloadVocabulary(vocabulary)` | `Uint32Array` | Interns up front so later calls never assign on the hot path. |
@@ -248,6 +249,12 @@ means. A fresh one is created when omitted.
 If the underlying table rejects a write, an ID assigned for that call is
 released again, so a failed `set` does not permanently consume an ID for a
 key that was never stored. IDs from earlier successful calls are untouched.
+
+`size` and `interner.size` answer different questions and diverge as soon as
+anything is deleted. `size` counts live entries; `interner.size` counts every
+distinct string ever seen, and never decreases, because IDs stay stable for
+the lifetime of the interner. In a long-lived map with churning keys,
+`interner.size` is the one that grows without bound.
 
 ## Functions and types
 

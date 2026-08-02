@@ -138,6 +138,34 @@ different cache lines, so a hit costs three serialized misses instead of two.
 Interleaving removes one from the critical path — worth ~3 ns per lookup at
 100k entries.
 
+## Footprint
+
+The banks are fixed static arrays and the module links with
+`--initial-memory == --max-memory`, so an instance reserves its whole linear
+memory — 20 MiB for u32, 32 MiB for u64 — the moment it is instantiated,
+holding zero entries or 917,504.
+
+Reserved is not resident. The host commits pages as they are touched, and an
+empty table touches only the control bytes of its initial 64 slots. Measured
+on x64 Linux:
+
+| | RSS | virtual |
+| --- | --- | --- |
+| empty u32 table | +1.7 MiB | +15.6 MiB |
+| 64 empty u32 tables | +5.0 MiB | — |
+| one table after 900k inserts | +32.9 MiB | +16.6 MiB |
+
+Two things follow. The first is that address space is claimed up front:
+virtual size barely moves across a fill that adds 27 MiB of resident memory.
+The second is that the marginal cost of an extra instance is small — roughly
+50 KiB once the first has paid for module compilation — so a program holding
+dozens of tables is fine, and the fixed cost that matters is per *process*,
+not per table.
+
+What this does not buy back is the small-table case. The reason `Map` wins
+below ~16k entries is the boundary crossing, not the footprint; see
+[performance.md](performance.md#small-tables-the-crossing-is-the-whole-budget).
+
 ## Crossing the boundary
 
 Two decisions exist purely to keep a lookup at **one** boundary crossing.

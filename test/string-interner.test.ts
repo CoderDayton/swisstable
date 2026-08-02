@@ -7,6 +7,9 @@ import type { NumericKeyTable } from "../src/index.ts";
 function mapTable<V>(): NumericKeyTable<V> {
   const backing = new Map<number, V>();
   return {
+    get size() {
+      return backing.size;
+    },
     set: (key, value) => backing.set(key, value),
     get: (key) => backing.get(key),
     has: (key) => backing.has(key),
@@ -17,6 +20,7 @@ function mapTable<V>(): NumericKeyTable<V> {
 /** A table that rejects every write, standing in for a full WASM table. */
 function rejectingTable<V>(): NumericKeyTable<V> {
   return {
+    size: 0,
     set: () => {
       throw new RangeError("set exceeded the compiled capacity");
     },
@@ -66,6 +70,9 @@ describe("InternedSwissMap", () => {
     let failing = false;
 
     const table: NumericKeyTable<number> = {
+      get size() {
+        return backing.size;
+      },
       set: (key, value) => {
         if (failing) throw new RangeError("full");
         backing.set(key, value);

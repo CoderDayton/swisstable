@@ -44,7 +44,7 @@
     "bench": "bun run scripts/bench.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
-    "prepare": "lefthook install",
+    "hooks": "lefthook install",
     "prepublishOnly": "bun run build && bun run typecheck && bun test"
   },
   "devDependencies": {

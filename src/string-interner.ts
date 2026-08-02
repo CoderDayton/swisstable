@@ -8,6 +8,8 @@
  * @typeParam V - Value type stored against each numeric key.
  */
 export interface NumericKeyTable<V> {
+  /** Number of live entries. */
+  readonly size: number;
   /** Inserts `key`, or overwrites the value if it is already present. */
   set(key: number, value: V): void;
   /** Returns the value stored for `key`, or `undefined` if absent. */
@@ -206,6 +208,18 @@ export class InternedSwissMap<V> {
   constructor(table: NumericKeyTable<V>, interner = new StringInterner()) {
     this.table = table;
     this.interner = interner;
+  }
+
+  /**
+   * Number of live entries.
+   *
+   * This is the table's count, not the interner's: an interned string whose
+   * entry was deleted, or that was never written, does not count. IDs are
+   * never reclaimed, so {@link StringInterner.size} can be larger and is the
+   * number to watch for unbounded growth in a long-lived map.
+   */
+  get size(): number {
+    return this.table.size;
   }
 
   /**

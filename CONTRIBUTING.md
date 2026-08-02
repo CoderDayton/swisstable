@@ -9,8 +9,14 @@ whole loop is build, test, typecheck, benchmark.
 git clone https://github.com/CoderDayton/swisstable
 cd swisstable
 bun install
+bun run hooks   # installs the lefthook pre-commit and pre-push gates
 bun run build
 ```
+
+`bun run hooks` is a deliberate one-off rather than a `prepare` script: a
+lifecycle script in `package.json` ships to every consumer, where npm reports
+it as an install script even though it never runs for a registry install.
+The hooks are for contributors, so contributors ask for them.
 
 Requirements:
 
@@ -56,7 +62,7 @@ bun run build      # both steps below
 bun run build:wasm # native/*.c -> dist/wasm/*.wasm + src/generated/*.ts
 bun run build:js   # src/*.ts   -> dist/js/*.js + .d.ts
 
-bun test           # 41 tests across 4 suites
+bun test           # 55 tests across 5 suites
 bun run typecheck  # tsc --noEmit
 bun run bench      # throughput against Map, Object, Int32Array
 ```

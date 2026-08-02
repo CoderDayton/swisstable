@@ -23,14 +23,9 @@ import {
   SwissU32ToU64,
 } from "../src/index.ts";
 
-const U32_PATH = new URL("../dist/wasm/swiss_u32.wasm", import.meta.url);
-const U64_PATH = new URL("../dist/wasm/swiss_u64.wasm", import.meta.url);
-
 // ── 1. The convenience facade ──────────────────────────────────────────
 
-const counts = new InternedSwissMap(
-  await SwissU32ToU32.load(await Bun.file(U32_PATH).arrayBuffer(), 1_000),
-);
+const counts = new InternedSwissMap(await SwissU32ToU32.create(1_000));
 
 for (const word of ["alpha", "beta", "alpha", "gamma", "alpha"]) {
   counts.set(word, (counts.get(word) ?? 0) + 1);
@@ -68,10 +63,7 @@ const encoded = vocabulary.map((text) => encoder.encode(text));
 const poolSize = encoded.reduce((total, bytes) => total + bytes.length, 0);
 const pool = new Uint8Array(poolSize);
 
-const spans = await SwissU32ToU64.load(
-  await Bun.file(U64_PATH).arrayBuffer(),
-  vocabulary.length,
-);
+const spans = await SwissU32ToU64.create(vocabulary.length);
 
 let offset = 0;
 for (const [index, bytes] of encoded.entries()) {

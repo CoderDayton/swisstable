@@ -1,4 +1,6 @@
 import { asWasmI32, assertStatus } from "./abi.ts";
+import { embeddedModule } from "./embedded.ts";
+import { SWISS_U32_WASM_BASE64 } from "./generated/swiss_u32.ts";
 import { instantiate } from "./wasm.ts";
 import type { WasmSource } from "./wasm.ts";
 
@@ -56,6 +58,9 @@ const REQUIRED_U32_EXPORTS = [
   "capacity",
 ] as const satisfies readonly (keyof SwissU32WasmExports)[];
 
+/** Compiles the embedded module once, shared by every {@link SwissU32ToU32.create}. */
+const compileEmbedded = embeddedModule(SWISS_U32_WASM_BASE64);
+
 /**
  * WASM-resident SwissTable mapping `uint32_t` keys to `uint32_t` values.
  *
@@ -102,7 +107,29 @@ export class SwissU32ToU32 {
   }
 
   /**
-   * Instantiates `swiss_u32.wasm` and returns a table ready for use.
+   * Creates a table from the module compiled into this package.
+   *
+   * Prefer this over {@link load} unless you need to control how the module
+   * is fetched or cached. It needs no `.wasm` file, so it behaves the same
+   * on every runtime, and the module is compiled once and shared by every
+   * table created this way.
+   *
+   * @param expectedEntries - Entry count to size the table for up front,
+   *   avoiding rehashes during the initial fill.
+   * @returns The new table.
+   * @throws {RangeError} If `expectedEntries` exceeds the compiled capacity.
+   */
+  static async create(expectedEntries = 0): Promise<SwissU32ToU32> {
+    return SwissU32ToU32.load(await compileEmbedded(), expectedEntries);
+  }
+
+  /**
+   * Instantiates a caller-supplied `swiss_u32.wasm` and returns a table
+   * ready for use.
+   *
+   * Use this to control loading — streaming compilation, a shared module
+   * across workers, a custom asset path. {@link create} covers the common
+   * case without a loader.
    *
    * @param wasmBytes - Module bytes, or a module already compiled with
    *   {@link WebAssembly.compile}. Compile once and pass the module when

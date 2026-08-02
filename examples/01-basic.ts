@@ -1,20 +1,18 @@
 /**
  * Basic u32 -> u32 usage.
  *
- * Covers loading a module, the read/write methods, and the two behaviours
+ * Covers creating a table, the read/write methods, and the two behaviours
  * that differ from `Map`: keys and values are strictly unsigned 32-bit, and
  * capacity is fixed at build time rather than grown on demand.
  *
- * Run with `bun run examples/01-basic.ts` (after `bun run build`).
+ * Run with `bun run examples/01-basic.ts`.
  */
 
 import { SwissU32ToU32 } from "../src/index.ts";
 
-const WASM_PATH = new URL("../dist/wasm/swiss_u32.wasm", import.meta.url);
-const wasmBytes = await Bun.file(WASM_PATH).arrayBuffer();
-
-// Sizing the table up front avoids rehashing during the initial fill.
-const table = await SwissU32ToU32.load(wasmBytes, 1_000);
+// create() uses the module compiled into the package, so there is no .wasm
+// file to locate. Sizing up front avoids rehashing during the initial fill.
+const table = await SwissU32ToU32.create(1_000);
 
 table.set(1, 100);
 table.set(2, 200);

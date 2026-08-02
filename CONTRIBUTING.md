@@ -29,26 +29,34 @@ The `.wasm` modules are build output and are not checked in, so
 Suites that need a compiled module skip themselves when `dist/wasm` is empty,
 so `bun test` still works on a fresh clone.
 
+`src/generated/*.ts` is the exception: `build:wasm` writes each module out a
+second time as base64, and those files **are** committed. They have to be,
+because `src` imports them — without them the package would not typecheck on
+a clone that has no clang. CI rebuilds and fails if the committed copy drifts
+from `native/*.c`, so treat them as build output that happens to be tracked:
+never hand-edit, and stage the rebuilt files with any C change.
+
 ## Layout
 
 ```
-native/     C sources for the wasm32 modules
-scripts/    build tooling (build-wasm.ts) and benchmarks (bench.ts)
-src/        TypeScript bindings and public entry point
-examples/   runnable examples, start at 01-basic.ts
-test/       bun test suites
-docs/       api.md, design.md, performance.md
-dist/wasm/  build output (generated)
+native/         C sources for the wasm32 modules
+scripts/        build tooling (build-wasm.ts) and benchmarks (bench.ts)
+src/            TypeScript bindings and public entry point
+src/generated/  base64 module payloads (generated, committed)
+examples/       runnable examples, start at 01-basic.ts
+test/           bun test suites
+docs/           api.md, design.md, performance.md
+dist/wasm/      build output (generated, not committed)
 ```
 
 ## The loop
 
 ```bash
 bun run build      # both steps below
-bun run build:wasm # native/*.c -> dist/wasm/*.wasm
+bun run build:wasm # native/*.c -> dist/wasm/*.wasm + src/generated/*.ts
 bun run build:js   # src/*.ts   -> dist/js/*.js + .d.ts
 
-bun test           # 35 tests across 3 suites
+bun test           # 41 tests across 4 suites
 bun run typecheck  # tsc --noEmit
 bun run bench      # throughput against Map, Object, Int32Array
 ```

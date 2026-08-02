@@ -15,12 +15,9 @@
 
 import { SwissU32ToU64 } from "../src/index.ts";
 
-const WASM_PATH = new URL("../dist/wasm/swiss_u64.wasm", import.meta.url);
-const wasmBytes = await Bun.file(WASM_PATH).arrayBuffer();
-
 const COUNT = 100_000;
 
-const table = await SwissU32ToU64.load(wasmBytes, COUNT);
+const table = await SwissU32ToU64.create(COUNT);
 
 // Bulk methods take parallel typed arrays. Values are two u32 lanes rather
 // than a bigint, because an i64 return would be boxed on every call.

@@ -1,24 +1,20 @@
 /**
- * Several tables from one compiled module, and the capacity ceiling.
+ * Several tables at once, and the capacity ceiling.
  *
  * Each module instance owns exactly one table in its own linear memory —
  * the native sources hold it in static storage and link without an
- * allocator. Two tables therefore mean two instances, which is cheap as
- * long as the module is compiled once and reused.
+ * allocator. Two tables therefore mean two instances, which is cheap
+ * because `create` compiles the module once and shares it.
  *
- * Run with `bun run examples/04-multiple-tables.ts` (after `bun run build`).
+ * Run with `bun run examples/04-multiple-tables.ts`.
  */
 
 import { SwissU32ToU32 } from "../src/index.ts";
 
-const WASM_PATH = new URL("../dist/wasm/swiss_u32.wasm", import.meta.url);
-
-// Compile once. Passing the compiled module to `load` skips validation and
-// codegen on every instance after the first.
-const module = await WebAssembly.compile(await Bun.file(WASM_PATH).arrayBuffer());
-
-const forward = await SwissU32ToU32.load(module, 1_000);
-const reverse = await SwissU32ToU32.load(module, 1_000);
+// No compile step to manage: the first create() compiles the embedded
+// module, and every later one reuses it. Only instantiation is per-table.
+const forward = await SwissU32ToU32.create(1_000);
+const reverse = await SwissU32ToU32.create(1_000);
 
 // A bidirectional index, one direction per instance. The instances share
 // no state: writing to one is invisible to the other.
@@ -38,14 +34,14 @@ console.log("reverse has 2:", reverse.has(2)); // false — separate tables
 // rebuilding, since the linear memory reserved by scripts/build-wasm.ts has
 // to cover the larger banks.
 try {
-  await SwissU32ToU32.load(module, 2_000_000);
+  await SwissU32ToU32.create(2_000_000);
 } catch (error) {
   console.log("oversized load:", (error as RangeError).message);
 }
 
 // `reserve` grows an existing table in place, preserving its contents. It
 // is worth calling when the final size becomes known after construction.
-const table = await SwissU32ToU32.load(module);
+const table = await SwissU32ToU32.create();
 table.set(7, 70);
 
 console.log("capacity before reserve:", table.capacity);
@@ -55,7 +51,7 @@ console.log("contents survived:", table.get(7)); // 70
 
 // Growth is automatic without a reserve, but it costs a full rehash each
 // time the table crosses its 7/8 load factor. Sizing up front avoids that.
-const unsized = await SwissU32ToU32.load(module);
+const unsized = await SwissU32ToU32.create();
 const capacities: number[] = [];
 
 for (let i = 0; i < 20_000; i++) {

@@ -44,6 +44,23 @@ jobs:
       - name: Build wasm modules
         run: bun run build:wasm
 
+      # src/generated is committed so the package typechecks on a clone with
+      # no clang. The build just rewrote it from native/*.c, so anything the
+      # working tree reports here means the committed copy is out of date.
+      #
+      # git status rather than git diff: diff only reports tracked files, so a
+      # payload for a newly added module that was never committed would land
+      # untracked and pass silently -- the case this gate most needs to catch.
+      - name: Verify generated sources are current
+        run: |
+          changes="$(git status --porcelain --untracked-files=all src/generated)"
+          if [ -n "$changes" ]; then
+            echo "src/generated is stale or incomplete:" >&2
+            echo "$changes" >&2
+            echo "run 'bun run build:wasm' and commit the result" >&2
+            exit 1
+          fi
+
       - name: Build JavaScript and type declarations
         run: bun run build:js
 

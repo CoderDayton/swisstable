@@ -34,8 +34,10 @@ Docs: [API](docs/api.md) · [Design](docs/design.md) ·
   6.9 ns/op against `Map`'s 40.7 for a 100k-entry fill.
 - No allocator: fixed linear memory, linked `-nostdlib`, never calls
   `memory.grow`, and no allocation on any hot path.
-- Ships compiled ESM with type declarations and prebuilt `.wasm` modules.
-  Nothing is built on install and there are no runtime dependencies.
+- The modules are compiled into the package, so there is no `.wasm` file to
+  locate, copy, or serve, and no loader to write per runtime.
+- Ships compiled ESM with type declarations. Nothing is built on install and
+  there are no runtime dependencies.
 - Runs in Node, Bun, Deno, bundlers, and browsers — anything with WebAssembly
   SIMD (Node 16+, Chrome 91+, Firefox 89+, Safari 16.4+).
 
@@ -48,19 +50,20 @@ npm install swisstable    # or bun add / pnpm add / yarn add
 Then:
 
 ```ts
-import { readFile } from "node:fs/promises";
 import { SwissU32ToU32 } from "swisstable";
 
-const wasm = await readFile(new URL(import.meta.resolve("swisstable/swiss_u32.wasm")));
-const table = await SwissU32ToU32.load(wasm, 100_000);
+// Sizing up front avoids rehashing during the initial fill.
+const table = await SwissU32ToU32.create(100_000);
 
 table.set(0xdead_beef, 42);
 table.get(0xdead_beef); // 42
 ```
 
-`load` takes the module bytes, so how you read them is up to your runtime —
-`fetch(...).arrayBuffer()` in a browser. The `.wasm` files are exposed as
-package subpaths, so nothing needs a hardcoded path into `node_modules`.
+`create` uses the module compiled into the package and compiles it once,
+sharing it across every table. To control loading yourself — streaming
+compilation, a module shared across workers, a custom asset path — use
+`load(bytes)` instead; the `.wasm` files are also exposed as package
+subpaths.
 
 Four exports:
 
@@ -114,7 +117,7 @@ hardware are especially useful — the numbers above are from one machine.
 ```bash
 bun install
 bun run build      # compile native/*.c to dist/wasm/*.wasm
-bun test           # 35 tests across 3 suites
+bun test           # 41 tests across 4 suites
 bun run typecheck
 bun run bench
 ```

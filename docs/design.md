@@ -204,8 +204,27 @@ Exports are declared per function with
 guarantee: renaming an export in the C source still links cleanly, because
 `wasm-ld` does not treat a missing `--export=` symbol as an error. The check
 that actually catches it is in the bindings — `load()` verifies every
-expected symbol is present on the instance and throws `TypeError` otherwise.
+expected symbol is present on the instance and throws `TypeError` otherwise,
+and `create()` routes through `load()` for the same reason.
 
 Capacity is `1 << 20` slots per bank, giving 917,504 live entries at the 7/8
 load factor. Raising it means editing `MAX_CAPACITY` **and** the memory
 figures, since the statics have to fit.
+
+## Embedding
+
+The build emits each module twice: as a `.wasm` file, and as a base64 string
+in `src/generated/<name>.ts`. `create()` decodes the latter, which is why it
+needs no loader and behaves the same on every runtime — no `fs`, no `fetch`,
+no bundler asset handling.
+
+base64 costs 33% over the raw bytes, about 1.3 KiB across both modules.
+Decoding runs once per process and takes a few microseconds against a
+compile that is orders of magnitude more, so the payload size is the only
+real cost and it is small.
+
+The compiled `WebAssembly.Module` is cached per module for the lifetime of
+the process, so only the first `create()` pays validation and codegen.
+Rejections are cached too: the way compilation fails here is a runtime that
+cannot compile these modules at all, usually missing SIMD, and that does not
+change on a retry.

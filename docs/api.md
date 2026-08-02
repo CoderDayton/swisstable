@@ -40,6 +40,26 @@ method that returns a promise.
 Maps `u32` keys to `u32` values. Use it for counters, ID remaps, and presence
 sets.
 
+### `static create(expectedEntries?)`
+
+```ts
+static create(expectedEntries?: number): Promise<SwissU32ToU32>
+```
+
+Creates a table from the module compiled into the package. No `.wasm` file
+is involved, so this behaves identically on every runtime.
+
+The module is compiled on the first call and shared by every later one, so
+only instantiation is paid per table. Measured on Bun 1.3.14 / x64 Linux:
+1.49 ms for the first table, 152 µs for each one after, against 276 µs when
+recompiling bytes on every call.
+
+`expectedEntries` behaves as it does for `load`.
+
+Throws `RangeError` if `expectedEntries` exceeds the compiled capacity.
+
+Prefer this unless you need control over loading, in which case use `load`.
+
 ### `static load(wasmBytes, expectedEntries?)`
 
 ```ts
@@ -121,8 +141,9 @@ The reassembled value is `(hi × 2³²) + lo`.
 
 ### Everything `SwissU32ToU32` has
 
-`load`, `size`, `capacity`, `has`, `delete`, `reserve`, and `clear` behave
-identically. Only the value-carrying methods differ:
+`create`, `load`, `size`, `capacity`, `has`, `delete`, `reserve`, and `clear`
+behave identically, `create` and `load` instantiating `swiss_u64.wasm`
+instead. Only the value-carrying methods differ:
 
 | Method | Returns |
 | --- | --- |

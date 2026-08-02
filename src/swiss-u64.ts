@@ -1,12 +1,15 @@
 import {
   DELETE_MANY_FAILED,
+  ScanIterator,
+  asCallback,
   asWasmI32,
   assertStatus,
   bulkLength,
+  scanWindows,
   stageU32,
   validateU32,
 } from "./abi.ts";
-import type { BulkU32Source } from "./abi.ts";
+import type { BulkU32Source, ScanExports } from "./abi.ts";
 import { embeddedModule } from "./embedded.ts";
 import { SWISS_U64_WASM_BASE64 } from "./generated/swiss_u64.ts";
 import { instantiate } from "./wasm.ts";
@@ -20,7 +23,7 @@ import type { WasmSource } from "./wasm.ts";
  *
  * @internal
  */
-export interface SwissU64WasmExports {
+export interface SwissU64WasmExports extends ScanExports {
   /** The module's linear memory. Fixed size; never grown. */
   memory: WebAssembly.Memory;
 
@@ -81,6 +84,18 @@ export interface SwissU64WasmExports {
   /** Address of the staging flag buffer. */
   bulk_flags_ptr(): number;
 
+  /**
+   * Stages the live entries in the slot window at `cursor`, returning how
+   * many, or a negative status if it rejected the cursor.
+   *
+   * Writes through the same staging buffers as the bulk methods.
+   */
+  scan(cursor: number): number;
+  /** Slots one `scan` visits, never more than `bulk_capacity()`. */
+  scan_window(): number;
+  /** Counter bumped by every rehash, clear, and init. */
+  generation(): number;
+
   /** Number of live entries. */
   size(): number;
   /** Number of allocated slots. */
@@ -120,6 +135,116 @@ export interface BulkGetResult {
   valsHi: Uint32Array;
   /** 1 where the key was present, 0 where it was absent. */
   found: Uint8Array;
+}
+
+/** The parts of the table an iterator reads. */
+interface SwissU64Scan {
+  readonly wasm: SwissU64WasmExports;
+  readonly scanWindow: number;
+  readonly scratch: BulkScratch;
+}
+
+/**
+ * Chunk-buffer length for one iterator over `source`.
+ *
+ * A window is the most a scan can stage, and a table smaller than one is
+ * the most it ever will — so iterating ten entries does not allocate for
+ * 65536.
+ */
+function stagedLength(source: SwissU64Scan): number {
+  return Math.min(source.scanWindow, source.wasm.capacity() >>> 0);
+}
+
+/*
+ * The three kinds are separate classes rather than one class with a mode,
+ * so each at() has a single return type and a single call site. See the
+ * matching note in swiss-u32.ts.
+ *
+ * Each holds its own chunk buffers, filled before any next() that crosses a
+ * window boundary returns. Here that also isolates them from the bulk
+ * methods: the scan writes through the same staging buffers getMany does,
+ * so an iterator that read them lazily would hand back whatever an
+ * interleaved call left behind.
+ */
+
+/** Yields each key. Never copies the lanes, which it does not read. */
+class KeyIterator extends ScanIterator<number> {
+  private readonly keys: Uint32Array;
+
+  constructor(private readonly source: SwissU64Scan) {
+    super(source.wasm, source.scanWindow);
+    this.keys = new Uint32Array(stagedLength(source));
+  }
+
+  protected override receive(count: number): void {
+    this.keys.set(this.source.scratch.keys.subarray(0, count));
+  }
+
+  protected override at(index: number): number {
+    return this.keys[index]!;
+  }
+}
+
+/** Yields each value as fresh lanes. */
+class ValueIterator extends ScanIterator<U64Lanes> {
+  private readonly valsLo: Uint32Array;
+  private readonly valsHi: Uint32Array;
+
+  constructor(private readonly source: SwissU64Scan) {
+    super(source.wasm, source.scanWindow);
+    const staged = stagedLength(source);
+    this.valsLo = new Uint32Array(staged);
+    this.valsHi = new Uint32Array(staged);
+  }
+
+  protected override receive(count: number): void {
+    this.valsLo.set(this.source.scratch.valsLo.subarray(0, count));
+    this.valsHi.set(this.source.scratch.valsHi.subarray(0, count));
+  }
+
+  protected override at(index: number): U64Lanes {
+    return { lo: this.valsLo[index]!, hi: this.valsHi[index]! };
+  }
+}
+
+/** Yields each entry as a fresh `[key, lanes]` pair. */
+class EntryIterator extends ScanIterator<[number, U64Lanes]> {
+  private readonly keys: Uint32Array;
+  private readonly valsLo: Uint32Array;
+  private readonly valsHi: Uint32Array;
+
+  constructor(private readonly source: SwissU64Scan) {
+    super(source.wasm, source.scanWindow);
+    const staged = stagedLength(source);
+    this.keys = new Uint32Array(staged);
+    this.valsLo = new Uint32Array(staged);
+    this.valsHi = new Uint32Array(staged);
+  }
+
+  protected override receive(count: number): void {
+    this.keys.set(this.source.scratch.keys.subarray(0, count));
+    this.valsLo.set(this.source.scratch.valsLo.subarray(0, count));
+    this.valsHi.set(this.source.scratch.valsHi.subarray(0, count));
+  }
+
+  protected override at(index: number): [number, U64Lanes] {
+    return [
+      this.keys[index]!,
+      { lo: this.valsLo[index]!, hi: this.valsHi[index]! },
+    ];
+  }
+}
+
+/** One window's worth of staged entries, copied out of the module. */
+interface EntryChunk {
+  /** Keys, valid up to {@link EntryChunk.count}. */
+  readonly keys: Uint32Array;
+  /** Low lanes, parallel to {@link EntryChunk.keys}. */
+  readonly valsLo: Uint32Array;
+  /** High lanes, parallel to {@link EntryChunk.keys}. */
+  readonly valsHi: Uint32Array;
+  /** How many of the buffers' leading elements are live. */
+  count: number;
 }
 
 /** Result of {@link SwissU32ToU64.deleteMany}. */
@@ -194,6 +319,9 @@ const REQUIRED_U64_EXPORTS = [
   "bulk_vals_lo_ptr",
   "bulk_vals_hi_ptr",
   "bulk_flags_ptr",
+  "scan",
+  "scan_window",
+  "generation",
   "size",
   "capacity",
 ] as const satisfies readonly (keyof SwissU64WasmExports)[];
@@ -283,6 +411,9 @@ export class SwissU32ToU64 {
    */
   private readonly lastValue: Uint32Array;
 
+  /** Slots one scan call visits. */
+  private readonly scanWindow: number;
+
   private constructor(wasm: SwissU64WasmExports) {
     this.wasm = wasm;
     this.scratch = new BulkScratch(wasm);
@@ -291,6 +422,17 @@ export class SwissU32ToU64 {
       wasm.last_value_ptr(),
       2,
     );
+
+    this.scanWindow = wasm.scan_window() >>> 0;
+
+    // The scan borrows the bulk staging buffers, so its window has to fit
+    // inside them; and every iterator strides by it, so a zero would never
+    // reach capacity.
+    if (this.scanWindow === 0 || this.scanWindow > this.scratch.maxBatch) {
+      throw new TypeError(
+        "swiss_u64.wasm reported a scan window its staging buffers cannot hold",
+      );
+    }
   }
 
   /**
@@ -650,5 +792,128 @@ export class SwissU32ToU64 {
     }
 
     return { deleted, removedCount };
+  }
+
+  /** The scan state an iterator needs, bundled without exposing it. */
+  private scanSource(): SwissU64Scan {
+    return {
+      wasm: this.wasm,
+      scanWindow: this.scanWindow,
+      scratch: this.scratch,
+    };
+  }
+
+  /**
+   * Walks the table one slot window at a time, yielding the chunk each scan
+   * staged.
+   *
+   * The yielded object is reused across chunks — every public iterator
+   * consumes one fully before asking for the next — but its buffers belong
+   * to this generator alone. The scan writes through the same staging
+   * buffers the bulk methods use, so copying out before the yield is what
+   * keeps an interleaved {@link SwissU32ToU64.getMany} from rewriting a
+   * chunk an open iterator has not finished with. It is also what lets two
+   * iterators be advanced alternately.
+   *
+   * The buffers are sized to the smaller of the window and the capacity, so
+   * iterating a table of ten entries does not allocate for 65536.
+   */
+  private *chunks(): Generator<EntryChunk> {
+    const staged = Math.min(this.scanWindow, this.capacity);
+    const chunk: EntryChunk = {
+      keys: new Uint32Array(staged),
+      valsLo: new Uint32Array(staged),
+      valsHi: new Uint32Array(staged),
+      count: 0,
+    };
+
+    const receive = (count: number): void => {
+      chunk.keys.set(this.scratch.keys.subarray(0, count));
+      chunk.valsLo.set(this.scratch.valsLo.subarray(0, count));
+      chunk.valsHi.set(this.scratch.valsHi.subarray(0, count));
+    };
+
+    for (const count of scanWindows(this.wasm, this.scanWindow, receive)) {
+      chunk.count = count;
+      yield chunk;
+    }
+  }
+
+  /**
+   * Yields every key.
+   *
+   * Order is unspecified: it is slot order, which depends on the hash and
+   * changes whenever the table rehashes. Do not rely on it, and do not rely
+   * on two tables holding the same entries agreeing on it.
+   *
+   * Entries are read out one window of slots per WASM call rather than one
+   * per key, so a full walk costs a handful of crossings whatever the size.
+   *
+   * Deleting or inserting during the walk is allowed as long as the table
+   * does not rehash; whether the walk observes the change is unspecified. A
+   * rehash — including the one {@link SwissU32ToU64.clear} performs — throws
+   * rather than silently skipping or repeating entries.
+   *
+   * @throws {Error} If the table rehashes while the iterator is open.
+   */
+  keys(): IterableIterator<number> {
+    return new KeyIterator(this.scanSource());
+  }
+
+  /**
+   * Yields every value as lanes, in the same unspecified order as
+   * {@link SwissU32ToU64.keys}.
+   *
+   * Allocates one object per entry. Prefer {@link SwissU32ToU64.forEach}
+   * with the lanes read straight off the callback arguments on a hot path.
+   *
+   * @throws {Error} If the table rehashes while the iterator is open.
+   */
+  values(): IterableIterator<U64Lanes> {
+    return new ValueIterator(this.scanSource());
+  }
+
+  /**
+   * Yields every entry as a `[key, lanes]` pair, in the same unspecified
+   * order as {@link SwissU32ToU64.keys}.
+   *
+   * Each pair is a fresh array holding a fresh {@link U64Lanes}, matching
+   * `Map`. Prefer {@link SwissU32ToU64.forEach} on a hot path.
+   *
+   * @throws {Error} If the table rehashes while the iterator is open.
+   */
+  entries(): IterableIterator<[number, U64Lanes]> {
+    return new EntryIterator(this.scanSource());
+  }
+
+  /**
+   * Yields every entry as a `[key, lanes]` pair, so the table works in
+   * `for…of` and spreads. Same as {@link SwissU32ToU64.entries}.
+   */
+  [Symbol.iterator](): IterableIterator<[number, U64Lanes]> {
+    return this.entries();
+  }
+
+  /**
+   * Calls `callback` once per entry, in the same unspecified order as
+   * {@link SwissU32ToU64.keys}.
+   *
+   * @param callback - Receives the lanes, the key, and this table — the
+   *   argument order `Map.prototype.forEach` uses.
+   * @param thisArg - Bound as `this` inside `callback`.
+   * @throws {TypeError} If `callback` is not a function.
+   * @throws {Error} If the table rehashes while the walk is in progress.
+   */
+  forEach(
+    callback: (value: U64Lanes, key: number, table: this) => void,
+    thisArg?: unknown,
+  ): void {
+    asCallback(callback, "forEach");
+
+    for (const { keys, valsLo, valsHi, count } of this.chunks()) {
+      for (let i = 0; i < count; i += 1) {
+        callback.call(thisArg, { lo: valsLo[i]!, hi: valsHi[i]! }, keys[i]!, this);
+      }
+    }
   }
 }

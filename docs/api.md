@@ -174,6 +174,44 @@ const reverse = await SwissU32ToU32.load(module, 1_000);
 | `reserve(entries)` | `void` | Grows in place, preserving contents. No-op if the capacity already suffices. |
 | `clear()` | `void` | Empties the table but **retains capacity** — a cleared instance never shrinks. |
 
+### Iteration
+
+| Method | Yields |
+| --- | --- |
+| `keys()` | `number` |
+| `values()` | `number` |
+| `entries()`, `[Symbol.iterator]()` | `[key, value]` |
+| `forEach(callback, thisArg?)` | calls `callback(value, key, table)` |
+
+Entries are read out one window of slots per WASM call rather than one per
+key, so a full walk is a handful of crossings whatever the size — 16 at the
+compiled ceiling.
+
+**Order is unspecified.** It is slot order, which depends on the hash and
+changes whenever the table rehashes. Two tables holding the same entries need
+not agree on it. If you need a stable order, sort what you get.
+
+**Mutating during a walk.** Inserting and deleting are allowed as long as the
+table does not rehash; whether the walk observes the change is unspecified. A
+rehash renumbers the slots, so a walk that continued across one would skip
+some entries and repeat others with nothing in the data to show it — it
+throws instead. `clear()` counts as a rehash here.
+
+```ts
+for (const [key, value] of table) { /* … */ }
+
+const iterator = table.keys();
+iterator.next();
+table.reserve(500_000);   // rehashes
+[...iterator];            // throws: rehashed during iteration
+```
+
+**Cost.** `forEach` allocates nothing per entry and measures ~3.6x faster
+than `Map.prototype.forEach` over 500k entries. The iterator protocol is the
+other way round: `keys()`, `values()`, and `entries()` allocate a result
+record per entry the way the built-ins do, and run 1.7–7x *slower* than
+`Map`'s, whose iterator is engine-internal. Prefer `forEach` on a hot path.
+
 ```ts
 const table = await SwissU32ToU32.load(bytes, 100_000);
 
@@ -202,6 +240,12 @@ instead. Only the value-carrying methods differ:
 | --- | --- |
 | `get(key)` | `U64Lanes \| undefined` — allocates one `{lo, hi}` object per hit |
 | `set(key, lo, hi)` | `this` |
+
+Iteration works the same way, with the same order and mutation rules, except
+that `values()` yields `U64Lanes` and `entries()` yields `[key, lanes]`. The
+scan borrows the same staging buffers the bulk methods use, so each chunk is
+copied out before it is handed over — a `getMany` issued between two steps of
+an open iterator cannot disturb it.
 
 ### Spans
 
@@ -244,12 +288,18 @@ before the failure are applied and `size` reflects them.
 
 ## `StringInterner`
 
-Assigns stable `u32` IDs to exact strings, in first-seen order starting at 0.
-IDs remain stable for the lifetime of the instance.
+Assigns `u32` IDs to exact strings, in first-seen order starting at 0. By
+default IDs remain stable for the lifetime of the instance.
+
+```ts
+new StringInterner(options?: { recycleIds?: boolean })
+```
 
 | Member | Returns | Notes |
 | --- | --- | --- |
-| `size` | `number` | Distinct strings interned so far. |
+| `size` | `number` | Strings currently interned. Only ever grows unless IDs are recycled. |
+| `recyclesIds` | `boolean` | The mode, fixed at construction. |
+| `release(id)` | `boolean` | Frees an ID for reuse. **Throws `TypeError` unless `recycleIds` is on.** |
 | `intern(text)` | `number` | Existing ID, or a newly assigned one. |
 | `internAll(texts)` | `Uint32Array` | IDs positionally matching `texts`. |
 | `lookup(text)` | `number \| undefined` | Does **not** assign. |
@@ -265,7 +315,44 @@ part lists collide the way plain concatenation would allow:
 **`forgetLast` is deliberately limited to the last ID.** Releasing an
 arbitrary one would either leave a hole in the ID space or renumber the IDs
 that follow, and stable IDs are the point of the class. It exists so a caller
-that interns a key and then fails to store it can avoid leaking the ID.
+that interns a key and then fails to store it can avoid leaking the ID. With
+recycling on it also accepts an ID `intern` has just taken from the pool,
+which is not at the end of the ID space and so cannot be found by position.
+
+### Recycling IDs
+
+Without recycling, a deleted key keeps its ID and its string forever. That is
+the right default — IDs are stable, so they can be held anywhere — but for a
+long-lived map whose keys rotate it is a leak: the interner retires one ID per
+distinct key *ever seen*, not per key currently held. `size` never falls.
+
+`{ recycleIds: true }` hands a released ID to the next new string instead,
+bounding the ID space at the number of strings live at once:
+
+```ts
+const map = new InternedSwissMap(table, new StringInterner({ recycleIds: true }));
+
+for (let i = 0; i < 300_000; i += 1) {
+  map.set(`key-${i}`, i);
+  if (i >= 1000) map.delete(`key-${i - 1000}`);
+}
+
+map.interner.size;   // 1000 — without recycling, 300000
+```
+
+What you give up, and the rules that follow from it:
+
+- **An ID no longer identifies one string.** Anything holding an ID across a
+  `delete` may be reading a different key's value. Do not persist, log, or
+  share IDs from a recycling interner.
+- **A recycling interner cannot be shared between maps.** The second
+  `InternedSwissMap` built around one throws `TypeError`. A delete in the
+  first map would hand its ID to a new string while the second map's entry
+  under that ID still answered for the old key. Non-recycling interners stay
+  shareable.
+- **Only `InternedSwissMap.delete`/`deleteParts` release**, and only when the
+  table actually held the entry. A key that was interned but never stored
+  keeps its ID, since `resolve` still answers for it.
 
 ## `InternedSwissMap`
 

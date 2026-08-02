@@ -22,13 +22,33 @@ export interface NumericKeyTable<V> {
   delete(key: number): boolean;
 }
 
+/** Options for {@link StringInterner}. */
+export interface StringInternerOptions {
+  /**
+   * Hand released IDs back out to later strings instead of retiring them.
+   *
+   * Off by default, because turning it on gives up the guarantee the class
+   * otherwise makes: that an ID identifies the same string for the lifetime
+   * of the instance. Turn it on for a long-lived map whose keys rotate,
+   * where retiring an ID per distinct key ever seen is a leak; leave it off
+   * when IDs are held anywhere outside the one map that owns the interner.
+   */
+  recycleIds?: boolean;
+}
+
 /**
- * Assigns stable unsigned 32-bit IDs to exact strings.
+ * Assigns unsigned 32-bit IDs to exact strings.
  *
  * IDs are handed out in first-seen order starting at 0 — 0 is a valid,
- * assignable ID — and remain stable for the lifetime of the instance. This
- * is the bridge between string-keyed data (tokenizer vocabularies, cache
- * namespaces, structured cache keys) and a u32-keyed SwissTable.
+ * assignable ID. By default they remain stable for the lifetime of the
+ * instance. This is the bridge between string-keyed data (tokenizer
+ * vocabularies, cache namespaces, structured cache keys) and a u32-keyed
+ * SwissTable.
+ *
+ * With {@link StringInternerOptions.recycleIds} on, a released ID is handed
+ * to the next new string instead, which bounds the ID space at the number of
+ * strings live at once rather than the number ever seen — at the cost of
+ * that stability. See {@link StringInterner.release}.
  *
  * Interning itself is a JavaScript `Map` lookup, so it is worth doing once
  * per string and reusing the ID; a table keyed by IDs is where the win is.
@@ -41,15 +61,124 @@ export interface NumericKeyTable<V> {
  * ```
  */
 export class StringInterner {
-  /** Forward index, string to assigned ID. */
+  /** Forward index, string to assigned ID. Also the live-string count. */
   private readonly stringToId = new Map<string, number>();
 
-  /** Reverse index; an ID is its position in this array. */
-  private readonly idToString: string[] = [];
+  /**
+   * Reverse index; an ID is its position in this array.
+   *
+   * A released ID leaves `undefined` behind rather than shortening the
+   * array, so every other ID keeps its position.
+   */
+  private readonly idToString: (string | undefined)[] = [];
 
-  /** Number of distinct strings interned so far. */
+  /**
+   * Released IDs waiting to be handed out again, most recent first.
+   *
+   * Empty unless {@link StringInterner.recyclesIds} is on, since nothing
+   * else ever releases one.
+   */
+  private readonly pool: number[] = [];
+
+  /**
+   * The ID {@link StringInterner.intern} last took from the pool, if it has
+   * not been handed back since.
+   *
+   * {@link StringInterner.forgetLast} needs it: a recycled ID is not at the
+   * end of the reverse index, so the tail rule alone cannot recognise it.
+   */
+  private lastRecycled: number | undefined;
+
+  /** Set once an {@link InternedSwissMap} has claimed this interner. */
+  private claimed = false;
+
+  /** Whether released IDs are handed out again. Fixed at construction. */
+  readonly recyclesIds: boolean;
+
+  /**
+   * @param options - See {@link StringInternerOptions}.
+   */
+  constructor(options: StringInternerOptions = {}) {
+    this.recyclesIds = options.recycleIds === true;
+  }
+
+  /**
+   * Number of strings currently interned.
+   *
+   * Without recycling this only ever grows, and equals the number of IDs
+   * ever assigned. With it, released strings are subtracted, which is what
+   * makes this the number to watch for unbounded growth.
+   */
   get size(): number {
-    return this.idToString.length;
+    return this.stringToId.size;
+  }
+
+  /**
+   * Binds this interner to a single {@link InternedSwissMap}.
+   *
+   * Only recycling interners are claimed. Two maps sharing one would corrupt
+   * each other: a delete in the first returns an ID to the pool, the next
+   * new string takes it, and the second map's entry under that ID then
+   * answers for a key it never held. Without recycling an ID never changes
+   * meaning, so sharing stays safe and this is not called.
+   *
+   * @throws {TypeError} If another map has already claimed it.
+   * @internal
+   */
+  claim(): void {
+    if (this.claimed) {
+      throw new TypeError(
+        "a recycling StringInterner cannot be shared between maps: its IDs " +
+          "change meaning, so only the owner that releases them can hold them",
+      );
+    }
+    this.claimed = true;
+  }
+
+  /**
+   * Releases `id`, forgetting its string and returning the ID to the pool.
+   *
+   * The ID is handed to a later string, so anything still holding it now
+   * refers to whatever that turns out to be. Only the owner that assigned it
+   * can know it is safe to release, which is why this is refused unless
+   * recycling was asked for at construction.
+   *
+   * @param id - ID to release.
+   * @returns `true` if it was assigned and has been released, `false` if it
+   *   was never assigned or was already released. Nothing changes on
+   *   `false`, so a repeated release cannot put an ID in the pool twice.
+   * @throws {TypeError} If this interner does not recycle IDs.
+   */
+  release(id: number): boolean {
+    if (!this.recyclesIds) {
+      throw new TypeError(
+        "this StringInterner does not recycle IDs; construct it with " +
+          "{ recycleIds: true } to release them",
+      );
+    }
+
+    const text = this.assignedText(id);
+    if (text === undefined) return false;
+
+    this.idToString[id] = undefined;
+    this.stringToId.delete(text);
+    this.pool.push(id);
+
+    if (this.lastRecycled === id) this.lastRecycled = undefined;
+
+    return true;
+  }
+
+  /**
+   * The string `id` is assigned to, or `undefined` if it is not assigned.
+   *
+   * A released ID reads back as a hole, and an out-of-range or non-integer
+   * one reads back as `undefined` from the array, so one lookup covers all
+   * three.
+   */
+  private assignedText(id: number): string | undefined {
+    if (!Number.isInteger(id) || id < 0) return undefined;
+    return this.idToString[id];
   }
 
   /**
@@ -65,14 +194,22 @@ export class StringInterner {
     const existing = this.stringToId.get(text);
     if (existing !== undefined) return existing;
 
-    const id = this.idToString.length;
+    const recycled = this.pool.pop();
+    const id = recycled ?? this.idToString.length;
 
     if (id > 0xffff_ffff) {
       throw new RangeError("StringInterner exhausted the u32 ID space");
     }
 
     this.stringToId.set(text, id);
-    this.idToString.push(text);
+
+    if (recycled === undefined) {
+      this.idToString.push(text);
+    } else {
+      this.idToString[id] = text;
+    }
+
+    this.lastRecycled = recycled;
 
     return id;
   }
@@ -106,22 +243,38 @@ export class StringInterner {
    * StringInterner.intern}.
    *
    * This exists so a caller that interns a key and then fails to store it
-   * can avoid leaking the ID — see {@link InternedSwissMap.set}. It is
-   * deliberately limited to the last ID: releasing an arbitrary one would
-   * either leave a hole in the ID space or renumber the IDs that follow,
-   * and stable IDs are the point of the class.
+   * can avoid leaking the ID — see {@link InternedSwissMap.set}. Without
+   * recycling it is deliberately limited to the last ID: releasing an
+   * arbitrary one would either leave a hole in the ID space or renumber the
+   * IDs that follow, and stable IDs are the point of the class.
    *
-   * @param id - The ID to release, which must be the most recent one.
-   * @returns `true` if it was released, `false` if `id` was not the last
-   *   assigned ID, in which case nothing changed.
+   * With recycling on it also accepts an ID that {@link
+   * StringInterner.intern} has just taken from the pool, which is not at the
+   * end of the reverse index and so cannot be recognised by position. That
+   * ID goes back to the pool rather than being retired.
+   *
+   * @param id - The ID to release, which must be the one most recently
+   *   assigned.
+   * @returns `true` if it was released, `false` otherwise, in which case
+   *   nothing changed.
    */
   forgetLast(id: number): boolean {
-    if (id !== this.idToString.length - 1) return false;
+    if (id === this.idToString.length - 1) {
+      // Read before popping: with recycling the tail can already be a hole,
+      // and popping it would shorten the array on the way to returning false.
+      const text = this.assignedText(id);
+      if (text === undefined) return false;
 
-    const text = this.idToString.pop()!;
-    this.stringToId.delete(text);
+      this.idToString.pop();
+      this.stringToId.delete(text);
+      if (this.lastRecycled === id) this.lastRecycled = undefined;
 
-    return true;
+      return true;
+    }
+
+    if (this.recyclesIds && id === this.lastRecycled) return this.release(id);
+
+    return false;
   }
 
   /**
@@ -131,10 +284,7 @@ export class StringInterner {
    * @returns The original string, or `undefined` if `id` was never assigned.
    */
   resolve(id: number): string | undefined {
-    if (!Number.isInteger(id) || id < 0 || id >= this.idToString.length) {
-      return undefined;
-    }
-    return this.idToString[id];
+    return this.assignedText(id);
   }
 
   /**
@@ -212,6 +362,9 @@ export class InternedSwissMap<V> {
    * @param table - Numeric table to store values in.
    * @param interner - Interner to assign key IDs, so several maps can share
    *   one ID space. A fresh interner is created when omitted.
+   * @throws {TypeError} If `table` is not a {@link NumericKeyTable}, if
+   *   `interner` is not a {@link StringInterner}, or if it recycles IDs and
+   *   another map already owns it.
    */
   constructor(table: NumericKeyTable<V>, interner = new StringInterner()) {
     // Checked here rather than at first use: a map built around the wrong
@@ -230,6 +383,10 @@ export class InternedSwissMap<V> {
       throw new TypeError("interner must be a StringInterner");
     }
 
+    // A recycling interner's IDs change meaning, so only the map that
+    // releases them may hold them. See StringInterner.claim.
+    if (interner.recyclesIds) interner.claim();
+
     this.table = table;
     this.interner = interner;
   }
@@ -238,9 +395,10 @@ export class InternedSwissMap<V> {
    * Number of live entries.
    *
    * This is the table's count, not the interner's: an interned string whose
-   * entry was deleted, or that was never written, does not count. IDs are
-   * never reclaimed, so {@link StringInterner.size} can be larger and is the
-   * number to watch for unbounded growth in a long-lived map.
+   * entry was deleted, or that was never written, does not count.
+   * {@link StringInterner.size} can be larger, and is the number to watch
+   * for unbounded growth in a long-lived map — without recycling it never
+   * falls, since a deleted key keeps its ID forever.
    */
   get size(): number {
     return this.table.size;
@@ -286,14 +444,16 @@ export class InternedSwissMap<V> {
   }
 
   /**
-   * Removes `key`. The key keeps its interned ID, so re-inserting it later
-   * reuses the same ID.
+   * Removes `key`.
+   *
+   * Without recycling the key keeps its interned ID, so re-inserting it
+   * later reuses the same one. With recycling the ID is returned to the pool
+   * and re-inserting the key assigns whatever is free at the time.
    *
    * @returns `true` if the key was present.
    */
   delete(key: string): boolean {
-    const id = this.interner.lookup(key);
-    return id !== undefined && this.table.delete(id);
+    return this.remove(this.interner.lookup(key));
   }
 
   /**
@@ -345,7 +505,25 @@ export class InternedSwissMap<V> {
 
   /** {@link InternedSwissMap.delete} for a composite key. */
   deleteParts(parts: readonly string[]): boolean {
-    const id = this.interner.lookupParts(parts);
-    return id !== undefined && this.table.delete(id);
+    return this.remove(this.interner.lookupParts(parts));
+  }
+
+  /**
+   * Removes the entry under `id`, releasing the ID when recycling is on.
+   *
+   * The release is conditional on the table actually having held the entry.
+   * A key that was interned but never stored, or already deleted, keeps its
+   * ID: releasing it here would hand a live interned string's ID to another
+   * key while `resolve` still answered for it.
+   *
+   * @param id - The key's ID, or undefined if it was never interned.
+   * @returns `true` if an entry was removed.
+   */
+  private remove(id: number | undefined): boolean {
+    if (id === undefined || !this.table.delete(id)) return false;
+
+    if (this.interner.recyclesIds) this.interner.release(id);
+
+    return true;
   }
 }

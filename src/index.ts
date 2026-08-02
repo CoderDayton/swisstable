@@ -24,4 +24,7 @@ export type {
 } from "./swiss-u64.ts";
 
 export { InternedSwissMap, StringInterner } from "./string-interner.ts";
-export type { NumericKeyTable } from "./string-interner.ts";
+export type {
+  NumericKeyTable,
+  StringInternerOptions,
+} from "./string-interner.ts";

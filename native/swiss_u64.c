@@ -170,6 +170,32 @@ static uint32_t g_bulk_vals_hi[BULK_CAPACITY];
 static uint8_t  g_bulk_flags[BULK_CAPACITY];
 
 /*
+ * Counter of every event that re-permutes the slots: a rehash, a clear, or
+ * an init.
+ *
+ * A scan cursor names a slot, and those events move entries between slots,
+ * so a cursor held across one is meaningless — resuming with it would skip
+ * some entries and repeat others with nothing to signal it. Capacity cannot
+ * stand in for this: an in-place compaction rehashes without changing it.
+ */
+static uint32_t g_generation = 0;
+
+/*
+ * Slots one scan() call visits.
+ *
+ * A window is a fixed span of slots rather than a fixed number of entries.
+ * That is what lets the caller advance its own cursor without the module
+ * reporting where the scan stopped: the windows [0, W), [W, 2W), ...
+ * partition the slot space, so every live slot falls in exactly one and is
+ * reported exactly once. A window of W slots holds at most W entries, which
+ * is why it can share the bulk staging buffers without overflowing them.
+ *
+ * At MAX_CAPACITY a full walk is 16 crossings. A larger window costs only
+ * staging memory; a smaller one costs crossings.
+ */
+#define SCAN_WINDOW BULK_CAPACITY
+
+/*
  * True when `ptr` is the address of the staging buffer it is meant to be.
  *
  * The bulk exports take addresses, which makes every one of them a write
@@ -445,6 +471,7 @@ static int32_t rehash(uint32_t next_capacity) {
   g_mask = new_mask;
   g_size = new_size;
   g_growth_left = MAX_LIVE(next_capacity) - new_size;
+  g_generation++;
 
   return STATUS_OK;
 }
@@ -552,6 +579,7 @@ int32_t init(uint32_t expected_entries) {
   g_mask = next_capacity - 1u;
   g_size = 0;
   g_growth_left = MAX_LIVE(next_capacity);
+  g_generation++;
   initialize_bank(g_active_bank, g_capacity);
 
   return STATUS_OK;
@@ -579,6 +607,7 @@ void clear(void) {
   initialize_bank(g_active_bank, g_capacity);
   g_size = 0;
   g_growth_left = MAX_LIVE(g_capacity);
+  g_generation++;
 }
 
 /*
@@ -834,3 +863,62 @@ uint32_t size(void) { return g_size; }
 /* Allocated slots in the live bank. */
 __attribute__((export_name("capacity")))
 uint32_t capacity(void) { return g_capacity; }
+
+/* ── Iteration ─────────────────────────────────────────────────────── */
+
+/* Slots one scan() visits. Never more than BULK_CAPACITY, whose buffers it
+ * borrows: the caller copies each chunk out before it can issue another
+ * bulk call, so only one of the two ever holds live data at a time. */
+__attribute__((export_name("scan_window")))
+uint32_t scan_window(void) { return SCAN_WINDOW; }
+
+/* Bumped by every rehash, clear, and init. See g_generation. */
+__attribute__((export_name("generation")))
+uint32_t generation(void) { return g_generation; }
+
+/*
+ * Copies the live entries in the slot window at `cursor` into the staging
+ * buffers, returning how many were written.
+ *
+ * `cursor` must be a multiple of GROUP_WIDTH, and is rejected with
+ * STATUS_INVALID_ARGUMENT rather than trusted otherwise: an unaligned
+ * position would let the final group's 16-byte load read past the bank. A
+ * cursor at or beyond capacity is the end of the walk, and reports 0.
+ *
+ * Capacity is a power of two and at least GROUP_WIDTH, so a group-aligned
+ * cursor gives a group-aligned end however the window is clamped, and the
+ * loop never has a partial group to handle.
+ *
+ * Cost is one SIMD load per group plus one copy per live entry, so a full
+ * walk is O(capacity / GROUP_WIDTH + size): the empty stretches of a sparse
+ * table are skipped 16 slots at a time rather than examined byte by byte.
+ */
+__attribute__((export_name("scan")))
+int32_t scan(uint32_t cursor) {
+  if ((cursor & (GROUP_WIDTH - 1u)) != 0) return STATUS_INVALID_ARGUMENT;
+  if (g_capacity == 0 || cursor >= g_capacity) return 0;
+
+  const uint8_t *control = g_ctrl[g_active_bank];
+  const Entry *entries = g_entries[g_active_bank];
+
+  uint32_t end = cursor + SCAN_WINDOW;
+  if (end > g_capacity) end = g_capacity;
+
+  uint32_t count = 0;
+
+  for (uint32_t position = cursor; position < end; position += GROUP_WIDTH) {
+    /* match_special selects EMPTY and DELETED, so its complement is live. */
+    uint32_t live = ~match_special(control, position) & 0xffffu;
+
+    while (live != 0) {
+      const uint32_t slot = position + ctz32(live);
+      live &= live - 1u;
+      g_bulk_keys[count] = entries[slot].key;
+      g_bulk_vals_lo[count] = entries[slot].lo;
+      g_bulk_vals_hi[count] = entries[slot].hi;
+      count++;
+    }
+  }
+
+  return (int32_t)count;
+}

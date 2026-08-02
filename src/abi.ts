@@ -48,6 +48,196 @@ export const STATUS_INVALID_ARGUMENT = -3;
 export const DELETE_MANY_FAILED = -1;
 
 /**
+ * The exports {@link scanWindows} drives. Both modules provide them.
+ *
+ * @internal
+ */
+export interface ScanExports {
+  /** Stages the live entries in the slot window at `cursor`, returning how
+   *  many, or a negative status if it rejected the cursor. */
+  scan(cursor: number): number;
+  /** Slots one {@link ScanExports.scan} call visits. */
+  scan_window(): number;
+  /** Counter bumped by every rehash, clear, and init. */
+  generation(): number;
+  /** Number of allocated slots. */
+  capacity(): number;
+}
+
+/**
+ * Thrown when the table is rehashed while an iterator is open.
+ *
+ * @internal
+ */
+export const REHASHED_DURING_ITERATION =
+  "the table was rehashed during iteration, so the cursor no longer refers " +
+  "to the entries it did when the walk started";
+
+/**
+ * Walks the whole slot space one window at a time, calling `receive` with
+ * the number of entries the module staged for each.
+ *
+ * The windows `[0, W)`, `[W, 2W)`, … partition the slot space, so every live
+ * slot falls in exactly one and is reported exactly once. Nothing is carried
+ * across a call but the cursor, which is why two iterators over the same
+ * table can be advanced alternately without either observing the other.
+ *
+ * `receive` runs before the yield, while the staged chunk is still intact.
+ * Copying it out there is what makes the iterator safe against a bulk call
+ * issued between two `next()`s: the module's staging buffers are shared, the
+ * caller's copy is not.
+ *
+ * A rehash renumbers the slots, so a cursor held across one names different
+ * entries than it did — some skipped, some repeated, with nothing in the
+ * data to show it. The generation counter is checked before each window and
+ * the walk is abandoned rather than allowed to report a mixture. Mutations
+ * that leave the slots in place (an insert with room, a delete) are not
+ * errors; whether the walk observes them is unspecified.
+ *
+ * @param wasm - The module being iterated.
+ * @param window - Slots per call, from `scan_window()`.
+ * @param receive - Copies the staged chunk out. Called once per window.
+ * @yields The entry count staged for each window, in cursor order.
+ * @throws {Error} If the table is rehashed, cleared, or re-inited mid-walk,
+ *   or if the module rejects a cursor this function generated.
+ * @internal
+ */
+export function scanWindows(
+  wasm: ScanExports,
+  window: number,
+  receive: (count: number) => void,
+): Generator<number> {
+  // Read here rather than inside the generator, which would not run until
+  // the first next(). A caller sizes its chunk buffers from the capacity it
+  // sees when it builds the walk; deferring these would let a rehash in
+  // between go unnoticed and stage a chunk larger than those buffers.
+  return walkWindows(
+    wasm,
+    window,
+    receive,
+    wasm.capacity() >>> 0,
+    wasm.generation() >>> 0,
+  );
+}
+
+/** The walk itself, over the capacity and generation {@link scanWindows}
+ *  pinned when it was called. */
+function* walkWindows(
+  wasm: ScanExports,
+  window: number,
+  receive: (count: number) => void,
+  capacity: number,
+  generation: number,
+): Generator<number> {
+  for (let cursor = 0; cursor < capacity; cursor += window) {
+    if ((wasm.generation() >>> 0) !== generation) {
+      throw new Error(REHASHED_DURING_ITERATION);
+    }
+
+    const count = wasm.scan(cursor);
+
+    // Only an unaligned cursor is rejected, and every cursor here is a
+    // multiple of the window, itself a multiple of the group width. A
+    // module that reports one anyway is not the one this was written for.
+    if (count < 0) {
+      throw new Error(`scan rejected cursor ${cursor} with status ${count}`);
+    }
+
+    receive(count);
+    yield count;
+  }
+}
+
+/**
+ * The single exhausted result, shared by every iterator.
+ *
+ * Reusing it is safe where reusing a `{value, done: false}` record would not
+ * be: it carries no value, and consumers stop at the first `done`.
+ */
+const EXHAUSTED: IteratorReturnResult<undefined> = Object.freeze({
+  value: undefined,
+  done: true,
+});
+
+/**
+ * Iterator protocol over a table, refilled one slot window at a time.
+ *
+ * Written as an explicit `next()` rather than a generator, which is not
+ * stylistic: a generator resumes its frame once per entry, and measured
+ * against an iterator object over the same data that costs about 2x. The
+ * window walk underneath is still {@link scanWindows} — its own frame
+ * resumes once per window, roughly once per 57000 entries at the load
+ * factor, so it costs nothing per entry.
+ *
+ * Subclasses supply the two per-entry halves: {@link ScanIterator.receive}
+ * copies a staged chunk out of the module, and {@link ScanIterator.at}
+ * projects one element of it.
+ *
+ * @internal
+ */
+export abstract class ScanIterator<T> implements IterableIterator<T> {
+  /** Walk over the slot windows; yields the entry count staged for each. */
+  private readonly walk: Generator<number>;
+
+  /** Next element of the current chunk to project. */
+  private index = 0;
+
+  /** Live elements in the current chunk. */
+  private count = 0;
+
+  protected constructor(wasm: ScanExports, window: number) {
+    this.walk = scanWindows(wasm, window, (count) => this.receive(count));
+  }
+
+  /** Copies a staged chunk out of the module's buffers. */
+  protected abstract receive(count: number): void;
+
+  /** Projects element `index` of the chunk last received. */
+  protected abstract at(index: number): T;
+
+  next(): IteratorResult<T> {
+    // A window can be entirely empty, so this loops rather than branches:
+    // a sparse table has stretches of slots that stage nothing at all.
+    while (this.index >= this.count) {
+      const step = this.walk.next();
+      if (step.done === true) return EXHAUSTED;
+      this.count = step.value;
+      this.index = 0;
+    }
+
+    // A fresh record per entry, as the built-in iterators produce. Reusing
+    // one measured about 1.6x faster, and is what a library willing to
+    // deviate here would do — but it breaks holding two results from
+    // consecutive next() calls, and even reused this path does not overtake
+    // Map. forEach is the answer for a hot loop; it allocates nothing.
+    return { value: this.at(this.index++), done: false };
+  }
+
+  [Symbol.iterator](): IterableIterator<T> {
+    return this;
+  }
+}
+
+/**
+ * Asserts an iteration callback is callable before the walk begins.
+ *
+ * `Map.prototype.forEach` rejects a non-function up front rather than at the
+ * first entry, so an empty table reports the mistake the same way a full one
+ * does. This keeps that.
+ *
+ * @param value - The caller-supplied argument.
+ * @param name - Method name, for the message.
+ * @throws {TypeError} If `value` is not a function.
+ * @internal
+ */
+export function asCallback<T>(value: T, name: string): T {
+  if (typeof value !== "function") {
+    throw new TypeError(`${name} expects a function`);
+  }
+  return value;
+}
+
+/**
  * Validates an unsigned 32-bit integer and hands back its int32 bit pattern.
  *
  * `x >>> 0` is the identity exactly on the u32 range, so the single

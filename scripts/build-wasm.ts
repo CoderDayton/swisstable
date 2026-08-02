@@ -51,6 +51,8 @@ const TARGETS: readonly WasmTarget[] = [
   {
     name: "swiss_u32",
     source: "swiss_u32.c",
+    // 18 MiB of table banks (2 MiB control + 16 MiB of 8-byte entries)
+    // plus 0.5 MiB of scan staging buffers.
     memoryBytes: 20 * MIB,
     exports: [
       "init",
@@ -61,6 +63,11 @@ const TARGETS: readonly WasmTarget[] = [
       "last_value_ptr",
       "set",
       "delete_key",
+      "scan",
+      "scan_window",
+      "scan_keys_ptr",
+      "scan_values_ptr",
+      "generation",
       "size",
       "capacity",
     ],
@@ -88,6 +95,9 @@ const TARGETS: readonly WasmTarget[] = [
       "bulk_vals_lo_ptr",
       "bulk_vals_hi_ptr",
       "bulk_flags_ptr",
+      "scan",
+      "scan_window",
+      "generation",
       "size",
       "capacity",
     ],

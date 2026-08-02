@@ -8,7 +8,7 @@ on:
 
 permissions:
   contents: write # create the release and upload assets
-  id-token: write # reserved for npm provenance, see the publish step
+  id-token: write # mint the OIDC token npm provenance signs with
 
 # Never cancel a release mid-flight; a half-published version is worse than a
 # queued one.
@@ -65,14 +65,16 @@ jobs:
       - name: Test
         run: bun test
 
-      # Pack once and publish that exact file, so the tarball attached to the
-      # release is byte-for-byte the one on npm rather than a second build.
+      # Produces the tarball attached to the release. It is packed from the
+      # same tree publish uses, so the contents match, but npm publishes its
+      # own pack rather than this file -- provenance is only documented for
+      # publishing a directory, so the tarball is the asset, not the input.
       #
       # --ignore-scripts matters for more than speed: npm pack runs `prepare`,
       # and lefthook writes "sync hooks: ..." to stdout, which would end up
       # captured as part of the filename. The build already ran above, so
       # there is nothing for the lifecycle scripts to contribute here.
-      - name: Pack
+      - name: Pack the release asset
         id: pack
         run: |
           tarball="$(npm pack --silent --ignore-scripts)"
@@ -80,10 +82,11 @@ jobs:
           echo "packed $tarball"
           npm pack --dry-run --ignore-scripts
 
-      # Add --provenance once the repository and package are public; npm
-      # rejects provenance for private repositories.
+      # --access public is required on a first publish. Provenance needs the
+      # id-token permission above, a GitHub-hosted runner, and package.json's
+      # repository field to match this repository case-sensitively.
       - name: Publish to npm
-        run: npm publish "${{ steps.pack.outputs.tarball }}" --access public --ignore-scripts
+        run: npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 

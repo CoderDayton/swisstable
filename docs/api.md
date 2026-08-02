@@ -13,6 +13,21 @@ the signatures. For a guided tour instead, start at
 
 ## Rules that apply everywhere
 
+Arguments are validated at the boundary and rejected by name, so a mistake
+reports the parameter you wrote rather than surfacing later as an internal
+error:
+
+| Argument | Requirement | On violation |
+| --- | --- | --- |
+| Keys, values, `expectedEntries`, `entries` | Unsigned 32-bit integer | `RangeError` naming the parameter |
+| Bulk `keys`, `valsLo`, `valsHi` | `Uint32Array` exactly | `TypeError` — another typed array would be reinterpreted, not converted |
+| `span` | Object with u32 `offset` and `length` | `TypeError`, then `RangeError` naming `span.offset` / `span.length` |
+| Interner keys and parts | `string` | `TypeError` — a non-string would break `resolve`'s return type |
+| `new InternedSwissMap(table)` | Object with `set`/`get`/`has`/`delete` | `TypeError` at construction, not at first use |
+
+Bulk arguments are checked once per call, never per key.
+
+
 **Keys and values are strictly unsigned 32-bit.** Negatives, fractions,
 `NaN`, and anything past `2³² − 1` throw `RangeError` rather than being
 coerced. The check is `(x >>> 0) === x`, which is exact on the u32 range, and

@@ -1,3 +1,5 @@
+import { asString } from "./abi.ts";
+
 /**
  * The minimal numeric-table contract {@link InternedSwissMap} depends on.
  *
@@ -58,6 +60,8 @@ export class StringInterner {
    * @throws {RangeError} If the u32 ID space is exhausted.
    */
   intern(text: string): number {
+    asString(text, "text");
+
     const existing = this.stringToId.get(text);
     if (existing !== undefined) return existing;
 
@@ -93,6 +97,7 @@ export class StringInterner {
    * @returns The ID, or `undefined` if `text` was never interned.
    */
   lookup(text: string): number | undefined {
+    asString(text, "text");
     return this.stringToId.get(text);
   }
 
@@ -168,6 +173,9 @@ export class StringInterner {
 function encodeParts(parts: readonly string[]): string {
   let encoded = "";
   for (const part of parts) {
+    // A non-string part has no length, which would encode as "undefined:"
+    // and collide with any other non-string in the same position.
+    asString(part, "part");
     encoded += part.length;
     encoded += ":";
     encoded += part;
@@ -206,6 +214,22 @@ export class InternedSwissMap<V> {
    *   one ID space. A fresh interner is created when omitted.
    */
   constructor(table: NumericKeyTable<V>, interner = new StringInterner()) {
+    // Checked here rather than at first use: a map built around the wrong
+    // object otherwise fails somewhere far from the line that built it.
+    if (table === null || typeof table !== "object") {
+      throw new TypeError("table must be a NumericKeyTable");
+    }
+
+    for (const method of ["set", "get", "has", "delete"] as const) {
+      if (typeof table[method] !== "function") {
+        throw new TypeError(`table must be a NumericKeyTable: ${method} is missing`);
+      }
+    }
+
+    if (!(interner instanceof StringInterner)) {
+      throw new TypeError("interner must be a StringInterner");
+    }
+
     this.table = table;
     this.interner = interner;
   }

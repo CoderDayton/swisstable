@@ -64,6 +64,47 @@ export function asWasmI32(value: number, name: string): number {
  * @throws {Error} If the module reported any other non-zero status.
  * @internal
  */
+/**
+ * Asserts a bulk argument really is a `Uint32Array`.
+ *
+ * Every typed array has `subarray` and `length`, so without this check an
+ * `Int32Array` or `Float64Array` is accepted and quietly reinterpreted as it
+ * is copied into the staging buffer — producing wrong lookups rather than an
+ * error. Checked once per call, never per key.
+ *
+ * @param value - The caller-supplied argument.
+ * @param name - Parameter name, for the message.
+ * @returns `value`, narrowed.
+ * @throws {TypeError} If `value` is not a `Uint32Array`.
+ * @internal
+ */
+export function asKeyArray(value: unknown, name: string): Uint32Array {
+  if (!(value instanceof Uint32Array)) {
+    throw new TypeError(`${name} must be a Uint32Array`);
+  }
+  return value;
+}
+
+/**
+ * Asserts a value is a string before it is used as an interning key.
+ *
+ * A `Map` accepts any key, so an accidental number or `null` would be
+ * interned and later handed back by `resolve`, breaking its declared
+ * `string | undefined` return.
+ *
+ * @param value - The caller-supplied argument.
+ * @param name - Parameter name, for the message.
+ * @returns `value`, narrowed.
+ * @throws {TypeError} If `value` is not a string.
+ * @internal
+ */
+export function asString(value: unknown, name: string): string {
+  if (typeof value !== "string") {
+    throw new TypeError(`${name} must be a string`);
+  }
+  return value;
+}
+
 export function assertStatus(
   status: number,
   operation: string,

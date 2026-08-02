@@ -62,7 +62,7 @@ bun run build      # both steps below
 bun run build:wasm # native/*.c -> dist/wasm/*.wasm + src/generated/*.ts
 bun run build:js   # src/*.ts   -> dist/js/*.js + .d.ts
 
-bun test           # 55 tests across 5 suites
+bun test           # 66 tests across 6 suites
 bun run typecheck  # tsc --noEmit
 bun run bench      # throughput against Map, Object, Int32Array
 ```

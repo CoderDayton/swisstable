@@ -1,4 +1,4 @@
-import { asWasmI32, assertStatus } from "./abi.ts";
+import { asKeyArray, asWasmI32, assertStatus } from "./abi.ts";
 import { embeddedModule } from "./embedded.ts";
 import { SWISS_U64_WASM_BASE64 } from "./generated/swiss_u64.ts";
 import { instantiate } from "./wasm.ts";
@@ -121,6 +121,11 @@ export interface BulkDeleteResult {
  * masking would turn an out-of-range `offset` or a fractional `length` into
  * a different, silently valid u32, defeating the validation
  * {@link SwissU32ToU64.set} performs at the boundary.
+ *
+ * This is a pure conversion and validates nothing, by design: the fields are
+ * carried through so {@link SwissU32ToU64.set} sees the value the caller
+ * actually wrote and can reject it. Validation lives at the boundary, in
+ * {@link SwissU32ToU64.setSpan}.
  *
  * @param span - Region to encode.
  * @returns The span as `{lo: offset, hi: length}`.
@@ -453,6 +458,16 @@ export class SwissU32ToU64 {
    *   32-bit integer, or if the insert would exceed the compiled capacity.
    */
   setSpan(key: number, span: Span): this {
+    // Reported against the field the caller wrote: letting a bad span reach
+    // set() would complain about `lo` or `hi`, names that appear nowhere in
+    // the span API.
+    if (span === null || typeof span !== "object") {
+      throw new TypeError("span must be an object with offset and length");
+    }
+
+    asWasmI32(span.offset, "span.offset");
+    asWasmI32(span.length, "span.length");
+
     const lanes = spanToLanes(span);
     return this.set(key, lanes.lo, lanes.hi);
   }
@@ -482,6 +497,10 @@ export class SwissU32ToU64 {
    *   inserts would exceed the compiled capacity.
    */
   setMany(keys: Uint32Array, valsLo: Uint32Array, valsHi: Uint32Array): void {
+    asKeyArray(keys, "keys");
+    asKeyArray(valsLo, "valsLo");
+    asKeyArray(valsHi, "valsHi");
+
     const total = keys.length;
 
     if (valsLo.length !== total || valsHi.length !== total) {
@@ -521,6 +540,8 @@ export class SwissU32ToU64 {
    *   allocated once per call.
    */
   getMany(keys: Uint32Array): BulkGetResult {
+    asKeyArray(keys, "keys");
+
     const total = keys.length;
 
     const valsLo = new Uint32Array(total);
@@ -560,6 +581,8 @@ export class SwissU32ToU64 {
    * @returns Per-key removal flags and the total removed.
    */
   deleteMany(keys: Uint32Array): BulkDeleteResult {
+    asKeyArray(keys, "keys");
+
     const total = keys.length;
     const deleted = new Uint8Array(total);
     let removedCount = 0;

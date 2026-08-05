@@ -6,8 +6,8 @@
  * the same operation sequence, so the numbers differ only by container.
  * Run `bun run build` first; the WASM contenders need dist/wasm.
  *
- * Usage: bun run bench [--scenario=name,...] [--json] [--help]
- * Scenarios: fill, lookup, bulk, string-keys, iteration, shrink, scale-sweep
+ * Usage: bun run bench [--scenario=name,...] [--json] [--no-isolate] [--help]
+ * `--help` lists the scenarios.
  */
 
 import { InternedSwissMap, SwissU32ToU32, SwissU32ToU64 } from "../src/index.ts";
@@ -15,7 +15,12 @@ import type { U64Lanes } from "../src/index.ts";
 
 const ENTRY_COUNT = 100_000;
 const WARMUP_ROUNDS = 3;
-const MEASURED_ROUNDS = 7;
+
+/**
+ * Rounds taken per contender, reduced by median. Tripled from 7 to tighten
+ * the estimate; unlike a best-of, a median does not drift as this grows.
+ */
+const MEASURED_ROUNDS = 21;
 const NS_PER_SECOND = 1_000_000_000;
 
 /**
@@ -53,6 +58,43 @@ function makeSparseKeys(count: number, seed = 0x9e3779b9): Uint32Array {
 function makeDenseKeys(count: number): Uint32Array {
   return Uint32Array.from({ length: count }, (_, i) => i);
 }
+
+/**
+ * A copy of `keys` in a scrambled order, for use as the probe sequence.
+ *
+ * Probing in insertion order is not a neutral choice. `Map` keeps its
+ * entries in insertion order, so asking for them back in that same order
+ * walks its entry table sequentially and hands it the prefetcher; with
+ * dense integer keys its bucket index goes near-sequentially too. Measured,
+ * that is worth ~1.6 ns/op to `Map` on dense keys and enough to decide the
+ * ranking. A table that hashes its keys has a scattered layout either way
+ * and gains ~0.2 ns, so insertion-order probing quietly compares a
+ * sequential scan against a random one.
+ *
+ * Seeded, so the probe sequence is the same from run to run.
+ */
+function shuffleProbes(keys: Uint32Array, seed: number): Uint32Array {
+  const probes = keys.slice();
+  let state = seed;
+
+  for (let i = probes.length - 1; i > 0; i--) {
+    state ^= state << 13;
+    state ^= state >>> 17;
+    state ^= state << 5;
+    state >>>= 0;
+
+    const j = state % (i + 1);
+    const swap = probes[i]!;
+    probes[i] = probes[j]!;
+    probes[j] = swap;
+  }
+
+  return probes;
+}
+
+/** Seeds for {@link shuffleProbes}, one per probe sequence built. */
+const PROBE_SEED = 0x6d2b_79f5;
+const SWEEP_PROBE_SEED = 0x1f12_3bb5;
 
 interface Contender {
   readonly name: string;
@@ -157,8 +199,17 @@ async function runRound(
  * measurement only for a field that genuinely has to share one process,
  * which in practice means a before/after of the same container.
  *
- * Reports the best round rather than the mean: the fastest round is the one
- * least polluted by GC pauses and scheduler noise.
+ * Reports the median round, not the best one.
+ *
+ * A minimum over N rounds is biased low, and the size of the bias grows with
+ * both N and the contender's variance — so the reducer itself decides part
+ * of the ranking. It is not a neutral discount either: the noisiest
+ * contenders here are noisy because they allocate, and taking their best
+ * round quietly writes off the collection they caused. Measured, `Map`'s
+ * 100k fill reports 71.2 ns/op as a best-of-7 and 46.2 as a best-of-21,
+ * while the tables — which allocate nothing on a hot path — barely move.
+ * Garbage a container generates is part of what it costs, so the median
+ * keeps it. The median is also stable against N, which a minimum is not.
  *
  * `repeatable` marks a workload that leaves no state behind (lookups), which
  * may be replayed within a round to amortize harness overhead. Workloads
@@ -174,26 +225,39 @@ async function measureField(
     ? Math.max(1, Math.ceil(MIN_OPS_PER_ROUND / operations))
     : 1;
 
-  const best = new Array<number>(contenders.length).fill(
-    Number.POSITIVE_INFINITY,
-  );
+  const rounds: number[][] = contenders.map(() => []);
 
   for (let round = 0; round < WARMUP_ROUNDS + MEASURED_ROUNDS; round++) {
     const measured = round >= WARMUP_ROUNDS;
 
+    // Building a scenario leaves megabytes of garbage — key sets, discarded
+    // containers, the staging a warmup round allocated. Collecting it here
+    // rather than letting it fall due mid-measurement is what separates the
+    // harness's litter from the contender's own: a pause charged to whoever
+    // happens to be timed when it lands is noise, and on a small table one
+    // pause is worth more than the work. Measured, it was doubling the
+    // 2,000-entry sweep rows. What a contender allocates itself still
+    // accrues during the measured rounds and is still counted.
+    if (round === WARMUP_ROUNDS) Bun.gc(true);
+
     for (const index of shuffledIndices(contenders.length)) {
       const elapsed = await runRound(contenders[index]!, replays);
-      if (measured && elapsed < best[index]!) best[index] = elapsed;
+      if (measured) rounds[index]!.push(elapsed);
     }
   }
 
   if (checksum === Number.MAX_SAFE_INTEGER) console.log(""); // keep the work live
 
-  return contenders.map((contender, index) => ({
-    name: contender.name,
-    nsPerOp: best[index]! / operations,
-    opsPerSecond: (operations * NS_PER_SECOND) / best[index]!,
-  }));
+  return contenders.map((contender, index) => {
+    const sorted = [...rounds[index]!].sort((a, b) => a - b);
+    const middle = sorted[Math.floor(sorted.length / 2)]!;
+
+    return {
+      name: contender.name,
+      nsPerOp: middle / operations,
+      opsPerSecond: (operations * NS_PER_SECOND) / middle,
+    };
+  });
 }
 
 /**
@@ -239,6 +303,37 @@ let fieldCounter = 0;
 /** Stands in for a field a child was not spawned to measure. */
 function skipped(contender: Contender): Result {
   return { name: contender.name, nsPerOp: 0, opsPerSecond: 0 };
+}
+
+/**
+ * Whether this process will time the next field {@link measureAll} is given.
+ *
+ * Isolation puts each contender in a fresh process, but a scenario with
+ * several fields still runs every earlier field's *setup* in that process
+ * before reaching the one being measured — and that setup leaves containers
+ * alive. Measured, it inflated the small end of the scale sweep by up to
+ * 2.3x: 8,000-entry lookups reported 14 ns/op against 6.2 standalone, and
+ * non-monotonically, since the distortion grows with how many sizes were
+ * built first.
+ *
+ * A scenario whose setup is worth skipping asks this first and, when the
+ * answer is no, hands {@link measureAll} placeholders of the right length —
+ * enough for a parent to know how many children to spawn, while nothing gets
+ * built or kept alive. Only the count matters: the parent reports the names
+ * its children send back, and a child discards non-target fields entirely.
+ */
+function willMeasureNextField(): boolean {
+  if (!isolateFields) return true;
+  if (isolationTarget === null) return false;
+  return isolationTarget.field === fieldCounter;
+}
+
+/** Placeholders for a field this process builds no state for. */
+function unbuilt(length: number): Contender[] {
+  return Array.from({ length }, (_, index) => ({
+    name: `unbuilt ${index}`,
+    prepare: () => () => 0,
+  }));
 }
 
 /**
@@ -492,9 +587,22 @@ async function lookupScenario(
   hit: boolean,
 ): Promise<void> {
   const count = keys.length;
-  const probes = hit
-    ? keys
-    : Uint32Array.from(keys, (key) => (key ^ MISS_KEY_OFFSET) >>> 0);
+  const dense = label.startsWith("dense");
+
+  // Four lookup fields share this process; building the other three's
+  // containers first would leave them resident during this one's timing.
+  if (!willMeasureNextField()) {
+    report(
+      `lookup ${hit ? "hit" : "miss"} — ${label}`,
+      await measureAll(unbuilt(dense ? 4 : 3), count, true),
+    );
+    return;
+  }
+
+  const probes = shuffleProbes(
+    hit ? keys : Uint32Array.from(keys, (key) => (key ^ MISS_KEY_OFFSET) >>> 0),
+    PROBE_SEED,
+  );
 
   const map = new Map<number, number>();
   const object: Record<number, number> = {};
@@ -687,12 +795,49 @@ async function stringKeyScenario(count: number): Promise<void> {
  * function of working-set size. The tables store ~10 B/entry against Map's
  * ~24-32 B/entry, which only pays off once Map spills a cache level and the
  * tables do not — a crossover in N, not a constant factor. Sweep to find it.
+ *
+ * KNOWN DEFECT — do not quote the two smallest rows. The table's side of
+ * them reads about twice a direct standalone measurement of the same work
+ * (2,000: 9.0 here against 4.7; 8,000: 11.1 against 5.2), while `Map`'s side
+ * and every row from 16,000 up agree with it. The inflation is specific to
+ * the table's path in this harness: it survives a forced GC, resident module
+ * globals, instantiating from bytes rather than a cached module, and the
+ * closure shape the timed region uses — none of which reproduce it in
+ * isolation. Because it hits only the small sizes it lands exactly where the
+ * crossover is decided, so the crossover quoted in docs/performance.md comes
+ * from the standalone measurement (~6k entries), not from this table.
  */
+/** Builds one sweep row from the `[swiss, map]` pair measured for a size. */
+function sweepRow(entries: number, pair: readonly Result[]): ScaleSweepRow {
+  const swissNsPerOp = pair[0]!.nsPerOp;
+  const mapNsPerOp = pair[1]!.nsPerOp;
+  const ratio = swissNsPerOp / mapNsPerOp;
+
+  return {
+    entries,
+    swissNsPerOp,
+    mapNsPerOp,
+    ratio,
+    winner: ratio < 1 ? "SwissTable" : "Map",
+  };
+}
+
 async function scaleSweep(sizes: readonly number[]): Promise<void> {
   const rows: ScaleSweepRow[] = [];
 
   for (const count of sizes) {
+    // Every size is a field of this one scenario, so without this a child
+    // measuring 512,000 would first build all five smaller pairs and hold
+    // them. That is what made the small end read high and non-monotonic.
+    if (!willMeasureNextField()) {
+      // A parent still lands here — it spawns the children and gets their
+      // real results back, so the row is built exactly as below.
+      rows.push(sweepRow(count, await measureAll(unbuilt(2), count, true)));
+      continue;
+    }
+
     const keys = makeSparseKeys(count);
+    const probes = shuffleProbes(keys, SWEEP_PROBE_SEED);
     const map = new Map<number, number>();
 
     // A fresh instance per size: clear() retains the capacity of the
@@ -712,25 +857,15 @@ async function scaleSweep(sizes: readonly number[]): Promise<void> {
         lookupContender(
           "swiss",
           count,
-          (i) => table.get(keys[i]!) !== undefined,
+          (i) => table.get(probes[i]!) !== undefined,
         ),
-        lookupContender("map", count, (i) => map.get(keys[i]!) !== undefined),
+        lookupContender("map", count, (i) => map.get(probes[i]!) !== undefined),
       ],
       count,
       true,
     );
 
-    const swissResult = pair[0]!;
-    const mapResult = pair[1]!;
-    const ratio = swissResult.nsPerOp / mapResult.nsPerOp;
-
-    rows.push({
-      entries: count,
-      swissNsPerOp: swissResult.nsPerOp,
-      mapNsPerOp: mapResult.nsPerOp,
-      ratio,
-      winner: ratio < 1 ? "SwissTable" : "Map",
-    });
+    rows.push(sweepRow(count, pair));
   }
 
   reports.push({ kind: "scale-sweep", rows });
@@ -950,12 +1085,508 @@ async function shrinkScenario(peak: number, remaining: number): Promise<void> {
   );
 }
 
+/**
+ * Removal, which nothing else here covers.
+ *
+ * Not repeatable: the second pass would delete keys that are already gone
+ * and measure the miss path instead. Every round refills in `prepare`.
+ */
+async function deleteScenario(keys: Uint32Array): Promise<void> {
+  const count = keys.length;
+  const probes = shuffleProbes(keys, PROBE_SEED);
+
+  const contenders: Contender[] = [
+    {
+      name: "SwissU32ToU32.delete (wasm)",
+      prepare: () => {
+        swiss.clear();
+        for (let i = 0; i < count; i++) swiss.set(keys[i]!, i);
+        return () => {
+          let removed = 0;
+          for (let i = 0; i < count; i++) if (swiss.delete(probes[i]!)) removed++;
+          return removed;
+        };
+      },
+    },
+    {
+      name: "Map.delete",
+      prepare: () => {
+        const map = new Map<number, number>();
+        for (let i = 0; i < count; i++) map.set(keys[i]!, i);
+        return () => {
+          let removed = 0;
+          for (let i = 0; i < count; i++) if (map.delete(probes[i]!)) removed++;
+          return removed;
+        };
+      },
+    },
+    {
+      name: "Object (delete operator)",
+      prepare: () => {
+        const object: Record<number, number> = {};
+        for (let i = 0; i < count; i++) object[keys[i]!] = i;
+        return () => {
+          let removed = 0;
+          for (let i = 0; i < count; i++) {
+            if (delete object[probes[i]!]) removed++;
+          }
+          return removed;
+        };
+      },
+    },
+  ];
+
+  report(
+    `delete ${count.toLocaleString()} entries — sparse keys`,
+    await measureAll(contenders, count),
+  );
+}
+
+/**
+ * `has` against `get`. The tables latch a found value into linear memory
+ * whether or not the caller wants it, so `has` should be the cheaper call
+ * only by the result read it skips.
+ */
+async function hasScenario(keys: Uint32Array): Promise<void> {
+  const count = keys.length;
+  const probes = shuffleProbes(keys, PROBE_SEED);
+
+  swiss.clear();
+  const map = new Map<number, number>();
+  const object: Record<number, number> = {};
+
+  for (let i = 0; i < count; i++) {
+    swiss.set(keys[i]!, i);
+    map.set(keys[i]!, i);
+    object[keys[i]!] = i;
+  }
+
+  report(
+    `has ${count.toLocaleString()} keys — sparse keys`,
+    await measureAll(
+      [
+        lookupContender("SwissU32ToU32.has (wasm)", count, (i) =>
+          swiss.has(probes[i]!),
+        ),
+        lookupContender("SwissU32ToU32.get (wasm)", count, (i) =>
+          swiss.get(probes[i]!) !== undefined,
+        ),
+        lookupContender("Map.has", count, (i) => map.has(probes[i]!)),
+        lookupContender(
+          "Object (in operator)",
+          count,
+          (i) => probes[i]! in object,
+        ),
+      ],
+      count,
+      true,
+    ),
+  );
+}
+
+/**
+ * Overwriting keys that are already present. Distinct from a fill: no slot
+ * is claimed, nothing grows, and the table never rehashes — but `set` still
+ * pays the probe that confirms the key is there.
+ *
+ * Replaying is safe because an overwrite leaves the table exactly as it was.
+ */
+async function overwriteScenario(keys: Uint32Array): Promise<void> {
+  const count = keys.length;
+
+  swiss.clear();
+  const map = new Map<number, number>();
+
+  for (let i = 0; i < count; i++) {
+    swiss.set(keys[i]!, i);
+    map.set(keys[i]!, i);
+  }
+
+  report(
+    `overwrite ${count.toLocaleString()} existing keys — sparse keys`,
+    await measureAll(
+      [
+        {
+          name: "SwissU32ToU32.set (wasm)",
+          prepare: () => () => {
+            for (let i = 0; i < count; i++) swiss.set(keys[i]!, i + 1);
+            return swiss.size;
+          },
+        },
+        {
+          name: "Map.set",
+          prepare: () => () => {
+            for (let i = 0; i < count; i++) map.set(keys[i]!, i + 1);
+            return map.size;
+          },
+        },
+      ],
+      count,
+      true,
+    ),
+  );
+}
+
+/**
+ * Steady-state churn: delete a key, insert it straight back.
+ *
+ * This is what the tombstone design exists for. A removal writes `DELETED`
+ * rather than `EMPTY` so it cannot truncate another key's probe sequence,
+ * and the re-insert reclaims that tombstone without consuming growth — so a
+ * table under pure churn should hold its capacity and never rehash. Counted
+ * as two operations per key.
+ */
+async function churnScenario(keys: Uint32Array): Promise<void> {
+  const count = keys.length;
+  const probes = shuffleProbes(keys, PROBE_SEED);
+
+  const contenders: Contender[] = [
+    {
+      name: "SwissU32ToU32 delete + set (wasm)",
+      prepare: () => {
+        swiss.clear();
+        for (let i = 0; i < count; i++) swiss.set(keys[i]!, i);
+        return () => {
+          for (let i = 0; i < count; i++) {
+            swiss.delete(probes[i]!);
+            swiss.set(probes[i]!, i);
+          }
+          return swiss.size;
+        };
+      },
+    },
+    {
+      name: "Map delete + set",
+      prepare: () => {
+        const map = new Map<number, number>();
+        for (let i = 0; i < count; i++) map.set(keys[i]!, i);
+        return () => {
+          for (let i = 0; i < count; i++) {
+            map.delete(probes[i]!);
+            map.set(probes[i]!, i);
+          }
+          return map.size;
+        };
+      },
+    },
+  ];
+
+  report(
+    `churn ${count.toLocaleString()} keys (delete + reinsert)`,
+    await measureAll(contenders, count * 2),
+  );
+}
+
+/**
+ * Lookup cost against how full the table is.
+ *
+ * Entry count is held fixed and capacity is varied, so the probe sequence
+ * lengthens without the entry working set changing. The control array grows
+ * as load falls, which pulls the other way — these are not separable, and
+ * the point is the net effect a caller sees, not an isolated probe count.
+ */
+async function loadFactorScenario(entries: number): Promise<void> {
+  const keys = makeSparseKeys(entries);
+  const probes = shuffleProbes(keys, PROBE_SEED);
+  const contenders: Contender[] = [];
+
+  for (const reserved of [entries, entries * 2, entries * 4, entries * 8]) {
+    const table = await SwissU32ToU32.load(u32Bytes, reserved);
+    for (let i = 0; i < entries; i++) table.set(keys[i]!, i);
+
+    const load = ((entries / table.capacity) * 100).toFixed(0);
+    contenders.push(
+      lookupContender(
+        `${load}% full (${table.capacity.toLocaleString()} slots)`,
+        entries,
+        (i) => table.get(probes[i]!) !== undefined,
+      ),
+    );
+  }
+
+  report(
+    `lookup ${entries.toLocaleString()} keys vs load factor`,
+    await measureAll(contenders, entries, true),
+  );
+}
+
+/**
+ * How quickly a bulk call amortizes its crossing.
+ *
+ * Every contender moves the same 100k keys; only the batch handed to one
+ * call changes. A batch of 1 is the per-key path plus staging overhead, and
+ * the curve from there shows where the crossing stops mattering.
+ */
+async function batchSweepScenario(keys: Uint32Array): Promise<void> {
+  const count = keys.length;
+  const valsLo = Uint32Array.from({ length: count }, (_, i) => i);
+  const valsHi = Uint32Array.from({ length: count }, (_, i) => i * 2);
+  const sizes = [1, 8, 64, 512, 4096, count];
+
+  swiss64.clear();
+  swiss64.setMany(keys, valsLo, valsHi);
+
+  const getters: Contender[] = sizes.map((batch) => ({
+    name: `getMany batch ${batch.toLocaleString()}`,
+    prepare: () => {
+      const out = {
+        valsLo: new Uint32Array(batch),
+        valsHi: new Uint32Array(batch),
+        found: new Uint8Array(batch),
+      };
+      return () => {
+        let seen = 0;
+        for (let offset = 0; offset < count; offset += batch) {
+          const chunk = keys.subarray(offset, Math.min(offset + batch, count));
+          seen += swiss64.getMany(chunk, out).found.length;
+        }
+        return seen;
+      };
+    },
+  }));
+
+  report(
+    `u64 getMany ${count.toLocaleString()} keys vs batch size`,
+    await measureAll(getters, count, true),
+  );
+
+  const setters: Contender[] = sizes.map((batch) => ({
+    name: `setMany batch ${batch.toLocaleString()}`,
+    prepare: () => {
+      swiss64.clear();
+      swiss64.reserve(count);
+      return () => {
+        for (let offset = 0; offset < count; offset += batch) {
+          const end = Math.min(offset + batch, count);
+          swiss64.setMany(
+            keys.subarray(offset, end),
+            valsLo.subarray(offset, end),
+            valsHi.subarray(offset, end),
+          );
+        }
+        return swiss64.size;
+      };
+    },
+  }));
+
+  report(
+    `u64 setMany ${count.toLocaleString()} entries vs batch size`,
+    await measureAll(setters, count),
+  );
+}
+
+/** Bulk removal against the per-key path and against `Map`. */
+async function deleteManyScenario(keys: Uint32Array): Promise<void> {
+  const count = keys.length;
+  const valsLo = Uint32Array.from({ length: count }, (_, i) => i);
+  const valsHi = Uint32Array.from({ length: count }, (_, i) => i * 2);
+
+  const refill = (): void => {
+    swiss64.clear();
+    swiss64.setMany(keys, valsLo, valsHi);
+  };
+
+  const contenders: Contender[] = [
+    {
+      name: "SwissU32ToU64.deleteMany (wasm)",
+      prepare: () => {
+        refill();
+        return () => swiss64.deleteMany(keys).removedCount;
+      },
+    },
+    {
+      name: "SwissU32ToU64.delete (per key)",
+      prepare: () => {
+        refill();
+        return () => {
+          let removed = 0;
+          for (let i = 0; i < count; i++) if (swiss64.delete(keys[i]!)) removed++;
+          return removed;
+        };
+      },
+    },
+    {
+      name: "Map<number, bigint>.delete",
+      prepare: () => {
+        const map = new Map<number, bigint>();
+        for (let i = 0; i < count; i++) map.set(keys[i]!, BigInt(i));
+        return () => {
+          let removed = 0;
+          for (let i = 0; i < count; i++) if (map.delete(keys[i]!)) removed++;
+          return removed;
+        };
+      },
+    },
+  ];
+
+  report(
+    `u64 delete ${count.toLocaleString()} entries — sparse keys`,
+    await measureAll(contenders, count),
+  );
+}
+
+/**
+ * The int32 tagging cliff, at the public API rather than in a micro-test.
+ *
+ * A JavaScript number at or above 2^31 cannot be tagged as a machine int32,
+ * so it reaches a WASM `i32` parameter as a boxed double and is converted at
+ * the boundary. Every key here is a valid `u32` and every contender does the
+ * same lookups; only how the caller stores them differs. See
+ * docs/performance.md.
+ */
+async function taggingScenario(count: number): Promise<void> {
+  const low = makeSparseKeys(count, 0x1234_5678);
+  for (let i = 0; i < count; i++) low[i] = low[i]! >>> 1; // now all < 2^31
+
+  const high = Uint32Array.from(low, (key) => (key | 0x8000_0000) >>> 0);
+  const boxed = Array.from(high);
+
+  const lowTable = await SwissU32ToU32.load(u32Bytes, count);
+  const highTable = await SwissU32ToU32.load(u32Bytes, count);
+
+  for (let i = 0; i < count; i++) {
+    lowTable.set(low[i]!, i);
+    highTable.set(high[i]!, i);
+  }
+
+  report(
+    `has ${count.toLocaleString()} keys vs argument tagging`,
+    await measureAll(
+      [
+        lookupContender("keys < 2^31 (int32-tagged)", count, (i) =>
+          lowTable.has(low[i]!),
+        ),
+        lookupContender("keys >= 2^31 (boxed double)", count, (i) =>
+          highTable.has(high[i]!),
+        ),
+        lookupContender("plain Array source (always double)", count, (i) =>
+          highTable.has(boxed[i]!),
+        ),
+      ],
+      count,
+      true,
+    ),
+  );
+}
+
+/**
+ * The whole-table operations, each measured as one call.
+ *
+ * Not repeatable and rebuilt every round: `clear` and `shrinkToFit` are only
+ * expensive the first time, and a second `reserve` to the same size is a
+ * no-op by design.
+ */
+async function maintenanceScenario(count: number): Promise<void> {
+  const keys = makeSparseKeys(count);
+
+  const filled = async (reserved: number): Promise<SwissU32ToU32> => {
+    const table = await SwissU32ToU32.load(u32Bytes, reserved);
+    for (let i = 0; i < count; i++) table.set(keys[i]!, i);
+    return table;
+  };
+
+  const contenders: Contender[] = [
+    {
+      name: "clear() a full table",
+      prepare: async () => {
+        const table = await filled(count);
+        return () => {
+          table.clear();
+          return table.size;
+        };
+      },
+    },
+    {
+      name: "reserve() forcing one rehash",
+      prepare: async () => {
+        const table = await filled(count);
+        return () => {
+          table.reserve(count * 4);
+          return table.capacity;
+        };
+      },
+    },
+    {
+      name: "shrinkToFit() after emptying",
+      prepare: async () => {
+        const table = await filled(count);
+        for (let i = 8; i < count; i++) table.delete(keys[i]!);
+        return () => {
+          table.shrinkToFit();
+          return table.capacity;
+        };
+      },
+    },
+  ];
+
+  report(
+    `whole-table operations at ${count.toLocaleString()} entries`,
+    await measureAll(contenders, 1),
+  );
+}
+
+/**
+ * Interning strings, which the string-key scenario only ever measures the
+ * lookup side of. Interning is the half that has to copy and hash bytes.
+ */
+async function internScenario(count: number): Promise<void> {
+  const strings = Array.from({ length: count }, (_, i) => `token:${i}:${i * 7}`);
+
+  const contenders: Contender[] = [
+    {
+      name: "InternedSwissMap.set (per key)",
+      prepare: async () => {
+        const table = await SwissU32ToU32.load(u32Bytes, count);
+        const interned = new InternedSwissMap<number>(table);
+        return () => {
+          for (let i = 0; i < count; i++) interned.set(strings[i]!, i);
+          return interned.size;
+        };
+      },
+    },
+    {
+      name: "Map<string, number>.set",
+      prepare: () => {
+        const map = new Map<string, number>();
+        return () => {
+          for (let i = 0; i < count; i++) map.set(strings[i]!, i);
+          return map.size;
+        };
+      },
+    },
+    {
+      name: "Object (string keys)",
+      prepare: () => {
+        const object: Record<string, number> = Object.create(null);
+        return () => {
+          for (let i = 0; i < count; i++) object[strings[i]!] = i;
+          return count;
+        };
+      },
+    },
+  ];
+
+  report(
+    `string keys: insert ${count.toLocaleString()} keys`,
+    await measureAll(contenders, count),
+  );
+}
+
 const SCENARIO_NAMES = [
   "fill",
   "lookup",
+  "has",
+  "overwrite",
+  "delete",
+  "churn",
   "bulk",
+  "batch-sweep",
+  "delete-many",
+  "load-factor",
+  "tagging",
   "string-keys",
   "iteration",
+  "maintenance",
   "shrink",
   "scale-sweep",
 ] as const;
@@ -1049,10 +1680,23 @@ const scenarios: Record<ScenarioName, () => Promise<void>> = {
     await lookupScenario("sparse keys", sparseKeys, true);
     await lookupScenario("sparse keys", sparseKeys, false);
     await lookupScenario("dense keys", denseKeys, true);
+    await lookupScenario("dense keys", denseKeys, false);
   },
+  has: () => hasScenario(sparseKeys),
+  overwrite: () => overwriteScenario(sparseKeys),
+  delete: () => deleteScenario(sparseKeys),
+  churn: () => churnScenario(sparseKeys),
   bulk: () => bulkScenario(sparseKeys),
-  "string-keys": () => stringKeyScenario(ENTRY_COUNT),
+  "batch-sweep": () => batchSweepScenario(sparseKeys),
+  "delete-many": () => deleteManyScenario(sparseKeys),
+  "load-factor": () => loadFactorScenario(50_000),
+  tagging: () => taggingScenario(ENTRY_COUNT),
+  "string-keys": async () => {
+    await internScenario(ENTRY_COUNT);
+    await stringKeyScenario(ENTRY_COUNT);
+  },
   iteration: () => iterationScenario(sparseKeys),
+  maintenance: () => maintenanceScenario(ENTRY_COUNT),
   shrink: () => shrinkScenario(ENTRY_COUNT, 8),
   "scale-sweep": () => scaleSweep([2_000, 8_000, 16_000, 32_000, 128_000, 512_000]),
 };
@@ -1061,7 +1705,7 @@ const selected = options.scenarios ?? new Set<ScenarioName>(SCENARIO_NAMES);
 
 if (!jsonMode && isolationTarget === null) {
   console.log(
-    `${ENTRY_COUNT.toLocaleString()} entries, best of ${MEASURED_ROUNDS} rounds` +
+    `${ENTRY_COUNT.toLocaleString()} entries, median of ${MEASURED_ROUNDS} rounds` +
       ` after ${WARMUP_ROUNDS} warmups — Bun ${Bun.version}` +
       (isolateFields ? ", one process per contender" : ", shared process"),
   );

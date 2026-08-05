@@ -80,6 +80,43 @@ describe.skipIf(!wasmBuilt)("SwissU32ToU64", () => {
     expect(result.valsHi.subarray(0, count)).toEqual(valsHi);
   });
 
+  test("getMany writes into caller-owned out arrays without allocating", async () => {
+    const table = await loadTable();
+
+    const keys = Uint32Array.from({ length: 16 }, (_, i) => i + 1);
+    table.setMany(keys, keys, keys);
+
+    // Oversized buffers are allowed; only the first keys.length elements
+    // are written, so the sentinel past that must survive.
+    const out = {
+      valsLo: new Uint32Array(32).fill(0xdead),
+      valsHi: new Uint32Array(32).fill(0xdead),
+      found: new Uint8Array(32).fill(7),
+    };
+
+    const result = table.getMany(keys, out);
+
+    expect(result).toBe(out);
+    expect(out.valsLo.subarray(0, 16)).toEqual(keys);
+    expect(out.valsHi.subarray(0, 16)).toEqual(keys);
+    expect(out.found.subarray(0, 16)).toEqual(new Uint8Array(16).fill(1));
+    expect(out.valsLo[16]).toBe(0xdead);
+    expect(out.found[16]).toBe(7);
+  });
+
+  test("getMany rejects out arrays shorter than the batch", async () => {
+    const table = await loadTable();
+
+    const keys = Uint32Array.from({ length: 8 }, (_, i) => i + 1);
+    const out = {
+      valsLo: new Uint32Array(8),
+      valsHi: new Uint32Array(8),
+      found: new Uint8Array(4), // too short
+    };
+
+    expect(() => table.getMany(keys, out)).toThrow(RangeError);
+  });
+
   test("chunks batches larger than the module's staging capacity", async () => {
     const table = await loadTable(1 << 17);
     const count = 100_000; // > bulk_capacity (65536), so this spans chunks

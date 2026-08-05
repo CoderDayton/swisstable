@@ -78,6 +78,11 @@ const COMMON_FLAGS = [
   "-Wextra",
   "-Wl,--no-entry",
   "-Wl,--export-memory",
+  // Stack below all data: an overflow then traps as an out-of-bounds
+  // access instead of silently corrupting the table banks in .bss. The
+  // size pins the linker default so the budget is explicit.
+  "-Wl,--stack-first",
+  "-Wl,-z,stack-size=65536",
 ];
 
 interface WasmTarget {

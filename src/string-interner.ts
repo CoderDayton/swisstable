@@ -216,7 +216,13 @@ export class StringInterner {
     const recycled = this.pool.pop();
     const id = recycled ?? this.idToString.length;
 
-    if (id > 0xffff_ffff) {
+    // The highest assignable ID is 0xffff_fffe: the reverse index is a
+    // plain array, whose maximum index is 2**32 - 2, so 0xffff_ffff could
+    // never be stored positionally — pushing it would throw with the
+    // forward map already updated. Checking before any mutation keeps the
+    // two indexes consistent when this throws; a recycled ID was assigned
+    // before, so it is always under the bound.
+    if (id >= 0xffff_ffff) {
       throw new RangeError("StringInterner exhausted the u32 ID space");
     }
 

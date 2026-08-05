@@ -325,17 +325,6 @@ export function asWasmI32(value: number, name: string): number {
 }
 
 /**
- * Translates a native status code into a thrown error, or returns silently.
- *
- * @param status - Value returned by a fallible export.
- * @param operation - Export name, used to build the error message.
- * @param table - Class name of the binding that issued the call.
- * @throws {RangeError} If the module reported that its compiled capacity
- *   would be exceeded.
- * @throws {Error} If the module reported any other non-zero status.
- * @internal
- */
-/**
  * Any numeric sequence the bulk methods accept.
  *
  * Every element must be an integer representable in 32 bits, signed or
@@ -469,7 +458,8 @@ function bigintToU32(value: bigint, name: string, index: number): number {
 }
 
 /**
- * Walks `count` elements of `source`, storing them in `dest` when given one.
+ * Copies `count` elements of `source`, starting at `from`, into `dest`,
+ * validating each element.
  *
  * Integer typed arrays take a bulk `set` and are never inspected per element
  * — the case the bulk API exists for. Everything else is converted one
@@ -477,77 +467,6 @@ function bigintToU32(value: bigint, name: string, index: number): number {
  * information silently: a float array truncates (`1.5` becomes `1`, `2**32`
  * becomes `0`), and a BigInt array cannot convert at all. You pay the
  * per-element cost only for a source that needs it.
- *
- * A `null` `dest` runs the same walk and discards the results, which is how
- * {@link validateU32} checks a batch without staging it. Sharing one walk is
- * what keeps a validation pass from ever accepting an element the staging
- * copy would reject.
- *
- * @param source - Caller-supplied sequence.
- * @param dest - Staging buffer to fill, or `null` to validate only.
- * @param from - First index of `source` to read.
- * @param count - Number of elements to read.
- * @param name - Parameter name, for messages.
- * @throws {TypeError} If `source` is not a supported sequence.
- * @throws {RangeError} If an element is not a 32-bit integer.
- */
-function convertU32(
-  source: BulkU32Source,
-  dest: Uint32Array | null,
-  from: number,
-  count: number,
-  name: string,
-): void {
-  if (isIntegerView(source)) {
-    // Nothing in an integer view can fail, so a validation pass has no work.
-    dest?.set(source.subarray(from, from + count));
-    return;
-  }
-
-  if (source instanceof Float32Array) {
-    for (let i = 0; i < count; i += 1) {
-      const value = float32ElementToU32(source[from + i]!, name, from + i);
-      if (dest) dest[i] = value;
-    }
-    return;
-  }
-
-  if (source instanceof Float64Array) {
-    for (let i = 0; i < count; i += 1) {
-      const value = elementToU32(source[from + i]!, name, from + i);
-      if (dest) dest[i] = value;
-    }
-    return;
-  }
-
-  if (source instanceof BigInt64Array || source instanceof BigUint64Array) {
-    for (let i = 0; i < count; i += 1) {
-      const value = bigintToU32(source[from + i]!, name, from + i);
-      if (dest) dest[i] = value;
-    }
-    return;
-  }
-
-  if (!Array.isArray(source)) {
-    throw new TypeError(`${name} must be an array or typed array of numbers`);
-  }
-
-  for (let i = 0; i < count; i += 1) {
-    const element = source[from + i];
-    let value: number;
-    if (typeof element === "bigint") {
-      value = bigintToU32(element, name, from + i);
-    } else if (typeof element === "number") {
-      value = elementToU32(element, name, from + i);
-    } else {
-      throw new TypeError(`${name}[${from + i}] must be a number`);
-    }
-    if (dest) dest[i] = value;
-  }
-}
-
-/**
- * Copies `count` elements of `source`, starting at `from`, into `dest`.
  *
  * @param source - Caller-supplied sequence.
  * @param dest - Staging buffer to fill.
@@ -565,35 +484,82 @@ export function stageU32(
   count: number,
   name: string,
 ): void {
-  convertU32(source, dest, from, count, name);
+  if (isIntegerView(source)) {
+    // Nothing in an integer view can fail, so this is a single bulk copy.
+    dest.set(source.subarray(from, from + count));
+    return;
+  }
+
+  if (source instanceof Float32Array) {
+    for (let i = 0; i < count; i += 1) {
+      dest[i] = float32ElementToU32(source[from + i]!, name, from + i);
+    }
+    return;
+  }
+
+  if (source instanceof Float64Array) {
+    for (let i = 0; i < count; i += 1) {
+      dest[i] = elementToU32(source[from + i]!, name, from + i);
+    }
+    return;
+  }
+
+  if (source instanceof BigInt64Array || source instanceof BigUint64Array) {
+    for (let i = 0; i < count; i += 1) {
+      dest[i] = bigintToU32(source[from + i]!, name, from + i);
+    }
+    return;
+  }
+
+  if (!Array.isArray(source)) {
+    throw new TypeError(`${name} must be an array or typed array of numbers`);
+  }
+
+  for (let i = 0; i < count; i += 1) {
+    const element = source[from + i];
+    if (typeof element === "bigint") {
+      dest[i] = bigintToU32(element, name, from + i);
+    } else if (typeof element === "number") {
+      dest[i] = elementToU32(element, name, from + i);
+    } else {
+      throw new TypeError(`${name}[${from + i}] must be a number`);
+    }
+  }
 }
 
 /**
- * Checks `count` elements of `source` without copying any of them.
+ * Converts a source into a form that stages with a bulk copy, validating
+ * every element.
  *
- * A batch longer than the staging buffer is applied in several WASM calls, so
- * an element rejected in a later chunk would otherwise throw with the earlier
- * chunks already written to the table. Running the checks over the whole
- * batch first keeps the rejection all-or-nothing.
+ * Integer typed arrays return unchanged: nothing in them can fail, and they
+ * already stage with a single `set`. Every other source comes back as a
+ * fresh Uint32Array of its converted elements.
  *
- * Integer typed arrays cannot fail, so the pre-pass costs nothing for the
- * source type the bulk API exists for.
+ * This is how the chunked bulk methods keep their rejection all-or-nothing —
+ * a batch longer than the staging buffer is applied in several WASM calls,
+ * so an element rejected in a later chunk would otherwise throw with the
+ * earlier chunks already applied. Handing back the converted copy also
+ * means each element is converted exactly once: a separate validation pass
+ * would pay the per-element cost a second time when staging.
  *
  * @param source - Caller-supplied sequence.
- * @param from - First index of `source` to check.
- * @param count - Number of elements to check.
+ * @param count - Number of elements to convert, from index 0.
  * @param name - Parameter name, for messages.
+ * @returns `source` itself, or its elements converted to a Uint32Array.
  * @throws {TypeError} If `source` is not a supported sequence.
  * @throws {RangeError} If an element is not a 32-bit integer.
  * @internal
  */
-export function validateU32(
+export function materializeU32(
   source: BulkU32Source,
-  from: number,
   count: number,
   name: string,
-): void {
-  convertU32(source, null, from, count, name);
+): BulkU32Source {
+  if (isIntegerView(source)) return source;
+
+  const copy = new Uint32Array(count);
+  stageU32(source, copy, 0, count, name);
+  return copy;
 }
 
 /**
@@ -643,6 +609,17 @@ export function asString(value: unknown, name: string): string {
   return value;
 }
 
+/**
+ * Translates a native status code into a thrown error, or returns silently.
+ *
+ * @param status - Value returned by a fallible export.
+ * @param operation - Export name, used to build the error message.
+ * @param table - Class name of the binding that issued the call.
+ * @throws {RangeError} If the module reported that its compiled capacity
+ *   would be exceeded.
+ * @throws {Error} If the module reported any other non-zero status.
+ * @internal
+ */
 export function assertStatus(
   status: number,
   operation: string,

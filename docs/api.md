@@ -306,7 +306,7 @@ suite.
 | --- | --- | --- |
 | `maxBatch` | `number` | Keys per WASM call. Longer batches chunk automatically; size batches to this to avoid the extra copy. |
 | `setMany(keys, valsLo, valsHi)` | `void` | Throws `RangeError` if the three arrays differ in length. |
-| `getMany(keys)` | `BulkGetResult` | Result arrays are freshly allocated, sized to `keys.length`. |
+| `getMany(keys, out?)` | `BulkGetResult` | Allocates result arrays sized to `keys.length`, or writes into `out` (arrays at least that long) — pass the previous result back in a loop to make the steady state allocation-free. |
 | `deleteMany(keys)` | `BulkDeleteResult` | Per-key flags plus the total removed. |
 
 Misses in `getMany` are reported through `found`, and their lanes are zeroed,

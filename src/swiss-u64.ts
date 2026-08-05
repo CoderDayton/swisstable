@@ -5,9 +5,9 @@ import {
   asWasmI32,
   assertStatus,
   bulkLength,
+  materializeU32,
   scanColumns,
   stageU32,
-  validateU32,
 } from "./abi.ts";
 import type { BulkU32Source, ColumnScan, ScanExports } from "./abi.ts";
 import { embeddedModule } from "./embedded.ts";
@@ -260,17 +260,6 @@ export function lanesToSpan(lanes: U64Lanes): Span {
 }
 
 /**
- * Views over the module's own bulk staging buffers.
- *
- * The addresses and the batch size come from the module itself, so the
- * buffers can never overlap the table banks — an earlier revision picked the
- * offsets on the JavaScript side and silently aliased them.
- *
- * The views are built once: the modules are linked with initial memory equal
- * to maximum memory and never call `memory.grow`, so the backing buffer is
- * never detached and never reallocated.
- */
-/**
  * Exports the bindings call. Every one is listed, not a representative
  * few: {@link BulkScratch} and the constructor invoke the pointer and
  * capacity accessors immediately, so a module missing one used to surface
@@ -306,6 +295,17 @@ const REQUIRED_U64_EXPORTS = [
 /** Compiles the embedded module once, shared by every {@link SwissU32ToU64.create}. */
 const compileEmbedded = embeddedModule(SWISS_U64_WASM_BASE64);
 
+/**
+ * Views over the module's own bulk staging buffers.
+ *
+ * The addresses and the batch size come from the module itself, so the
+ * buffers can never overlap the table banks — an earlier revision picked the
+ * offsets on the JavaScript side and silently aliased them.
+ *
+ * The views are built once: the modules are linked with initial memory equal
+ * to maximum memory and never call `memory.grow`, so the backing buffer is
+ * never detached and never reallocated.
+ */
 class BulkScratch {
   /** Maximum keys per WASM call; larger batches are chunked. */
   readonly maxBatch: number;
@@ -696,13 +696,15 @@ export class SwissU32ToU64 {
     const { maxBatch } = this.scratch;
 
     // One chunk stages every element before the single WASM call, so a bad
-    // element already rejects the whole batch. Past that, the elements have
-    // to be checked up front: otherwise element 69_999 of a 70_000-pair
-    // batch would throw with the first 65_536 pairs already inserted.
+    // element already rejects the whole batch. Past that, the batch has to
+    // be checked up front — otherwise element 69_999 of a 70_000-pair batch
+    // would throw with the first 65_536 pairs already inserted. The check
+    // keeps what it converts, so a non-integer source pays the per-element
+    // cost once here rather than again per chunk.
     if (total > maxBatch) {
-      validateU32(keys, 0, total, "keys");
-      validateU32(valsLo, 0, total, "valsLo");
-      validateU32(valsHi, 0, total, "valsHi");
+      keys = materializeU32(keys, total, "keys");
+      valsLo = materializeU32(valsLo, total, "valsLo");
+      valsHi = materializeU32(valsHi, total, "valsHi");
     }
 
     for (let offset = 0; offset < total; offset += maxBatch) {
@@ -732,15 +734,31 @@ export class SwissU32ToU64 {
    * chunk is still a single WASM call.
    *
    * @param keys - Unsigned 32-bit keys.
-   * @returns Parallel result arrays, each of `keys.length`, freshly
-   *   allocated once per call.
+   * @param out - Result arrays to write into instead of allocating, each at
+   *   least `keys.length` long; only the first `keys.length` elements are
+   *   written. A caller issuing same-sized batches in a loop passes the
+   *   previous result back to make the steady state allocation-free.
+   * @returns Parallel result arrays, each covering `keys.length` keys —
+   *   `out` when given, else freshly allocated.
+   * @throws {RangeError} If an element is not a 32-bit integer, or an `out`
+   *   array is shorter than `keys`.
    */
-  getMany(keys: BulkU32Source): BulkGetResult {
+  getMany(keys: BulkU32Source, out?: BulkGetResult): BulkGetResult {
     const total = bulkLength(keys, "keys");
 
-    const valsLo = new Uint32Array(total);
-    const valsHi = new Uint32Array(total);
-    const found = new Uint8Array(total);
+    const valsLo = out?.valsLo ?? new Uint32Array(total);
+    const valsHi = out?.valsHi ?? new Uint32Array(total);
+    const found = out?.found ?? new Uint8Array(total);
+
+    // Checked before the first chunk lands, so a short buffer rejects the
+    // whole call rather than failing after some lookups were copied out.
+    if (
+      valsLo.length < total ||
+      valsHi.length < total ||
+      found.length < total
+    ) {
+      throw new RangeError("getMany: out arrays are shorter than keys");
+    }
 
     const { maxBatch } = this.scratch;
 
@@ -766,7 +784,7 @@ export class SwissU32ToU64 {
       found.set(this.scratch.found.subarray(0, chunk), offset);
     }
 
-    return { valsLo, valsHi, found };
+    return out ?? { valsLo, valsHi, found };
   }
 
   /**
@@ -789,7 +807,7 @@ export class SwissU32ToU64 {
 
     // Removals land chunk by chunk, so a bad element in a later chunk would
     // otherwise throw with the earlier chunks already gone. See setMany.
-    if (total > maxBatch) validateU32(keys, 0, total, "keys");
+    if (total > maxBatch) keys = materializeU32(keys, total, "keys");
 
     for (let offset = 0; offset < total; offset += maxBatch) {
       const chunk = Math.min(maxBatch, total - offset);

@@ -905,6 +905,17 @@ uint32_t size(void) { return g_size; }
 __attribute__((export_name("capacity")))
 uint32_t capacity(void) { return g_capacity; }
 
+/*
+ * Addresses of the two counters above, so the binding can read them as
+ * memory rather than as calls. See the matching note in swiss_u32.c for why
+ * this is sound and what it is worth.
+ */
+__attribute__((export_name("size_ptr")))
+uint32_t size_ptr(void) { return (uint32_t)(uintptr_t)&g_size; }
+
+__attribute__((export_name("capacity_ptr")))
+uint32_t capacity_ptr(void) { return (uint32_t)(uintptr_t)&g_capacity; }
+
 /* ── Iteration ─────────────────────────────────────────────────────── */
 
 /* Slots one scan() visits. Never more than BULK_CAPACITY, whose buffers it

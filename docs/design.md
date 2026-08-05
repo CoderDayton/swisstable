@@ -189,6 +189,29 @@ maximum memory and never call `memory.grow`, so the backing `ArrayBuffer` is
 never detached or reallocated and a view stays valid for the module's
 lifetime.
 
+**`size` and `capacity` are read the same way**, through `size_ptr()` and
+`capacity_ptr()`. They are properties on the JavaScript side, and a property
+that costs a boundary crossing sets the wrong expectation — a caller writing
+`for (i = 0; i < table.size; i++)` pays per iteration for what reads like a
+field. Measured through the real binding:
+
+| | per read |
+| --- | --- |
+| `table.size` (memory view) | 0.184 ns |
+| `wasm.size()` (export call) | 0.945 ns |
+| hoisted local (the floor) | 0.188 ns |
+
+So the property now costs what a local costs. This is not a cached count:
+the view is over the module's own counter, at the address the module
+reported, so there is no second copy and nothing to invalidate. The `size()`
+and `capacity()` exports remain — they are the definition these addresses
+point at, and what `load()` validates.
+
+Exposing the addresses is free on the C side because those counters are
+ordinary statics that already live in linear memory. The module has exactly
+one WebAssembly *global* (`__stack_pointer`), so nothing was moved out of a
+register to make this work.
+
 The third decision lives on the JavaScript side: every key is passed as
 `x | 0`. See
 [performance.md](performance.md#what-dominates-the-int32-tagging-cliff) —

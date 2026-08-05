@@ -102,6 +102,10 @@ export interface SwissU64WasmExports extends ScanExports {
   size(): number;
   /** Number of allocated slots. */
   capacity(): number;
+  /** Address of the live-entry counter, for reading it as memory. */
+  size_ptr(): number;
+  /** Address of the slot-count counter, for reading it as memory. */
+  capacity_ptr(): number;
 }
 
 /**
@@ -295,6 +299,8 @@ const REQUIRED_U64_EXPORTS = [
   "generation",
   "size",
   "capacity",
+  "size_ptr",
+  "capacity_ptr",
 ] as const satisfies readonly (keyof SwissU64WasmExports)[];
 
 /** Compiles the embedded module once, shared by every {@link SwissU32ToU64.create}. */
@@ -385,6 +391,18 @@ export class SwissU32ToU64 {
   /** Slots one scan call visits. */
   private readonly scanWindow: number;
 
+  /**
+   * Views over the module's live-entry and slot counters.
+   *
+   * {@link SwissU32ToU64.size} and {@link SwissU32ToU64.capacity} read
+   * through these rather than calling the matching exports, so a property
+   * costs what a local variable costs. See the note in swiss_u64.c — these
+   * are the module's own counters, not a cached copy, so there is nothing to
+   * invalidate.
+   */
+  private readonly sizeView: Uint32Array;
+  private readonly capacityView: Uint32Array;
+
   private constructor(wasm: SwissU64WasmExports) {
     this.wasm = wasm;
     this.scratch = new BulkScratch(wasm);
@@ -404,6 +422,10 @@ export class SwissU32ToU64 {
         "swiss_u64.wasm reported a scan window its staging buffers cannot hold",
       );
     }
+
+    const buffer = wasm.memory.buffer;
+    this.sizeView = new Uint32Array(buffer, wasm.size_ptr(), 1);
+    this.capacityView = new Uint32Array(buffer, wasm.capacity_ptr(), 1);
   }
 
   /**
@@ -467,18 +489,24 @@ export class SwissU32ToU64 {
     return table;
   }
 
-  /** Number of live entries. */
+  /**
+   * Number of live entries.
+   *
+   * Read straight out of linear memory, so this costs what reading a local
+   * variable costs and is safe to put in a loop condition.
+   */
   get size(): number {
-    return this.wasm.size() >>> 0;
+    return this.sizeView[0]!;
   }
 
   /**
    * Number of allocated slots, always a power of two.
    *
-   * The table rehashes once live entries reach 7/8 of this.
+   * The table rehashes once live entries reach 7/8 of this. As cheap to read
+   * as {@link SwissU32ToU64.size}.
    */
   get capacity(): number {
-    return this.wasm.capacity() >>> 0;
+    return this.capacityView[0]!;
   }
 
   /**

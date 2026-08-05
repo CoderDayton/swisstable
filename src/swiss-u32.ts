@@ -58,6 +58,10 @@ export interface SwissU32WasmExports extends ScanExports {
   size(): number;
   /** Number of allocated slots. */
   capacity(): number;
+  /** Address of the live-entry counter, for reading it as memory. */
+  size_ptr(): number;
+  /** Address of the slot-count counter, for reading it as memory. */
+  capacity_ptr(): number;
 }
 
 /** The parts of the table an iterator reads. */
@@ -149,6 +153,8 @@ const REQUIRED_U32_EXPORTS = [
   "generation",
   "size",
   "capacity",
+  "size_ptr",
+  "capacity_ptr",
 ] as const satisfies readonly (keyof SwissU32WasmExports)[];
 
 /** Compiles the embedded module once, shared by every {@link SwissU32ToU32.create}. */
@@ -199,6 +205,22 @@ export class SwissU32ToU32 {
   /** View over the module's staging value buffer, filled by `scan`. */
   private readonly scanValues: Uint32Array;
 
+  /**
+   * Views over the module's live-entry and slot counters.
+   *
+   * {@link SwissU32ToU32.size} and {@link SwissU32ToU32.capacity} are
+   * properties, so they read through these rather than calling the matching
+   * exports: a property that costs a boundary crossing invites
+   * `for (i = 0; i < table.size; i++)` to pay for one per iteration. Read as
+   * memory it costs what a local variable costs.
+   *
+   * These are not a cached count — they are the module's own counters, at
+   * the addresses it reported, so there is nothing to invalidate and no way
+   * for them to disagree with `size()` and `capacity()`.
+   */
+  private readonly sizeView: Uint32Array;
+  private readonly capacityView: Uint32Array;
+
   private constructor(wasm: SwissU32WasmExports) {
     this.wasm = wasm;
     this.lastValue = new Uint32Array(
@@ -225,6 +247,9 @@ export class SwissU32ToU32 {
       wasm.scan_values_ptr(),
       this.scanWindow,
     );
+
+    this.sizeView = new Uint32Array(buffer, wasm.size_ptr(), 1);
+    this.capacityView = new Uint32Array(buffer, wasm.capacity_ptr(), 1);
   }
 
   /**
@@ -288,18 +313,24 @@ export class SwissU32ToU32 {
     return table;
   }
 
-  /** Number of live entries. */
+  /**
+   * Number of live entries.
+   *
+   * Read straight out of linear memory, so this costs what reading a local
+   * variable costs and is safe to put in a loop condition.
+   */
   get size(): number {
-    return this.wasm.size() >>> 0;
+    return this.sizeView[0]!;
   }
 
   /**
    * Number of allocated slots, always a power of two.
    *
-   * The table rehashes once live entries reach 7/8 of this.
+   * The table rehashes once live entries reach 7/8 of this. As cheap to read
+   * as {@link SwissU32ToU32.size}.
    */
   get capacity(): number {
-    return this.wasm.capacity() >>> 0;
+    return this.capacityView[0]!;
   }
 
   /**

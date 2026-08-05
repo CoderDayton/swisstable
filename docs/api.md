@@ -175,6 +175,8 @@ const reverse = await SwissU32ToU32.load(module, 1_000);
 
 | Method | Returns | Notes |
 | --- | --- | --- |
+| `size` | `number` | Read out of linear memory, not a call. As cheap as a local — safe in a loop condition. |
+| `capacity` | `number` | Same. Always a power of two; the table rehashes at 7/8 of it. |
 | `has(key)` | `boolean` | Prefer `get` when you also want the value — it costs the same single crossing. |
 | `get(key)` | `number \| undefined` | One boundary crossing; the value is read from a cached view over linear memory. |
 | `set(key, value)` | `this` | Inserts or overwrites. Overwriting works even at the capacity ceiling. |

@@ -127,6 +127,8 @@ const TARGETS: readonly WasmTarget[] = [
       "generation",
       "size",
       "capacity",
+      "size_ptr",
+      "capacity_ptr",
     ],
   },
   {
@@ -159,6 +161,8 @@ const TARGETS: readonly WasmTarget[] = [
       "generation",
       "size",
       "capacity",
+      "size_ptr",
+      "capacity_ptr",
     ],
   },
 ];

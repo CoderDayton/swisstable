@@ -92,6 +92,71 @@ function lookupContender(
 }
 
 /**
+ * Contender order within a round, shuffled from a fixed seed.
+ *
+ * Run position is worth real time, which is why it is not left to
+ * declaration order. A contender that runs after the others meets a warmer
+ * JIT and a matured heap, measured here as 2-3 ns/op on a workload costing
+ * ~15 — enough to invert a ranking between two containers that are within
+ * noise of each other. Giving every contender a turn in every slot spreads
+ * that advantage instead of handing it to whoever was declared last.
+ *
+ * The seed is fixed, so the sequence of orders is identical from run to run
+ * and a bench result stays reproducible.
+ */
+let shuffleState = 0x2545_f491;
+
+function shuffledIndices(length: number): number[] {
+  const order = Array.from({ length }, (_, index) => index);
+
+  for (let i = length - 1; i > 0; i--) {
+    shuffleState ^= shuffleState << 13;
+    shuffleState ^= shuffleState >>> 17;
+    shuffleState ^= shuffleState << 5;
+    shuffleState >>>= 0;
+
+    const j = shuffleState % (i + 1);
+    const swap = order[i]!;
+    order[i] = order[j]!;
+    order[j] = swap;
+  }
+
+  return order;
+}
+
+/** Accumulates every return value, so no timed region can be dead code. */
+let checksum = 0;
+
+/** One prepared round of a contender; returns nanoseconds per replay. */
+async function runRound(
+  contender: Contender,
+  replays: number,
+): Promise<number> {
+  // Prepared outside the timed region: a contender is allowed to rebuild its
+  // container per round, and that rebuild is not what is being measured.
+  const run = await contender.prepare();
+
+  const start = Bun.nanoseconds();
+  for (let replay = 0; replay < replays; replay++) checksum += run();
+  return (Bun.nanoseconds() - start) / replays;
+}
+
+/**
+ * Measures a field of contenders inside this process, round-robin rather
+ * than one contender to completion, in the order {@link shuffledIndices}
+ * gives. Running them concurrently would interleave their work inside each
+ * other's timed regions; running them consecutively systematically favours
+ * whoever was declared last.
+ *
+ * Every contender is warmed before any is measured, so the measured rounds
+ * all observe the same matured engine state rather than each contender
+ * paying to mature it for the next.
+ *
+ * This is not on its own enough to make two contenders comparable — see
+ * {@link measureAll}, which is what scenarios should call. It is the right
+ * measurement only for a field that genuinely has to share one process,
+ * which in practice means a before/after of the same container.
+ *
  * Reports the best round rather than the mean: the fastest round is the one
  * least polluted by GC pauses and scheduler noise.
  *
@@ -100,55 +165,177 @@ function lookupContender(
  * that mutate the container must not be replayed: the second pass would
  * overwrite rather than insert, and would no longer be the same workload.
  */
+async function measureField(
+  contenders: readonly Contender[],
+  operations: number,
+  repeatable = false,
+): Promise<Result[]> {
+  const replays = repeatable
+    ? Math.max(1, Math.ceil(MIN_OPS_PER_ROUND / operations))
+    : 1;
+
+  const best = new Array<number>(contenders.length).fill(
+    Number.POSITIVE_INFINITY,
+  );
+
+  for (let round = 0; round < WARMUP_ROUNDS + MEASURED_ROUNDS; round++) {
+    const measured = round >= WARMUP_ROUNDS;
+
+    for (const index of shuffledIndices(contenders.length)) {
+      const elapsed = await runRound(contenders[index]!, replays);
+      if (measured && elapsed < best[index]!) best[index] = elapsed;
+    }
+  }
+
+  if (checksum === Number.MAX_SAFE_INTEGER) console.log(""); // keep the work live
+
+  return contenders.map((contender, index) => ({
+    name: contender.name,
+    nsPerOp: best[index]! / operations,
+    opsPerSecond: (operations * NS_PER_SECOND) / best[index]!,
+  }));
+}
+
+/**
+ * A lone contender, measured in this process.
+ *
+ * Nothing is being compared, so there is no second contender to be unfair
+ * to and no reason to pay for a subprocess.
+ */
 async function measure(
   contender: Contender,
   operations: number,
   repeatable = false,
 ): Promise<Result> {
-  const replays = repeatable
-    ? Math.max(1, Math.ceil(MIN_OPS_PER_ROUND / operations))
-    : 1;
+  const [result] = await measureField([contender], operations, repeatable);
+  return result!;
+}
 
-  let checksum = 0;
+/** Marks the one line of a `--isolate` child's output the parent wants. */
+const ISOLATED_RESULT = "#result ";
 
-  for (let round = 0; round < WARMUP_ROUNDS; round++) {
-    const run = await contender.prepare();
-    for (let replay = 0; replay < replays; replay++) checksum += run();
-  }
+/** `--isolate=<field>:<contender>`, set only in a child process. */
+interface IsolationTarget {
+  readonly field: number;
+  readonly contender: number;
+}
 
-  let bestNs = Number.POSITIVE_INFINITY;
+let isolationTarget: IsolationTarget | null = null;
 
-  for (let round = 0; round < MEASURED_ROUNDS; round++) {
-    const run = await contender.prepare();
+/** Cleared by `--no-isolate`, which trades comparability for wall time. */
+let isolateFields = true;
 
-    const start = Bun.nanoseconds();
-    for (let replay = 0; replay < replays; replay++) checksum += run();
-    const elapsed = (Bun.nanoseconds() - start) / replays;
+/** The scenario being run, which a child needs to reach the same field. */
+let currentScenario: string | null = null;
 
-    if (elapsed < bestNs) bestNs = elapsed;
-  }
+/**
+ * Counts {@link measureAll} calls within the current scenario, so a parent
+ * and its children agree on which field a result belongs to. Reset per
+ * scenario, and deterministic because scenarios build their fields in a
+ * fixed order.
+ */
+let fieldCounter = 0;
 
-  if (checksum === Number.MAX_SAFE_INTEGER) console.log(""); // keep the work live
-
-  return {
-    name: contender.name,
-    nsPerOp: bestNs / operations,
-    opsPerSecond: (operations * NS_PER_SECOND) / bestNs,
-  };
+/** Stands in for a field a child was not spawned to measure. */
+function skipped(contender: Contender): Result {
+  return { name: contender.name, nsPerOp: 0, opsPerSecond: 0 };
 }
 
 /**
- * Measures contenders strictly one at a time. Running them concurrently
- * would interleave their work inside each other's timed regions.
+ * Measures one contender in a process of its own and returns its result.
+ *
+ * The child re-runs this scenario's setup from scratch, which is the cost
+ * of the guarantee: it reaches the timed region having executed nothing but
+ * its own contender's code path.
+ */
+async function spawnContender(
+  scenario: string,
+  field: number,
+  index: number,
+): Promise<Result> {
+  const child = Bun.spawn({
+    cmd: [
+      process.execPath,
+      import.meta.path,
+      `--scenario=${scenario}`,
+      `--isolate=${field}:${index}`,
+    ],
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+
+  const [stdout, stderr] = await Promise.all([
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ]);
+
+  if ((await child.exited) !== 0) {
+    throw new Error(
+      `bench: isolated ${scenario} field ${field} contender ${index} failed\n${stderr}`,
+    );
+  }
+
+  const line = stdout
+    .split("\n")
+    .find((candidate) => candidate.startsWith(ISOLATED_RESULT));
+
+  if (line === undefined) {
+    throw new Error(
+      `bench: isolated ${scenario} field ${field} contender ${index} produced no result\n${stdout}`,
+    );
+  }
+
+  return JSON.parse(line.slice(ISOLATED_RESULT.length)) as Result;
+}
+
+/**
+ * Measures a field of contenders against each other, each in its own
+ * process.
+ *
+ * Isolation is the point, and it is not paranoia about GC or the scheduler
+ * — those {@link measureField} already handles. Contenders in one process
+ * share the library's call sites, so the first one through a shared method
+ * leaves it specialized for its own callback and the next arrives to a
+ * polluted inline cache. That is invisible, unrelated to the code being
+ * benchmarked, and large: two iteration contenders differing only in which
+ * ran first measured 3.7 and 10.1 ns/op, and swapped places when their
+ * declaration order was swapped. Interleaving rounds does not fix it,
+ * because the pollution is not about warm-up — only a fresh process is.
+ *
+ * The cost is one process per contender, each repeating this scenario's
+ * setup. `--no-isolate` skips it for a quick relative check, and is not
+ * what a reported number should come from.
  */
 async function measureAll(
   contenders: readonly Contender[],
   operations: number,
   repeatable = false,
 ): Promise<Result[]> {
+  const field = fieldCounter++;
+
+  if (isolationTarget !== null) {
+    if (field !== isolationTarget.field) return contenders.map(skipped);
+
+    const contender = contenders[isolationTarget.contender];
+    if (contender === undefined) {
+      throw new Error(`bench: no contender ${isolationTarget.contender}`);
+    }
+
+    const [result] = await measureField([contender], operations, repeatable);
+    console.log(ISOLATED_RESULT + JSON.stringify(result));
+
+    // The parent wants exactly this one field; whatever the scenario would
+    // go on to measure is another child's job.
+    process.exit(0);
+  }
+
+  if (!isolateFields || currentScenario === null) {
+    return measureField(contenders, operations, repeatable);
+  }
+
   const results: Result[] = [];
-  for (const contender of contenders) {
-    results.push(await measure(contender, operations, repeatable));
+  for (let index = 0; index < contenders.length; index++) {
+    results.push(await spawnContender(currentScenario, field, index));
   }
   return results;
 }
@@ -517,18 +704,24 @@ async function scaleSweep(sizes: readonly number[]): Promise<void> {
       map.set(keys[i]!, i);
     }
 
-    const swissResult = await measure(
-      lookupContender("swiss", count, (i) => table.get(keys[i]!) !== undefined),
+    // One field rather than two lone measurements: this row reports a
+    // winner, so the pair has to be interleaved or the ratio is partly just
+    // whichever of the two was timed second.
+    const pair = await measureAll(
+      [
+        lookupContender(
+          "swiss",
+          count,
+          (i) => table.get(keys[i]!) !== undefined,
+        ),
+        lookupContender("map", count, (i) => map.get(keys[i]!) !== undefined),
+      ],
       count,
       true,
     );
 
-    const mapResult = await measure(
-      lookupContender("map", count, (i) => map.get(keys[i]!) !== undefined),
-      count,
-      true,
-    );
-
+    const swissResult = pair[0]!;
+    const mapResult = pair[1]!;
     const ratio = swissResult.nsPerOp / mapResult.nsPerOp;
 
     rows.push({
@@ -771,6 +964,20 @@ type ScenarioName = (typeof SCENARIO_NAMES)[number];
 interface CliOptions {
   readonly json: boolean;
   readonly scenarios: ReadonlySet<ScenarioName> | null;
+  readonly isolate: boolean;
+  readonly target: IsolationTarget | null;
+}
+
+/** Parses `--isolate=<field>:<contender>`, which only a child is given. */
+function parseIsolate(value: string): IsolationTarget {
+  const [field, contender] = value.split(":");
+  const parsed = { field: Number(field), contender: Number(contender) };
+
+  if (!Number.isInteger(parsed.field) || !Number.isInteger(parsed.contender)) {
+    throw new Error(`bench: --isolate expects <field>:<contender>, got "${value}"`);
+  }
+
+  return parsed;
 }
 
 function printUsage(): void {
@@ -782,6 +989,9 @@ function printUsage(): void {
       "  --scenario=<name,...>  Run only the named scenarios (repeatable, comma-separated).",
       `                         One of: ${SCENARIO_NAMES.join(", ")}`,
       "  --json                 Emit machine-readable results instead of the text tables.",
+      "  --no-isolate           Measure a scenario's contenders in one process. Faster,",
+      "                         but contenders pollute each other's inline caches — use",
+      "                         for a quick check, not for a number worth reporting.",
       "  --help                 Show this message.",
     ].join("\n"),
   );
@@ -790,10 +1000,16 @@ function printUsage(): void {
 function parseArgs(argv: readonly string[]): CliOptions {
   let json = false;
   let scenarios: Set<ScenarioName> | null = null;
+  let isolate = true;
+  let target: IsolationTarget | null = null;
 
   for (const arg of argv) {
     if (arg === "--json") {
       json = true;
+    } else if (arg === "--no-isolate") {
+      isolate = false;
+    } else if (arg.startsWith("--isolate=")) {
+      target = parseIsolate(arg.slice("--isolate=".length));
     } else if (arg === "--help" || arg === "-h") {
       printUsage();
       process.exit(0);
@@ -813,11 +1029,13 @@ function parseArgs(argv: readonly string[]): CliOptions {
     }
   }
 
-  return { json, scenarios };
+  return { json, scenarios, isolate, target };
 }
 
 const options = parseArgs(Bun.argv.slice(2));
 jsonMode = options.json;
+isolateFields = options.isolate;
+isolationTarget = options.target;
 
 const sparseKeys = makeSparseKeys(ENTRY_COUNT);
 const denseKeys = makeDenseKeys(ENTRY_COUNT);
@@ -841,15 +1059,23 @@ const scenarios: Record<ScenarioName, () => Promise<void>> = {
 
 const selected = options.scenarios ?? new Set<ScenarioName>(SCENARIO_NAMES);
 
-if (!jsonMode) {
+if (!jsonMode && isolationTarget === null) {
   console.log(
     `${ENTRY_COUNT.toLocaleString()} entries, best of ${MEASURED_ROUNDS} rounds` +
-      ` after ${WARMUP_ROUNDS} warmups — Bun ${Bun.version}`,
+      ` after ${WARMUP_ROUNDS} warmups — Bun ${Bun.version}` +
+      (isolateFields ? ", one process per contender" : ", shared process"),
   );
 }
 
 for (const name of SCENARIO_NAMES) {
-  if (selected.has(name)) await scenarios[name]();
+  if (!selected.has(name)) continue;
+
+  // Both counters are per scenario, so a child given --scenario reaches the
+  // same field number the parent asked for.
+  currentScenario = name;
+  fieldCounter = 0;
+
+  await scenarios[name]();
 }
 
 if (jsonMode) console.log(JSON.stringify(reports, null, 2));

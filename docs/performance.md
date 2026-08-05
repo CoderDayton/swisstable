@@ -1,8 +1,8 @@
 # Performance
 
-**These tables beat `Map` on every measured workload for `u32` keys above
-~16k entries, by 1.1x to 9x. Below that threshold, and for repeated
-string-key lookups, `Map` wins and no implementation change fixes it.**
+**These tables beat `Map` on sparse `u32` keys above ~8k entries, by 1.1x to
+11x. Below that threshold, for dense-key lookups, and for repeated string-key
+lookups, `Map` wins and no implementation change fixes it.**
 
 Three things explain the whole picture:
 
@@ -15,26 +15,32 @@ Three things explain the whole picture:
 3. Batching moves the crossing off the per-key path entirely, which is why
    the bulk APIs show the widest margins.
 
-Numbers are from `bun run bench` on x64 Linux, Bun 1.3.14, best of 7 rounds.
-Treat the ratios as portable and the absolute figures as not.
+Numbers are from `bun run bench` on x64 Linux, Bun 1.3.14, best of 7 rounds,
+median of three runs. Each contender is measured in a process of its own:
+contenders sharing one process specialize each other's inline caches on the
+library's call sites, which was worth up to 2.7x on a single row and inverted
+several rankings. Treat the ratios as portable and the absolute figures as
+not.
 
 ## Results at 100k entries
 
 | Workload | SwissTable | `Map` | Speedup |
 | --- | --- | --- | --- |
-| fill, sparse keys (pre-sized) | 7.3 ns | 65.5 ns | 9.0x |
-| fill, sparse keys (grown) | 23.2 ns | 65.5 ns | 2.8x |
-| fill, dense keys (pre-sized) | 9.3 ns | 38.5 ns | 4.1x |
-| fill, dense keys (grown) | 23.4 ns | 38.5 ns | 1.6x |
-| lookup hit, sparse | 6.0 ns | 10.2 ns | 1.7x |
-| lookup miss, sparse | 8.4 ns | 11.4 ns | 1.4x |
-| lookup hit, dense | 6.7 ns | 7.3 ns | 1.1x |
-| u64 bulk fill, `setMany` | 6.9 ns | 40.7 ns | 5.9x |
-| u64 bulk lookup, `getMany` | 6.2 ns | 10.4 ns | 1.7x |
+| fill, sparse keys (pre-sized) | 7.8 ns | 74.8 ns | 9.6x |
+| fill, sparse keys (grown) | 24.7 ns | 74.8 ns | 3.0x |
+| fill, dense keys (pre-sized) | 8.9 ns | 67.5 ns | 7.6x |
+| fill, dense keys (grown) | 24.3 ns | 67.5 ns | 2.8x |
+| lookup hit, sparse | 6.7 ns | 10.6 ns | 1.6x |
+| lookup miss, sparse | 8.8 ns | 11.6 ns | 1.3x |
+| lookup hit, dense | 7.7 ns | 7.2 ns | 0.9x |
+| u64 bulk fill, `setMany` | 7.4 ns | 82.0 ns | 11.1x |
+| u64 bulk lookup, `getMany` | 7.4 ns | 10.9 ns | 1.5x |
 
-Neither container is the right answer for dense keys: a directly-indexed
-`Int32Array` fills at 0.4 ns and looks up at 0.5 ns, and a plain object looks
-up at 1.8 ns. If the keys really are dense, use the array.
+Dense keys are the one integer workload where `Map` stays ahead on lookup:
+both containers are cache-resident and the crossing is not amortized by
+anything. Neither is the right answer there anyway — a directly-indexed
+`Int32Array` fills at 1.7 ns and looks up at 0.6 ns, and a plain object looks
+up at 0.5 ns. If the keys really are dense, use the array.
 
 ## Why: the cost model
 
@@ -123,15 +129,16 @@ over 1.8 ns.
 
 `T >= c`, and `c` is ~2.6 ns for a crossing that does no work at all. An
 L1-resident `Map` lookup costs ~3.2 ns in total, leaving ~0.6 ns for the
-entire probe. Measured crossover is around 16k entries:
+entire probe. Measured crossover is around 8k entries:
 
 | entries | Swiss | `Map` | winner |
 | --- | --- | --- | --- |
-| 2,000 | 5.8 ns | 3.2 ns | Map |
-| 8,000 | 6.8 ns | 4.6 ns | Map |
-| 16,000 | 7.1 ns | 8.1 ns | SwissTable |
-| 128,000 | 9.0 ns | 11.8 ns | SwissTable |
-| 512,000 | 12.9 ns | 13.5 ns | SwissTable |
+| 2,000 | 9.2 ns | 3.5 ns | Map |
+| 8,000 | 5.7 ns | 6.0 ns | SwissTable |
+| 16,000 | 6.1 ns | 7.9 ns | SwissTable |
+| 32,000 | 6.6 ns | 7.9 ns | SwissTable |
+| 128,000 | 8.9 ns | 12.3 ns | SwissTable |
+| 512,000 | 14.3 ns | 16.2 ns | SwissTable |
 
 Below the crossover both containers are cache-resident, `mu(N)` is near zero
 for both, and the crossing is pure overhead. Above it, the ~10 B/entry

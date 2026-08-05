@@ -11,8 +11,9 @@ freestanding `wasm32`, with thin TypeScript bindings. Keys are `u32`.
 The table lives entirely inside WebAssembly linear memory: keys, values,
 control bytes, and probing never cross the JavaScript boundary, so a lookup
 costs one WASM call and a bulk operation costs one call per chunk regardless
-of batch size. Above ~16k entries that makes it 1.1–9x faster than `Map` on
-every workload measured. Below that, or with string keys, `Map` wins — see
+of batch size. Above ~8k entries that makes it 1.1–11x faster than `Map` on
+sparse integer keys. Below that, with string keys, or with dense keys, `Map`
+or a typed array wins — see
 [when not to use this](#when-not-to-use-this).
 
 The original C++ version can be found [here], and this [CppCon talk] gives an
@@ -31,7 +32,7 @@ Docs: [API](docs/api.md) · [Design](docs/design.md) ·
 - One byte of metadata per slot, compared sixteen at a time with `wasm_simd128`.
 - Lower memory usage: ~10 bytes per entry against `Map`'s ~24–32.
 - Bulk `setMany`/`getMany`/`deleteMany` stage a whole batch and cross once —
-  6.9 ns/op against `Map`'s 40.7 for a 100k-entry fill.
+  7.4 ns/op against `Map`'s 82.0 for a 100k-entry fill.
 - No allocator: fixed linear memory, linked `-nostdlib`, never calls
   `memory.grow`, and no allocation on any hot path.
 - The modules are compiled into the package, so there is no `.wasm` file to
@@ -84,7 +85,7 @@ runnable programs.
 
 | Situation | Use instead | Why |
 | --- | --- | --- |
-| Fewer than ~16k entries | `Map` | A crossing costs ~2.6 ns before doing any work; a cache-resident `Map` lookup costs ~3.2 ns in total. |
+| Fewer than ~8k entries | `Map` | A crossing costs ~2.6 ns before doing any work; a cache-resident `Map` lookup costs ~3.2 ns in total. |
 | String keys, looked up repeatedly | `Map<string, V>` | Engines cache a string's hash on the string object; a WASM table must copy and rehash the bytes. |
 | Dense integer keys with no gaps | `Int32Array` | Direct indexing is 0.5 ns and needs no hashing. |
 | Non-integer or `> 2^32 - 1` keys | `Map` | Anything outside `u32` throws. |
@@ -94,16 +95,17 @@ Both limits are structural rather than tuning problems;
 
 ## Benchmarks
 
-100k entries, best of 7 rounds, Bun 1.3.14 on x64 Linux. Ratios are portable,
-absolute figures are not.
+100k entries, best of 7 rounds, each contender in its own process, median of
+three runs. Bun 1.3.14 on x64 Linux. Ratios are portable, absolute figures
+are not.
 
 | Workload | SwissTable | `Map` | Speedup |
 | --- | --- | --- | --- |
-| fill, sparse keys | **7.3 ns** | 65.5 ns | 9.0x |
-| lookup hit, sparse | **6.0 ns** | 10.2 ns | 1.7x |
-| lookup miss, sparse | **8.4 ns** | 11.4 ns | 1.4x |
-| u64 bulk fill (`setMany`) | **6.9 ns** | 40.7 ns | 5.9x |
-| u64 bulk lookup (`getMany`) | **6.2 ns** | 10.4 ns | 1.7x |
+| fill, sparse keys | **7.8 ns** | 74.8 ns | 9.6x |
+| lookup hit, sparse | **6.7 ns** | 10.6 ns | 1.6x |
+| lookup miss, sparse | **8.8 ns** | 11.6 ns | 1.3x |
+| u64 bulk fill (`setMany`) | **7.4 ns** | 82.0 ns | 11.1x |
+| u64 bulk lookup (`getMany`) | **7.4 ns** | 10.9 ns | 1.5x |
 
 Reproduce with `bun run build && bun run bench`. The full table, the cost
 model behind it, and the int32 argument-tagging cliff that dominates

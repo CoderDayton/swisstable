@@ -157,7 +157,7 @@ never appears again. See
 bun run build && bun run bench
 ```
 
-`scripts/bench.ts` reports the best of 7 rounds after 3 warmups. Read-only
+`benches/bench.ts` reports the best of 7 rounds after 3 warmups. Read-only
 workloads replay until a round covers at least 2M operations, so harness
 overhead stays negligible at small `N`; mutating workloads never replay,
 since a second pass would overwrite rather than insert. Contenders run

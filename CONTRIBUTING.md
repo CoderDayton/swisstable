@@ -46,7 +46,8 @@ never hand-edit, and stage the rebuilt files with any C change.
 
 ```
 native/         C sources for the wasm32 modules
-scripts/        build tooling (build-wasm.ts) and benchmarks (bench.ts)
+scripts/        build tooling (build-wasm.ts)
+benches/        throughput benchmarks (bench.ts)
 src/            TypeScript bindings and public entry point
 src/generated/  base64 module payloads (generated, committed)
 examples/       runnable examples, start at 01-basic.ts
@@ -120,7 +121,7 @@ small" if they do not, so the arithmetic is checked by every build.
 
 ## Changing the benchmarks
 
-`scripts/bench.ts` has a few rules baked in that are easy to break:
+`benches/bench.ts` has a few rules baked in that are easy to break:
 
 - **Contenders run one at a time.** Running them concurrently interleaves
   their work inside each other's timed regions.

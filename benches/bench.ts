@@ -5,6 +5,9 @@
  * Every contender stores the same u32 -> u32 pairs and is exercised through
  * the same operation sequence, so the numbers differ only by container.
  * Run `bun run build` first; the WASM contenders need dist/wasm.
+ *
+ * Usage: bun run bench [--scenario=name,...] [--json] [--help]
+ * Scenarios: fill, lookup, bulk, string-keys, iteration, shrink, scale-sweep
  */
 
 import { InternedSwissMap, SwissU32ToU32, SwissU32ToU64 } from "../src/index.ts";
@@ -65,6 +68,27 @@ interface Result {
   readonly name: string;
   readonly nsPerOp: number;
   readonly opsPerSecond: number;
+}
+
+/**
+ * Counts how many of `count` probes hit, without allocating per probe.
+ * Every lookup contender below is "iterate probes, count hits" with a
+ * different `hit` test — factoring the loop out is what keeps that shape
+ * from being retyped for Map, Object, Int32Array, and every table variant.
+ */
+function countMatches(count: number, hit: (index: number) => boolean): number {
+  let found = 0;
+  for (let i = 0; i < count; i++) if (hit(i)) found++;
+  return found;
+}
+
+/** A {@link Contender} whose timed region is {@link countMatches}. */
+function lookupContender(
+  name: string,
+  count: number,
+  hit: (index: number) => boolean,
+): Contender {
+  return { name, prepare: () => () => countMatches(count, hit) };
 }
 
 /**
@@ -129,7 +153,47 @@ async function measureAll(
   return results;
 }
 
+interface ContenderReport {
+  readonly kind: "contenders";
+  readonly scenario: string;
+  readonly results: readonly Result[];
+}
+
+interface ScaleSweepRow {
+  readonly entries: number;
+  readonly swissNsPerOp: number;
+  readonly mapNsPerOp: number;
+  readonly ratio: number;
+  readonly winner: "SwissTable" | "Map";
+}
+
+interface ScaleSweepReport {
+  readonly kind: "scale-sweep";
+  readonly rows: readonly ScaleSweepRow[];
+}
+
+interface ShrinkReport {
+  readonly kind: "shrink";
+  readonly peak: number;
+  readonly remaining: number;
+  readonly beforeNsPerOp: number;
+  readonly afterNsPerOp: number;
+  readonly grownCapacitySlots: number;
+  readonly shrunkCapacitySlots: number;
+}
+
+type ReportEntry = ContenderReport | ScaleSweepReport | ShrinkReport;
+
+/** Every scenario's results, in run order — dumped whole under `--json`. */
+const reports: ReportEntry[] = [];
+
+/** Set once from argv, before any scenario runs; read by every report sink. */
+let jsonMode = false;
+
 function report(scenario: string, results: readonly Result[]): void {
+  reports.push({ kind: "contenders", scenario, results });
+  if (jsonMode) return;
+
   const fastest = Math.min(...results.map((result) => result.nsPerOp));
   const width = Math.max(...results.map((result) => result.name.length));
 
@@ -259,50 +323,22 @@ async function lookupScenario(
   }
 
   const contenders: Contender[] = [
-    {
-      name: "SwissU32ToU32 (wasm)",
-      prepare: () => () => {
-        let found = 0;
-        for (let i = 0; i < count; i++) {
-          if (swiss.get(probes[i]!) !== undefined) found++;
-        }
-        return found;
-      },
-    },
-    {
-      name: "Map",
-      prepare: () => () => {
-        let found = 0;
-        for (let i = 0; i < count; i++) {
-          if (map.get(probes[i]!) !== undefined) found++;
-        }
-        return found;
-      },
-    },
-    {
-      name: "Object (numeric keys)",
-      prepare: () => () => {
-        let found = 0;
-        for (let i = 0; i < count; i++) {
-          if (object[probes[i]!] !== undefined) found++;
-        }
-        return found;
-      },
-    },
+    lookupContender("SwissU32ToU32 (wasm)", count, (i) => swiss.get(probes[i]!) !== undefined),
+    lookupContender("Map", count, (i) => map.get(probes[i]!) !== undefined),
+    lookupContender(
+      "Object (numeric keys)",
+      count,
+      (i) => object[probes[i]!] !== undefined,
+    ),
   ];
 
   if (label.startsWith("dense")) {
-    contenders.push({
-      name: "Int32Array (direct index)",
-      prepare: () => () => {
-        let found = 0;
-        for (let i = 0; i < count; i++) {
-          const key = probes[i]!;
-          if (key < count && array[key] !== undefined) found++;
-        }
-        return found;
-      },
-    });
+    contenders.push(
+      lookupContender("Int32Array (direct index)", count, (i) => {
+        const key = probes[i]!;
+        return key < count && array[key] !== undefined;
+      }),
+    );
   }
 
   report(
@@ -401,26 +437,16 @@ async function bulkScenario(keys: Uint32Array): Promise<void> {
           name: "SwissU32ToU64.getMany (wasm)",
           prepare: () => () => swiss64.getMany(keys).found.length,
         },
-        {
-          name: "SwissU32ToU64.get (per key)",
-          prepare: () => () => {
-            let found = 0;
-            for (let i = 0; i < count; i++) {
-              if (swiss64.get(keys[i]!) !== undefined) found++;
-            }
-            return found;
-          },
-        },
-        {
-          name: "Map<number, bigint>",
-          prepare: () => () => {
-            let found = 0;
-            for (let i = 0; i < count; i++) {
-              if (bigintMap.get(keys[i]!) !== undefined) found++;
-            }
-            return found;
-          },
-        },
+        lookupContender(
+          "SwissU32ToU64.get (per key)",
+          count,
+          (i) => swiss64.get(keys[i]!) !== undefined,
+        ),
+        lookupContender(
+          "Map<number, bigint>",
+          count,
+          (i) => bigintMap.get(keys[i]!) !== undefined,
+        ),
       ],
       count,
       true,
@@ -447,36 +473,21 @@ async function stringKeyScenario(count: number): Promise<void> {
     `string keys: lookup ${count.toLocaleString()} keys`,
     await measureAll(
       [
-        {
-          name: "InternedSwissMap (wasm + Map)",
-          prepare: () => () => {
-            let found = 0;
-            for (let i = 0; i < count; i++) {
-              if (interned.get(strings[i]!) !== undefined) found++;
-            }
-            return found;
-          },
-        },
-        {
-          name: "Map<string, number>",
-          prepare: () => () => {
-            let found = 0;
-            for (let i = 0; i < count; i++) {
-              if (map.get(strings[i]!) !== undefined) found++;
-            }
-            return found;
-          },
-        },
-        {
-          name: "Object (string keys)",
-          prepare: () => () => {
-            let found = 0;
-            for (let i = 0; i < count; i++) {
-              if (object[strings[i]!] !== undefined) found++;
-            }
-            return found;
-          },
-        },
+        lookupContender(
+          "InternedSwissMap (wasm + Map)",
+          count,
+          (i) => interned.get(strings[i]!) !== undefined,
+        ),
+        lookupContender(
+          "Map<string, number>",
+          count,
+          (i) => map.get(strings[i]!) !== undefined,
+        ),
+        lookupContender(
+          "Object (string keys)",
+          count,
+          (i) => object[strings[i]!] !== undefined,
+        ),
       ],
       count,
       true,
@@ -491,7 +502,7 @@ async function stringKeyScenario(count: number): Promise<void> {
  * tables do not — a crossover in N, not a constant factor. Sweep to find it.
  */
 async function scaleSweep(sizes: readonly number[]): Promise<void> {
-  const results: string[] = [];
+  const rows: ScaleSweepRow[] = [];
 
   for (const count of sizes) {
     const keys = makeSparseKeys(count);
@@ -507,50 +518,42 @@ async function scaleSweep(sizes: readonly number[]): Promise<void> {
     }
 
     const swissResult = await measure(
-      {
-        name: "swiss",
-        prepare: () => () => {
-          let found = 0;
-          for (let i = 0; i < count; i++) {
-            if (table.get(keys[i]!) !== undefined) found++;
-          }
-          return found;
-        },
-      },
+      lookupContender("swiss", count, (i) => table.get(keys[i]!) !== undefined),
       count,
       true,
     );
 
     const mapResult = await measure(
-      {
-        name: "map",
-        prepare: () => () => {
-          let found = 0;
-          for (let i = 0; i < count; i++) {
-            if (map.get(keys[i]!) !== undefined) found++;
-          }
-          return found;
-        },
-      },
+      lookupContender("map", count, (i) => map.get(keys[i]!) !== undefined),
       count,
       true,
     );
 
     const ratio = swissResult.nsPerOp / mapResult.nsPerOp;
-    const winner = ratio < 1 ? "SwissTable" : "Map";
 
-    results.push(
-      `  ${count.toLocaleString().padStart(10)}  ` +
-        `${swissResult.nsPerOp.toFixed(1).padStart(7)} ns  ` +
-        `${mapResult.nsPerOp.toFixed(1).padStart(7)} ns  ` +
-        `${ratio.toFixed(2).padStart(5)}x  ${winner}`,
-    );
+    rows.push({
+      entries: count,
+      swissNsPerOp: swissResult.nsPerOp,
+      mapNsPerOp: mapResult.nsPerOp,
+      ratio,
+      winner: ratio < 1 ? "SwissTable" : "Map",
+    });
   }
+
+  reports.push({ kind: "scale-sweep", rows });
+  if (jsonMode) return;
 
   console.log("\nsingle-key lookup vs entry count — sparse keys");
   console.log("---------------------------------------------");
   console.log("      entries    Swiss      Map  ratio  winner");
-  for (const line of results) console.log(line);
+  for (const row of rows) {
+    console.log(
+      `  ${row.entries.toLocaleString().padStart(10)}  ` +
+        `${row.swissNsPerOp.toFixed(1).padStart(7)} ns  ` +
+        `${row.mapNsPerOp.toFixed(1).padStart(7)} ns  ` +
+        `${row.ratio.toFixed(2).padStart(5)}x  ${row.winner}`,
+    );
+  }
 }
 
 /**
@@ -721,11 +724,23 @@ async function shrinkScenario(peak: number, remaining: number): Promise<void> {
   };
 
   const before = await measure({ name: "before", prepare: () => walk }, 1);
-  const grownCapacity = table.capacity;
+  const grownCapacitySlots = table.capacity;
 
   table.shrinkToFit();
 
   const after = await measure({ name: "after", prepare: () => walk }, 1);
+  const shrunkCapacitySlots = table.capacity;
+
+  reports.push({
+    kind: "shrink",
+    peak,
+    remaining,
+    beforeNsPerOp: before.nsPerOp,
+    afterNsPerOp: after.nsPerOp,
+    grownCapacitySlots,
+    shrunkCapacitySlots,
+  });
+  if (jsonMode) return;
 
   console.log(
     `\nwalk ${remaining} entries left from a peak of ${peak.toLocaleString()}`,
@@ -733,30 +748,108 @@ async function shrinkScenario(peak: number, remaining: number): Promise<void> {
   console.log("-".repeat(52));
   console.log(
     `  before shrinkToFit  ${(before.nsPerOp / 1000).toFixed(1).padStart(8)} us` +
-      `  ${grownCapacity.toLocaleString().padStart(9)} slots`,
+      `  ${grownCapacitySlots.toLocaleString().padStart(9)} slots`,
   );
   console.log(
     `  after  shrinkToFit  ${(after.nsPerOp / 1000).toFixed(1).padStart(8)} us` +
-      `  ${table.capacity.toLocaleString().padStart(9)} slots` +
+      `  ${shrunkCapacitySlots.toLocaleString().padStart(9)} slots` +
       `  ${(before.nsPerOp / after.nsPerOp).toFixed(1)}x faster`,
   );
 }
 
+const SCENARIO_NAMES = [
+  "fill",
+  "lookup",
+  "bulk",
+  "string-keys",
+  "iteration",
+  "shrink",
+  "scale-sweep",
+] as const;
+type ScenarioName = (typeof SCENARIO_NAMES)[number];
+
+interface CliOptions {
+  readonly json: boolean;
+  readonly scenarios: ReadonlySet<ScenarioName> | null;
+}
+
+function printUsage(): void {
+  console.log(
+    [
+      "Usage: bun run bench [options]",
+      "",
+      "Options:",
+      "  --scenario=<name,...>  Run only the named scenarios (repeatable, comma-separated).",
+      `                         One of: ${SCENARIO_NAMES.join(", ")}`,
+      "  --json                 Emit machine-readable results instead of the text tables.",
+      "  --help                 Show this message.",
+    ].join("\n"),
+  );
+}
+
+function parseArgs(argv: readonly string[]): CliOptions {
+  let json = false;
+  let scenarios: Set<ScenarioName> | null = null;
+
+  for (const arg of argv) {
+    if (arg === "--json") {
+      json = true;
+    } else if (arg === "--help" || arg === "-h") {
+      printUsage();
+      process.exit(0);
+    } else if (arg.startsWith("--scenario=")) {
+      scenarios ??= new Set();
+      for (const raw of arg.slice("--scenario=".length).split(",")) {
+        const name = raw.trim();
+        if (!(SCENARIO_NAMES as readonly string[]).includes(name)) {
+          throw new Error(
+            `bench: unknown scenario "${name}" (one of: ${SCENARIO_NAMES.join(", ")})`,
+          );
+        }
+        scenarios.add(name as ScenarioName);
+      }
+    } else {
+      throw new Error(`bench: unrecognized argument "${arg}" (--help for usage)`);
+    }
+  }
+
+  return { json, scenarios };
+}
+
+const options = parseArgs(Bun.argv.slice(2));
+jsonMode = options.json;
+
 const sparseKeys = makeSparseKeys(ENTRY_COUNT);
 const denseKeys = makeDenseKeys(ENTRY_COUNT);
 
-console.log(
-  `${ENTRY_COUNT.toLocaleString()} entries, best of ${MEASURED_ROUNDS} rounds` +
-    ` after ${WARMUP_ROUNDS} warmups — Bun ${Bun.version}`,
-);
+const scenarios: Record<ScenarioName, () => Promise<void>> = {
+  fill: async () => {
+    await fillScenario("sparse keys", sparseKeys);
+    await fillScenario("dense keys", denseKeys);
+  },
+  lookup: async () => {
+    await lookupScenario("sparse keys", sparseKeys, true);
+    await lookupScenario("sparse keys", sparseKeys, false);
+    await lookupScenario("dense keys", denseKeys, true);
+  },
+  bulk: () => bulkScenario(sparseKeys),
+  "string-keys": () => stringKeyScenario(ENTRY_COUNT),
+  iteration: () => iterationScenario(sparseKeys),
+  shrink: () => shrinkScenario(ENTRY_COUNT, 8),
+  "scale-sweep": () => scaleSweep([2_000, 8_000, 16_000, 32_000, 128_000, 512_000]),
+};
 
-await fillScenario("sparse keys", sparseKeys);
-await fillScenario("dense keys", denseKeys);
-await lookupScenario("sparse keys", sparseKeys, true);
-await lookupScenario("sparse keys", sparseKeys, false);
-await lookupScenario("dense keys", denseKeys, true);
-await bulkScenario(sparseKeys);
-await stringKeyScenario(ENTRY_COUNT);
-await iterationScenario(sparseKeys);
-await shrinkScenario(ENTRY_COUNT, 8);
-await scaleSweep([2_000, 8_000, 16_000, 32_000, 128_000, 512_000]);
+const selected = options.scenarios ?? new Set<ScenarioName>(SCENARIO_NAMES);
+
+if (!jsonMode) {
+  console.log(
+    `${ENTRY_COUNT.toLocaleString()} entries, best of ${MEASURED_ROUNDS} rounds` +
+      ` after ${WARMUP_ROUNDS} warmups — Bun ${Bun.version}`,
+  );
+}
+
+for (const name of SCENARIO_NAMES) {
+  if (selected.has(name)) await scenarios[name]();
+}
+
+if (jsonMode) console.log(JSON.stringify(reports, null, 2));

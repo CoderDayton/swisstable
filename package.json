@@ -41,7 +41,7 @@
     "build": "bun run build:wasm && bun run build:js",
     "build:wasm": "bun run scripts/build-wasm.ts",
     "build:js": "tsc -p tsconfig.build.json",
-    "bench": "bun run scripts/bench.ts",
+    "bench": "bun run benches/bench.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
     "hooks": "lefthook install",

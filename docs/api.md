@@ -75,12 +75,20 @@ machine int32. That tagging is worth ~14 ns per call; see
 
 **Capacity is fixed at build time.** The modules are freestanding and link
 without an allocator, so the ceiling is `1 << 20` slots — 917,504 live
-entries at the 7/8 load factor. Requests past it throw `RangeError`; raising
-it means editing `MAX_CAPACITY` in the C source and rebuilding.
+entries at the 7/8 load factor. Requests past it throw `RangeError`. Rebuild
+with `SWISS_MAX_CAPACITY_LOG2` set to a different power-of-two exponent to
+move it either way; the build script sizes linear memory from the same
+number.
 
-**Each module instance owns exactly one table.** Two tables mean two
-instances. Compile the module once with `WebAssembly.compile` and pass it to
-`load` repeatedly — see [`examples/04-multiple-tables.ts`](../examples/04-multiple-tables.ts).
+**Each module instance owns exactly one table, and reserves its whole budget
+up front.** The banks are static arrays, so an instance costs 20 MiB (u32) or
+28 MiB (u64) of linear memory from instantiation whether it holds one entry
+or its maximum. Two tables mean two instances and twice that. Compile the
+module once with `WebAssembly.compile` and pass it to `load` repeatedly — see
+[`examples/04-multiple-tables.ts`](../examples/04-multiple-tables.ts). For
+many small tables, build a second pair of modules with a lower
+`SWISS_MAX_CAPACITY_LOG2`: at `2^16` a u32 instance costs 3.1 MiB instead of
+20, capped at 57,344 entries.
 
 **A stored `0` is never confused with an absent key.** Presence is reported
 separately from the value, so no sentinel is overloaded anywhere in the API.
@@ -172,7 +180,8 @@ const reverse = await SwissU32ToU32.load(module, 1_000);
 | `set(key, value)` | `this` | Inserts or overwrites. Overwriting works even at the capacity ceiling. |
 | `delete(key)` | `boolean` | `true` if the key was present. Leaves a tombstone, reclaimed by the next rehash. |
 | `reserve(entries)` | `void` | Grows in place, preserving contents. No-op if the capacity already suffices. |
-| `clear()` | `void` | Empties the table but **retains capacity** — a cleared instance never shrinks. |
+| `shrinkToFit()` | `void` | Rehashes down to the smallest capacity holding the live entries. No-op if already there. |
+| `clear()` | `void` | Empties the table but **retains capacity**. Follow with `shrinkToFit()` to hand the slots back. |
 
 ### Iteration
 
@@ -187,6 +196,14 @@ Entries are read out one window of slots per WASM call rather than one per
 key, so a full walk is a handful of crossings whatever the size — 16 at the
 compiled ceiling.
 
+**A walk costs O(capacity), not O(size).** A scan visits every group of slots,
+so the cost tracks the slot space rather than what is in it — and capacity
+only ever rises on its own: `reserve` and the growth path raise it, `clear`
+retains it, and a `delete` leaves a tombstone rather than a freed slot. A
+table that peaked at 100k entries and now holds 8 takes 36 µs per walk;
+`shrinkToFit()` brings that to 0.5 µs. Call it after a bulk removal on a
+long-lived table that is walked repeatedly.
+
 **Order is unspecified.** It is slot order, which depends on the hash and
 changes whenever the table rehashes. Two tables holding the same entries need
 not agree on it. If you need a stable order, sort what you get.
@@ -195,7 +212,12 @@ not agree on it. If you need a stable order, sort what you get.
 table does not rehash; whether the walk observes the change is unspecified. A
 rehash renumbers the slots, so a walk that continued across one would skip
 some entries and repeat others with nothing in the data to show it — it
-throws instead. `clear()` counts as a rehash here.
+throws instead. `clear()` and `shrinkToFit()` both count as a rehash here.
+
+The generation check runs once per slot window, so read this as **may throw**
+rather than always throws: a rehash after the last window has been handed
+over ends the walk normally, and correctly — every entry was already reported
+exactly once from the layout the walk pinned.
 
 ```ts
 for (const [key, value] of table) { /* … */ }
@@ -206,11 +228,12 @@ table.reserve(500_000);   // rehashes
 [...iterator];            // throws: rehashed during iteration
 ```
 
-**Cost.** `forEach` allocates nothing per entry and measures ~3.6x faster
-than `Map.prototype.forEach` over 500k entries. The iterator protocol is the
+**Cost.** `forEach` allocates nothing per entry and measures ~2.3x faster
+than `Map.prototype.forEach` over 100k entries. The iterator protocol is the
 other way round: `keys()`, `values()`, and `entries()` allocate a result
-record per entry the way the built-ins do, and run 1.7–7x *slower* than
-`Map`'s, whose iterator is engine-internal. Prefer `forEach` on a hot path.
+record per entry the way the built-ins do, and `entries()` runs ~1.2x
+*slower* than `Map`'s, whose iterator is engine-internal. Prefer `forEach` on
+a hot path. Reproduce all of it with `bun run bench`.
 
 ```ts
 const table = await SwissU32ToU32.load(bytes, 100_000);
@@ -246,6 +269,20 @@ that `values()` yields `U64Lanes` and `entries()` yields `[key, lanes]`. The
 scan borrows the same staging buffers the bulk methods use, so each chunk is
 copied out before it is handed over — a `getMany` issued between two steps of
 an open iterator cannot disturb it.
+
+`forEach` is here too, and matches `Map`'s callback shape — which has one
+value argument, so it must box the two lanes into a `U64Lanes` per entry.
+**`forEachLanes(callback, thisArg?)`** is the same walk without that: it
+calls `callback(lo, hi, key, table)` and allocates nothing. When the callback
+discards the lanes the two run level, because escape analysis removes the
+object; when it keeps them it cannot, and `forEachLanes` measures ~1.6x
+faster. Prefer it on a hot path.
+
+```ts
+table.forEachLanes((lo, hi, key) => {
+  // no allocation per entry, whatever the callback does with the lanes
+});
+```
 
 ### Spans
 
@@ -385,6 +422,30 @@ means. A fresh one is created when omitted.
 | `setParts(parts, value)` | `this` | Composite key. |
 | `getParts(parts)` | `V \| undefined` | |
 | `deleteParts(parts)` | `boolean` | |
+| `keys()` | `IterableIterator<string>` | Each ID resolved back to its string. |
+| `values()` | `IterableIterator<V>` | |
+| `entries()`, `[Symbol.iterator]()` | `IterableIterator<[string, V]>` | |
+| `forEach(callback, thisArg?)` | `void` | Calls `callback(value, key, map)`. The allocation-free walk. |
+
+### Iteration
+
+Order is the underlying table's — slot order, so unspecified. Not insertion
+order, and not the order keys were interned in.
+
+A key built with `setParts` comes back in its **encoded** form (`["user",
+"42"]` reads back as `"4:user2:42"`), because that encoded string is what was
+interned.
+
+Iteration needs more of the table than the four required methods, so it is
+feature-detected: `forEach` needs the table's `forEach`, and the pull
+iterators need its `entries`. Both are **optional** members of
+`NumericKeyTable` — a table written against the original four-method contract
+still works everywhere else and throws `TypeError` only here.
+
+An ID the interner cannot resolve throws rather than being skipped or handed
+back as `undefined`. It means the table holds an entry written through the
+public `table` property directly, bypassing interning, so there is no string
+key to report.
 
 If the underlying table rejects a write, an ID assigned for that call is
 released again, so a failed `set` does not permanently consume an ID for a
@@ -414,11 +475,12 @@ u32 and defeat the validation `set` performs at the boundary.
 | `Span` | `{ offset: number; length: number }` |
 | `BulkGetResult` | `{ valsLo: Uint32Array; valsHi: Uint32Array; found: Uint8Array }` |
 | `BulkDeleteResult` | `{ deleted: Uint8Array; removedCount: number }` |
-| `NumericKeyTable<V>` | `set`/`get`/`has`/`delete` — the contract `InternedSwissMap` needs |
+| `NumericKeyTable<V>` | `set`/`get`/`has`/`delete`, plus optional `forEach`/`entries` — the contract `InternedSwissMap` needs |
 
-`SwissU32ToU32` satisfies `NumericKeyTable<number>` directly. `SwissU32ToU64`
-takes its value as two lanes, so wrap its `set`/`get` at the call site to
-adapt it.
+`SwissU32ToU32` satisfies `NumericKeyTable<number>` directly, optional members
+included. `SwissU32ToU64` takes its value as two lanes, so wrap its
+`set`/`get` at the call site to adapt it — and its `forEachLanes`/`entries` if
+you want the wrapped table to stay iterable.
 
 The raw WASM export interfaces are not published: they mirror the
 `export_name` attributes in the C sources and are an implementation detail of

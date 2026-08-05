@@ -3,7 +3,7 @@ import {
   asCallback,
   asWasmI32,
   assertStatus,
-  scanWindows,
+  scanColumns,
 } from "./abi.ts";
 import type { ScanExports } from "./abi.ts";
 import { embeddedModule } from "./embedded.ts";
@@ -27,6 +27,8 @@ export interface SwissU32WasmExports extends ScanExports {
   init(expectedEntries: number): number;
   /** Grows the table so `entries` fit without a further rehash. */
   reserve(entries: number): number;
+  /** Shrinks to the smallest capacity holding the live entries. */
+  shrink_to_fit(): number;
   /** Marks every slot empty, retaining the current capacity. */
   clear(): void;
 
@@ -58,33 +60,12 @@ export interface SwissU32WasmExports extends ScanExports {
   capacity(): number;
 }
 
-/** One window's worth of staged entries, copied out of the module. */
-interface EntryChunk {
-  /** Keys, valid up to {@link EntryChunk.count}. */
-  readonly keys: Uint32Array;
-  /** Values, parallel to {@link EntryChunk.keys}. */
-  readonly values: Uint32Array;
-  /** How many of the buffers' leading elements are live. */
-  count: number;
-}
-
 /** The parts of the table an iterator reads. */
 interface SwissU32Scan {
   readonly wasm: SwissU32WasmExports;
   readonly scanWindow: number;
   readonly scanKeys: Uint32Array;
   readonly scanValues: Uint32Array;
-}
-
-/**
- * Chunk-buffer length for one iterator over `source`.
- *
- * A window is the most a scan can stage, and a table smaller than one is
- * the most it ever will — so iterating ten entries does not allocate for
- * 65536.
- */
-function stagedLength(source: SwissU32Scan): number {
-  return Math.min(source.scanWindow, source.wasm.capacity() >>> 0);
 }
 
 /*
@@ -95,23 +76,20 @@ function stagedLength(source: SwissU32Scan): number {
  * rest of the protocol — because the result record it feeds can no longer
  * be specialised. Split, each at() has one return type and one call site.
  *
- * Each holds its own chunk buffers, filled before any next() that crosses a
- * window boundary returns. That is what lets two iterators over one table
- * be advanced alternately: neither reads the module's staging buffers after
- * its own copy has been taken.
+ * Each lists only the columns it reads, so a keys() walk never pays to copy
+ * values, and each binds them to its own field rather than indexing
+ * `columns` per entry. Buffer sizing, copy-out, and rehash detection are
+ * all scanColumns' job — see the note there on why the copy is what lets
+ * two iterators over one table be advanced alternately.
  */
 
 /** Yields each key. */
 class KeyIterator extends ScanIterator<number> {
   private readonly keys: Uint32Array;
 
-  constructor(private readonly source: SwissU32Scan) {
-    super(source.wasm, source.scanWindow);
-    this.keys = new Uint32Array(stagedLength(source));
-  }
-
-  protected override receive(count: number): void {
-    this.keys.set(this.source.scanKeys.subarray(0, count));
+  constructor(source: SwissU32Scan) {
+    super(source.wasm, source.scanWindow, [source.scanKeys]);
+    this.keys = this.columns[0]!;
   }
 
   protected override at(index: number): number {
@@ -123,13 +101,9 @@ class KeyIterator extends ScanIterator<number> {
 class ValueIterator extends ScanIterator<number> {
   private readonly values: Uint32Array;
 
-  constructor(private readonly source: SwissU32Scan) {
-    super(source.wasm, source.scanWindow);
-    this.values = new Uint32Array(stagedLength(source));
-  }
-
-  protected override receive(count: number): void {
-    this.values.set(this.source.scanValues.subarray(0, count));
+  constructor(source: SwissU32Scan) {
+    super(source.wasm, source.scanWindow, [source.scanValues]);
+    this.values = this.columns[0]!;
   }
 
   protected override at(index: number): number {
@@ -142,16 +116,10 @@ class EntryIterator extends ScanIterator<[number, number]> {
   private readonly keys: Uint32Array;
   private readonly values: Uint32Array;
 
-  constructor(private readonly source: SwissU32Scan) {
-    super(source.wasm, source.scanWindow);
-    const staged = stagedLength(source);
-    this.keys = new Uint32Array(staged);
-    this.values = new Uint32Array(staged);
-  }
-
-  protected override receive(count: number): void {
-    this.keys.set(this.source.scanKeys.subarray(0, count));
-    this.values.set(this.source.scanValues.subarray(0, count));
+  constructor(source: SwissU32Scan) {
+    super(source.wasm, source.scanWindow, [source.scanKeys, source.scanValues]);
+    this.keys = this.columns[0]!;
+    this.values = this.columns[1]!;
   }
 
   protected override at(index: number): [number, number] {
@@ -167,6 +135,7 @@ class EntryIterator extends ScanIterator<[number, number]> {
 const REQUIRED_U32_EXPORTS = [
   "init",
   "reserve",
+  "shrink_to_fit",
   "clear",
   "has",
   "has_get",
@@ -351,10 +320,33 @@ export class SwissU32ToU32 {
   }
 
   /**
+   * Shrinks the table to the smallest capacity that holds its live entries.
+   *
+   * Capacity otherwise only ever rises — {@link SwissU32ToU32.reserve} and
+   * the growth path raise it, {@link SwissU32ToU32.clear} retains it, and a
+   * delete leaves a tombstone rather than a freed slot. Lookups do not care,
+   * but iteration visits every slot, so a table that once peaked large keeps
+   * paying peak walk cost until this is called.
+   *
+   * A no-op when the table is already at that capacity, so calling it after
+   * a bulk removal costs a comparison rather than a rehash.
+   *
+   * This rehashes, which invalidates any open iterator exactly as a growth
+   * rehash would.
+   *
+   * @throws {Error} If the module reports a failure.
+   */
+  shrinkToFit(): void {
+    assertStatus(this.wasm.shrink_to_fit(), "shrink_to_fit", "SwissU32ToU32");
+  }
+
+  /**
    * Removes every entry, retaining the current capacity.
    *
-   * Reuse the instance across workloads only when the next one is of similar
-   * size; the retained capacity is never released.
+   * The retained capacity is never released by this call; follow it with
+   * {@link SwissU32ToU32.shrinkToFit} to hand it back, which matters most
+   * when the instance is reused for a much smaller workload than the one it
+   * grew for.
    */
   clear(): void {
     this.wasm.clear();
@@ -424,38 +416,6 @@ export class SwissU32ToU32 {
   }
 
   /**
-   * Walks the table one slot window at a time, yielding the chunk each scan
-   * staged.
-   *
-   * The yielded object is reused across chunks — every public iterator
-   * consumes one fully before asking for the next — but its buffers belong
-   * to this generator alone. That is what keeps two open iterators from
-   * seeing each other's scan, and what makes a bulk call issued between two
-   * `next()`s harmless.
-   *
-   * They are sized to the smaller of the window and the capacity, so
-   * iterating a table of ten entries does not allocate for 65536.
-   */
-  private *chunks(): Generator<EntryChunk> {
-    const staged = Math.min(this.scanWindow, this.capacity);
-    const chunk: EntryChunk = {
-      keys: new Uint32Array(staged),
-      values: new Uint32Array(staged),
-      count: 0,
-    };
-
-    const receive = (count: number): void => {
-      chunk.keys.set(this.scanKeys.subarray(0, count));
-      chunk.values.set(this.scanValues.subarray(0, count));
-    };
-
-    for (const count of scanWindows(this.wasm, this.scanWindow, receive)) {
-      chunk.count = count;
-      yield chunk;
-    }
-  }
-
-  /**
    * Yields every key.
    *
    * Order is unspecified: it is slot order, which depends on the hash and
@@ -467,10 +427,19 @@ export class SwissU32ToU32 {
    *
    * Deleting or inserting during the walk is allowed as long as the table
    * does not rehash; whether the walk observes the change is unspecified. A
-   * rehash — including the one {@link SwissU32ToU32.clear} performs — throws
-   * rather than silently skipping or repeating entries.
+   * rehash — including the one {@link SwissU32ToU32.clear} or
+   * {@link SwissU32ToU32.shrinkToFit} performs — is detected rather than
+   * allowed to silently skip or repeat entries.
    *
-   * @throws {Error} If the table rehashes while the iterator is open.
+   * The check runs before each slot window, so a rehash is reported only if
+   * a window remains to be read. One that happens after the last window has
+   * been handed over ends the walk normally: every entry was already
+   * reported exactly once from the pre-rehash slot layout, so there is
+   * nothing left to get wrong. Treat the error as "may throw", not "always
+   * throws".
+   *
+   * @throws {Error} If the table rehashes while the iterator is open and
+   *   windows remain unread.
    */
   keys(): IterableIterator<number> {
     return new KeyIterator(this.scanSource());
@@ -526,7 +495,17 @@ export class SwissU32ToU32 {
   ): void {
     asCallback(callback, "forEach");
 
-    for (const { keys, values, count } of this.chunks()) {
+    const { windows, columns } = scanColumns(this.wasm, this.scanWindow, [
+      this.scanKeys,
+      this.scanValues,
+    ]);
+
+    // Hoisted out of the inner loop so the per-entry reads are field loads
+    // on two known Uint32Arrays rather than indexing through `columns`.
+    const keys = columns[0]!;
+    const values = columns[1]!;
+
+    for (const count of windows) {
       for (let i = 0; i < count; i += 1) {
         callback.call(thisArg, values[i]!, keys[i]!, this);
       }

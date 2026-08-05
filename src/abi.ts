@@ -74,18 +74,47 @@ export const REHASHED_DURING_ITERATION =
   "to the entries it did when the walk started";
 
 /**
- * Walks the whole slot space one window at a time, calling `receive` with
- * the number of entries the module staged for each.
+ * A walk over a table's slot space, with the walk's private copy of every
+ * column it was asked to stage.
+ *
+ * @internal
+ */
+export interface ColumnScan {
+  /**
+   * Per-window entry counts, in cursor order. Advancing this refills
+   * {@link ColumnScan.columns} before it yields.
+   */
+  readonly windows: Generator<number>;
+  /**
+   * One buffer per requested source, parallel to it and valid up to the
+   * count the walk last yielded. These belong to this walk alone.
+   */
+  readonly columns: readonly Uint32Array[];
+}
+
+/**
+ * Builds a walk over the whole slot space that copies `sources` out one
+ * window at a time.
  *
  * The windows `[0, W)`, `[W, 2W)`, … partition the slot space, so every live
  * slot falls in exactly one and is reported exactly once. Nothing is carried
  * across a call but the cursor, which is why two iterators over the same
  * table can be advanced alternately without either observing the other.
  *
- * `receive` runs before the yield, while the staged chunk is still intact.
- * Copying it out there is what makes the iterator safe against a bulk call
- * issued between two `next()`s: the module's staging buffers are shared, the
- * caller's copy is not.
+ * `sources` are views into the module's staging buffers, which every scan
+ * and every bulk call writes through. They are copied into this walk's own
+ * `columns` before each yield, while the staged chunk is still intact —
+ * that copy is what makes a walk safe against a bulk call issued between
+ * two `next()`s, and what keeps two open walks from seeing each other's
+ * scan.
+ *
+ * Capacity is read exactly once here, and the column buffers are sized from
+ * that same read rather than a second one. A window stages at most as many
+ * entries as it spans slots, so `min(window, capacity)` is an upper bound
+ * no scan of this walk can exceed — and because one read establishes both
+ * the walk's extent and its buffer length, there is no window in which a
+ * rehash could make the two disagree. It is also why iterating ten entries
+ * does not allocate for 65536.
  *
  * A rehash renumbers the slots, so a cursor held across one names different
  * entries than it did — some skipped, some repeated, with nothing in the
@@ -94,33 +123,56 @@ export const REHASHED_DURING_ITERATION =
  * that leave the slots in place (an insert with room, a delete) are not
  * errors; whether the walk observes them is unspecified.
  *
+ * The check is per window, which means a rehash after the last window was
+ * handed over is not reported at all. That is deliberate rather than a hole:
+ * by then every entry has been reported exactly once from the layout the
+ * walk pinned, so there is no mixture left to guard against. Callers should
+ * read the error as "may throw".
+ *
+ * `sources` are views over the module's linear memory, built once and held
+ * for the table's lifetime. That is only sound because the modules are
+ * linked with initial memory equal to maximum memory and never call
+ * `memory.grow`, so the backing buffer is never detached or reallocated —
+ * any future change to grow memory would have to rebuild these views.
+ *
  * @param wasm - The module being iterated.
  * @param window - Slots per call, from `scan_window()`.
- * @param receive - Copies the staged chunk out. Called once per window.
- * @yields The entry count staged for each window, in cursor order.
- * @throws {Error} If the table is rehashed, cleared, or re-inited mid-walk,
- *   or if the module rejects a cursor this function generated.
+ * @param sources - Views over the module's staging buffers to copy out.
+ *   Only the columns a caller actually reads should be listed; a `keys()`
+ *   walk that never looks at values should not pay to copy them.
+ * @returns The walk and its private column buffers.
  * @internal
  */
-export function scanWindows(
+export function scanColumns(
   wasm: ScanExports,
   window: number,
-  receive: (count: number) => void,
-): Generator<number> {
-  // Read here rather than inside the generator, which would not run until
-  // the first next(). A caller sizes its chunk buffers from the capacity it
-  // sees when it builds the walk; deferring these would let a rehash in
-  // between go unnoticed and stage a chunk larger than those buffers.
-  return walkWindows(
-    wasm,
-    window,
-    receive,
-    wasm.capacity() >>> 0,
-    wasm.generation() >>> 0,
-  );
+  sources: readonly Uint32Array[],
+): ColumnScan {
+  // Both reads happen here rather than inside the generator, which would
+  // not run until the first next(). A rehash between building the walk and
+  // advancing it would otherwise go unnoticed and stage a chunk larger than
+  // the buffers sized for it.
+  const capacity = wasm.capacity() >>> 0;
+  const generation = wasm.generation() >>> 0;
+
+  const staged = Math.min(window, capacity);
+  const columns = sources.map(() => new Uint32Array(staged));
+
+  // Runs once per window, not once per entry, so the loop over columns and
+  // the subarray views it builds cost nothing measurable per entry.
+  const receive = (count: number): void => {
+    for (let i = 0; i < columns.length; i += 1) {
+      columns[i]!.set(sources[i]!.subarray(0, count));
+    }
+  };
+
+  return {
+    windows: walkWindows(wasm, window, receive, capacity, generation),
+    columns,
+  };
 }
 
-/** The walk itself, over the capacity and generation {@link scanWindows}
+/** The walk itself, over the capacity and generation {@link scanColumns}
  *  pinned when it was called. */
 function* walkWindows(
   wasm: ScanExports,
@@ -165,13 +217,15 @@ const EXHAUSTED: IteratorReturnResult<undefined> = Object.freeze({
  * Written as an explicit `next()` rather than a generator, which is not
  * stylistic: a generator resumes its frame once per entry, and measured
  * against an iterator object over the same data that costs about 2x. The
- * window walk underneath is still {@link scanWindows} — its own frame
+ * window walk underneath is still {@link scanColumns} — its own frame
  * resumes once per window, roughly once per 57000 entries at the load
  * factor, so it costs nothing per entry.
  *
- * Subclasses supply the two per-entry halves: {@link ScanIterator.receive}
- * copies a staged chunk out of the module, and {@link ScanIterator.at}
- * projects one element of it.
+ * Copying the staged columns out is handled by the walk, so a subclass
+ * supplies only {@link ScanIterator.at}, which projects one element. Each
+ * should bind the columns it reads to its own fields in its constructor
+ * rather than indexing {@link ScanIterator.columns} per entry, which keeps
+ * the per-entry access a monomorphic field load.
  *
  * @internal
  */
@@ -179,20 +233,26 @@ export abstract class ScanIterator<T> implements IterableIterator<T> {
   /** Walk over the slot windows; yields the entry count staged for each. */
   private readonly walk: Generator<number>;
 
+  /** This walk's private copies of the columns it was built with. */
+  protected readonly columns: readonly Uint32Array[];
+
   /** Next element of the current chunk to project. */
   private index = 0;
 
   /** Live elements in the current chunk. */
   private count = 0;
 
-  protected constructor(wasm: ScanExports, window: number) {
-    this.walk = scanWindows(wasm, window, (count) => this.receive(count));
+  protected constructor(
+    wasm: ScanExports,
+    window: number,
+    sources: readonly Uint32Array[],
+  ) {
+    const scan = scanColumns(wasm, window, sources);
+    this.walk = scan.windows;
+    this.columns = scan.columns;
   }
 
-  /** Copies a staged chunk out of the module's buffers. */
-  protected abstract receive(count: number): void;
-
-  /** Projects element `index` of the chunk last received. */
+  /** Projects element `index` of the chunk last staged. */
   protected abstract at(index: number): T;
 
   next(): IteratorResult<T> {

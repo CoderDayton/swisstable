@@ -1,4 +1,4 @@
-import { asString } from "./abi.ts";
+import { asCallback, asString } from "./abi.ts";
 
 /**
  * The minimal numeric-table contract {@link InternedSwissMap} depends on.
@@ -20,6 +20,25 @@ export interface NumericKeyTable<V> {
   has(key: number): boolean;
   /** Removes `key`, returning `true` if it was present. */
   delete(key: number): boolean;
+
+  /**
+   * Calls `callback` once per entry, in unspecified order.
+   *
+   * Optional, and feature-detected rather than required: widening the four
+   * methods above into six would break every table already written against
+   * this interface. A table without it is fully usable and only gives up
+   * {@link InternedSwissMap.forEach}.
+   */
+  forEach?(callback: (value: V, key: number) => void): void;
+
+  /**
+   * Yields every entry as a `[key, value]` pair, in unspecified order.
+   *
+   * Optional for the same reason as {@link NumericKeyTable.forEach}. A
+   * table without it gives up the pull iterators
+   * ({@link InternedSwissMap.keys}, `values`, `entries`, and `for…of`).
+   */
+  entries?(): IterableIterator<[number, V]>;
 }
 
 /** Options for {@link StringInterner}. */
@@ -506,6 +525,146 @@ export class InternedSwissMap<V> {
   /** {@link InternedSwissMap.delete} for a composite key. */
   deleteParts(parts: readonly string[]): boolean {
     return this.remove(this.interner.lookupParts(parts));
+  }
+
+  /**
+   * Resolves one entry's ID back to the string it was interned from.
+   *
+   * An ID the interner cannot resolve means the table holds an entry this
+   * map did not write — the usual cause is writing through the public
+   * {@link InternedSwissMap.table} directly, which bypasses interning. It
+   * has no string key to report, so it is an error rather than an entry
+   * quietly skipped or handed back as `undefined`.
+   *
+   * @throws {Error} If `id` was never interned.
+   */
+  private keyOf(id: number): string {
+    const key = this.interner.resolve(id);
+
+    if (key === undefined) {
+      throw new Error(
+        `the table holds key ${id}, which this map's interner cannot ` +
+          `resolve to a string; it was written to the table directly ` +
+          `rather than through the map`,
+      );
+    }
+
+    return key;
+  }
+
+  /**
+   * The table's own `forEach`, or an explanation of why there is none.
+   *
+   * @throws {TypeError} If the table does not support iteration.
+   */
+  private tableForEach(): NonNullable<NumericKeyTable<V>["forEach"]> {
+    const walk = this.table.forEach;
+
+    if (typeof walk !== "function") {
+      throw new TypeError(
+        "the underlying table does not support forEach, so this map cannot " +
+          "be iterated",
+      );
+    }
+
+    return walk.bind(this.table);
+  }
+
+  /**
+   * The table's own `entries`, or an explanation of why there is none.
+   *
+   * @throws {TypeError} If the table does not support iteration.
+   */
+  private tableEntries(): IterableIterator<[number, V]> {
+    const walk = this.table.entries;
+
+    if (typeof walk !== "function") {
+      throw new TypeError(
+        "the underlying table does not support entries, so this map cannot " +
+          "be iterated",
+      );
+    }
+
+    return walk.call(this.table);
+  }
+
+  /**
+   * Calls `callback` once per entry, with the key resolved back to its
+   * string.
+   *
+   * Order is the table's, which is slot order and therefore unspecified —
+   * not insertion order, and not the order keys were interned in. A key
+   * built with {@link InternedSwissMap.setParts} comes back in its encoded
+   * form, since that is the string that was interned.
+   *
+   * This is the allocation-free walk: it hands the callback the key string
+   * the interner already holds rather than building a pair per entry.
+   *
+   * @param callback - Receives the value, the key, and this map — the
+   *   argument order `Map.prototype.forEach` uses.
+   * @param thisArg - Bound as `this` inside `callback`.
+   * @throws {TypeError} If `callback` is not a function, or the underlying
+   *   table does not support iteration.
+   * @throws {Error} If the table holds an ID this map's interner cannot
+   *   resolve, or if the table is rehashed mid-walk.
+   */
+  forEach(
+    callback: (value: V, key: string, map: this) => void,
+    thisArg?: unknown,
+  ): void {
+    asCallback(callback, "forEach");
+
+    const walk = this.tableForEach();
+
+    walk((value, id) => {
+      callback.call(thisArg, value, this.keyOf(id), this);
+    });
+  }
+
+  /**
+   * Yields every key as the string it was interned from, in the same
+   * unspecified order as {@link InternedSwissMap.forEach}.
+   *
+   * @throws {TypeError} If the underlying table does not support iteration.
+   * @throws {Error} If the table holds an unresolvable ID, or is rehashed
+   *   while the iterator is open.
+   */
+  *keys(): IterableIterator<string> {
+    for (const [id] of this.tableEntries()) yield this.keyOf(id);
+  }
+
+  /**
+   * Yields every value, in the same unspecified order as
+   * {@link InternedSwissMap.forEach}.
+   *
+   * @throws {TypeError} If the underlying table does not support iteration.
+   * @throws {Error} If the table is rehashed while the iterator is open.
+   */
+  *values(): IterableIterator<V> {
+    for (const [, value] of this.tableEntries()) yield value;
+  }
+
+  /**
+   * Yields every entry as a `[key, value]` pair, in the same unspecified
+   * order as {@link InternedSwissMap.forEach}.
+   *
+   * Each pair is a fresh array, matching `Map`. Prefer
+   * {@link InternedSwissMap.forEach} on a hot path.
+   *
+   * @throws {TypeError} If the underlying table does not support iteration.
+   * @throws {Error} If the table holds an unresolvable ID, or is rehashed
+   *   while the iterator is open.
+   */
+  *entries(): IterableIterator<[string, V]> {
+    for (const [id, value] of this.tableEntries()) yield [this.keyOf(id), value];
+  }
+
+  /**
+   * Yields every entry as a `[key, value]` pair, so the map works in
+   * `for…of` and spreads. Same as {@link InternedSwissMap.entries}.
+   */
+  [Symbol.iterator](): IterableIterator<[string, V]> {
+    return this.entries();
   }
 
   /**

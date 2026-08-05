@@ -19,6 +19,54 @@ const GENERATED_DIR = join(ROOT, "src", "generated");
 const CLANG = Bun.env.CLANG ?? "clang";
 const MIB = 1024 * 1024;
 
+/** WebAssembly linear memory is reserved in units of this. */
+const PAGE = 64 * 1024;
+
+/**
+ * Default `MAX_CAPACITY_LOG2`, matching the `#ifndef` in both sources.
+ *
+ * A table is bounded by this, and so is the memory an instance reserves —
+ * the banks are static arrays, so the full reservation exists from
+ * instantiation whether the table holds one entry or its maximum. One
+ * instance is one table, so a workload holding many small tables pays the
+ * whole budget per table.
+ *
+ * Lower it with SWISS_MAX_CAPACITY_LOG2 to build modules for that case:
+ * 2^16 slots costs a little over 1 MiB per u32 instance instead of 20, at
+ * the price of a table that cannot exceed 57,344 entries.
+ */
+const DEFAULT_MAX_CAPACITY_LOG2 = 20;
+
+/** Smallest exponent that still leaves room for one group of slots. */
+const MIN_MAX_CAPACITY_LOG2 = 4;
+
+/**
+ * Largest exponent whose banks still address inside wasm32's 4 GiB, with
+ * room to spare for the staging buffers.
+ */
+const MAX_MAX_CAPACITY_LOG2 = 26;
+
+function maxCapacityLog2(): number {
+  const raw = Bun.env.SWISS_MAX_CAPACITY_LOG2;
+  if (raw === undefined || raw === "") return DEFAULT_MAX_CAPACITY_LOG2;
+
+  const parsed = Number(raw);
+  if (
+    !Number.isInteger(parsed) ||
+    parsed < MIN_MAX_CAPACITY_LOG2 ||
+    parsed > MAX_MAX_CAPACITY_LOG2
+  ) {
+    throw new Error(
+      `SWISS_MAX_CAPACITY_LOG2 must be an integer in ` +
+        `[${MIN_MAX_CAPACITY_LOG2}, ${MAX_MAX_CAPACITY_LOG2}]; got ${raw}`,
+    );
+  }
+
+  return parsed;
+}
+
+const MAX_CAPACITY_LOG2 = maxCapacityLog2();
+
 const COMMON_FLAGS = [
   "--target=wasm32",
   "-O3",
@@ -38,11 +86,18 @@ interface WasmTarget {
   /** Single translation unit, relative to `native/`. */
   readonly source: string;
   /**
-   * Linear memory reserved up front; also the hard ceiling. The modules
-   * never call memory.grow, so this must cover every static array plus the
-   * linker-placed stack, and it is all the memory the module will ever have.
+   * Bytes of bank storage per slot: one control byte plus one entry, times
+   * the two banks a rehash swaps between. Memory is derived from this and
+   * MAX_CAPACITY_LOG2 rather than written out, so lowering the exponent
+   * shrinks the reservation instead of leaving it stranded at the default.
    */
-  readonly memoryBytes: number;
+  readonly bankBytesPerSlot: number;
+  /**
+   * Everything not proportional to capacity: the fixed-size staging buffers
+   * (which are sized by SCAN_WINDOW / BULK_CAPACITY, not by MAX_CAPACITY),
+   * the linker-placed stack, and the module's own sections.
+   */
+  readonly overheadBytes: number;
   /** Symbols the JavaScript bindings expect to find on the instance. */
   readonly exports: readonly string[];
 }
@@ -51,12 +106,14 @@ const TARGETS: readonly WasmTarget[] = [
   {
     name: "swiss_u32",
     source: "swiss_u32.c",
-    // 18 MiB of table banks (2 MiB control + 16 MiB of 8-byte entries)
-    // plus 0.5 MiB of scan staging buffers.
-    memoryBytes: 20 * MIB,
+    // 2 banks x (1 control byte + an 8-byte Entry) per slot: 18 MiB at 2^20.
+    bankBytesPerSlot: 2 * (1 + 8),
+    // 0.5 MiB of scan staging buffers, plus stack and section headroom.
+    overheadBytes: 2 * MIB,
     exports: [
       "init",
       "reserve",
+      "shrink_to_fit",
       "clear",
       "has",
       "has_get",
@@ -75,12 +132,14 @@ const TARGETS: readonly WasmTarget[] = [
   {
     name: "swiss_u64",
     source: "swiss_u64.c",
-    // 26 MiB of table banks (2 MiB control + 24 MiB of 12-byte entries)
-    // plus ~0.8 MiB of bulk staging buffers.
-    memoryBytes: 32 * MIB,
+    // 2 banks x (1 control byte + a 12-byte Entry): 26 MiB at 2^20.
+    bankBytesPerSlot: 2 * (1 + 12),
+    // ~0.81 MiB of bulk staging buffers, plus stack and section headroom.
+    overheadBytes: 2 * MIB,
     exports: [
       "init",
       "reserve",
+      "shrink_to_fit",
       "clear",
       "has",
       "has_get",
@@ -104,10 +163,23 @@ const TARGETS: readonly WasmTarget[] = [
   },
 ];
 
-function linkFlags(target: WasmTarget): string[] {
+/**
+ * Linear memory for a target, rounded up to a whole page.
+ *
+ * Undersizing it is caught by the link rather than at runtime: wasm-ld
+ * fails outright when .bss does not fit below the initial memory, so this
+ * arithmetic is checked by every build rather than trusted.
+ */
+function memoryBytes(target: WasmTarget): number {
+  const slots = 2 ** MAX_CAPACITY_LOG2;
+  const required = target.bankBytesPerSlot * slots + target.overheadBytes;
+  return Math.ceil(required / PAGE) * PAGE;
+}
+
+function linkFlags(target: WasmTarget, memory: number): string[] {
   return [
-    `-Wl,--initial-memory=${target.memoryBytes}`,
-    `-Wl,--max-memory=${target.memoryBytes}`,
+    `-Wl,--initial-memory=${memory}`,
+    `-Wl,--max-memory=${memory}`,
     ...target.exports.map((symbol) => `-Wl,--export=${symbol}`),
   ];
 }
@@ -116,10 +188,13 @@ async function build(target: WasmTarget): Promise<void> {
   const outputPath = join(OUTPUT_DIR, `${target.name}.wasm`);
   await mkdir(dirname(outputPath), { recursive: true });
 
+  const memory = memoryBytes(target);
+
   const argv = [
     CLANG,
     ...COMMON_FLAGS,
-    ...linkFlags(target),
+    `-DMAX_CAPACITY_LOG2=${MAX_CAPACITY_LOG2}`,
+    ...linkFlags(target, memory),
     "-o",
     outputPath,
     join(NATIVE_DIR, target.source),
@@ -134,7 +209,11 @@ async function build(target: WasmTarget): Promise<void> {
   const bytes = await Bun.file(outputPath).bytes();
   await emitEmbedded(target, bytes);
 
-  console.log(`built ${target.name}.wasm (${bytes.length} bytes)`);
+  console.log(
+    `built ${target.name}.wasm (${bytes.length} bytes, ` +
+      `${(memory / MIB).toFixed(1)} MiB of linear memory, ` +
+      `max capacity 2^${MAX_CAPACITY_LOG2})`,
+  );
 }
 
 /**

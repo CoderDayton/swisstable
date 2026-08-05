@@ -72,8 +72,24 @@
 #define CTRL_EMPTY   0xffu
 #define CTRL_DELETED 0x80u
 
-/* Slots per bank. Two banks of this size are reserved statically. */
-#define MAX_CAPACITY (1u << 20)
+/*
+ * Slots per bank. Two banks of this size are reserved statically.
+ *
+ * This is the module's whole memory budget: at 2^20 the banks alone are
+ * 26 MiB (2 MiB of control bytes + 24 MiB of 12-byte entries), reserved in
+ * .bss at instantiation whether the table holds one entry or a million.
+ * One instance is one table, so a workload with many small tables pays it
+ * per table — build a second module with a lower exponent for that case.
+ *
+ * Overridable at build time as a power-of-two exponent, which is what keeps
+ * the mask arithmetic valid; scripts/build-wasm.ts sizes linear memory from
+ * the same number. See SWISS_MAX_CAPACITY_LOG2 there.
+ */
+#ifndef MAX_CAPACITY_LOG2
+#define MAX_CAPACITY_LOG2 20
+#endif
+
+#define MAX_CAPACITY (1u << MAX_CAPACITY_LOG2)
 
 /*
  * Maximum live entries for a given capacity: the 7/8 load factor.
@@ -596,6 +612,31 @@ int32_t reserve(uint32_t entries) {
 
   const uint32_t next_capacity = capacity_for_entries(entries);
   if (entries > MAX_LIVE(next_capacity)) return STATUS_CAPACITY_EXCEEDED;
+
+  return rehash(next_capacity);
+}
+
+/*
+ * Shrinks the table to the smallest capacity that holds its live entries,
+ * preserving contents. A no-op when it is already there.
+ *
+ * Capacity otherwise only ever rises: reserve() and the growth path raise
+ * it, clear() retains it, and a delete leaves a tombstone rather than a
+ * freed slot. Lookups do not care — they probe from a hash — but scan()
+ * visits every group in the slot space, so iteration costs O(capacity) and
+ * a table that once peaked large keeps paying peak walk cost forever. This
+ * is the one way back down.
+ *
+ * capacity_for_entries() leaves a group of headroom above the load factor,
+ * so the result has room for further inserts and this cannot produce a
+ * table that rehashes on the very next set().
+ */
+__attribute__((export_name("shrink_to_fit")))
+int32_t shrink_to_fit(void) {
+  if (g_capacity == 0) return STATUS_OK;
+
+  const uint32_t next_capacity = capacity_for_entries(g_size);
+  if (next_capacity >= g_capacity) return STATUS_OK;
 
   return rehash(next_capacity);
 }

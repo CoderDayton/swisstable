@@ -109,9 +109,14 @@ If you add or rename an export, update the `exports` list in
 The linker does not fail on a missing `--export=` symbol — the error surfaces
 at `load()` as a `TypeError`, so tests are what catch it.
 
-Raising `MAX_CAPACITY` also means raising `memoryBytes` in
-`scripts/build-wasm.ts`. The statics have to fit in the linked linear memory,
-and the link fails with "initial memory too small" if they do not.
+`MAX_CAPACITY` is set by `MAX_CAPACITY_LOG2`, a power-of-two exponent
+defaulting to 20 via `#ifndef` and overridable with the
+`SWISS_MAX_CAPACITY_LOG2` environment variable at build time. Linear memory is
+derived from it in `scripts/build-wasm.ts` (bytes-per-slot times slots, plus
+fixed overhead), so there is no second figure to keep in step — but if you add
+a static array, raise that target's `overheadBytes`. The statics have to fit
+in the linked linear memory, and the link fails with "initial memory too
+small" if they do not, so the arithmetic is checked by every build.
 
 ## Changing the benchmarks
 

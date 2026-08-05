@@ -215,6 +215,34 @@ describe("SwissU32ToU32 iteration", () => {
     expect(() => iterator.next()).toThrow(/rehash/i);
   });
 
+  test("a rehash after the last window ends the walk without an error", async () => {
+    // The generation check runs before each window, so a rehash with no
+    // window left to read is not reported — and does not need to be: every
+    // entry was already handed over exactly once from the pinned layout.
+    // Pinned here so the "may throw" wording in the docs is not quietly
+    // tightened into "always throws" by a later change.
+    const table = await SwissU32ToU32.create(4);
+    table.set(1, 10);
+    table.set(2, 20);
+
+    const iterator = table.entries();
+    const seen: [number, number][] = [];
+
+    let step = iterator.next();
+    while (step.done !== true) {
+      seen.push(step.value);
+      if (seen.length === table.size) table.reserve(MULTI_WINDOW_ENTRIES);
+      step = iterator.next();
+    }
+
+    expect(new Map(seen)).toEqual(
+      new Map([
+        [1, 10],
+        [2, 20],
+      ]),
+    );
+  });
+
   test("a clear during iteration is reported too", async () => {
     const table = await SwissU32ToU32.create(MULTI_WINDOW_ENTRIES);
     for (let i = 0; i < MULTI_WINDOW_ENTRIES; i += 1) table.set(i, i);

@@ -8,6 +8,7 @@
  */
 
 import { InternedSwissMap, SwissU32ToU32, SwissU32ToU64 } from "../src/index.ts";
+import type { U64Lanes } from "../src/index.ts";
 
 const ENTRY_COUNT = 100_000;
 const WARMUP_ROUNDS = 3;
@@ -552,6 +553,195 @@ async function scaleSweep(sizes: readonly number[]): Promise<void> {
   for (const line of results) console.log(line);
 }
 
+/**
+ * Whole-table walks, which are a different shape of work from the lookup
+ * scenarios: one WASM crossing per window of slots rather than one per key,
+ * and a per-entry cost that is mostly whatever the walk has to allocate.
+ *
+ * Every contender visits the same entries and reads both halves of each, so
+ * a contender cannot win by skipping a column it was not asked for. The
+ * callback sums rather than discards for the same reason — an empty body is
+ * optimisable in a way a real caller's is not.
+ *
+ * This is what the design notes in abi.ts and the two bindings are asserting
+ * about: that forEach beats the iterator protocol, and that the u64 walk
+ * paying an object per entry is worth avoiding. Without it, those comments
+ * cite measurements nobody can reproduce.
+ *
+ * The two u64 walks come in a discarding and a retaining pair on purpose.
+ * When the callback drops the lanes, escape analysis scalar-replaces the
+ * object forEach built and the two run level — so a benchmark that only
+ * discarded would read as though the allocation were free. It is free only
+ * while the JIT can prove it does not outlive the call, which a caller that
+ * keeps the lanes does not let it prove. The retaining pair is where the
+ * difference is real, and it is the reason forEachLanes exists: it never
+ * depends on that proof holding.
+ */
+async function iterationScenario(keys: Uint32Array): Promise<void> {
+  const count = keys.length;
+
+  const map = new Map<number, number>();
+  const table = await SwissU32ToU32.load(u32Bytes, count);
+  const table64 = await SwissU32ToU64.load(u64Bytes, count);
+
+  for (let i = 0; i < count; i++) {
+    map.set(keys[i]!, i);
+    table.set(keys[i]!, i);
+    table64.set(keys[i]!, i, i);
+  }
+
+  const contenders: Contender[] = [
+    {
+      name: "SwissU32ToU32 forEach",
+      prepare: () => () => {
+        let sum = 0;
+        table.forEach((value, key) => {
+          sum = (sum + value + key) >>> 0;
+        });
+        return sum;
+      },
+    },
+    {
+      name: "SwissU32ToU32 for..of entries()",
+      prepare: () => () => {
+        let sum = 0;
+        for (const [key, value] of table) sum = (sum + value + key) >>> 0;
+        return sum;
+      },
+    },
+    {
+      name: "SwissU32ToU32 keys()",
+      prepare: () => () => {
+        let sum = 0;
+        for (const key of table.keys()) sum = (sum + key) >>> 0;
+        return sum;
+      },
+    },
+    {
+      name: "SwissU32ToU64 forEachLanes",
+      prepare: () => () => {
+        let sum = 0;
+        table64.forEachLanes((lo, hi, key) => {
+          sum = (sum + lo + hi + key) >>> 0;
+        });
+        return sum;
+      },
+    },
+    {
+      name: "SwissU32ToU64 forEach (boxes lanes)",
+      prepare: () => () => {
+        let sum = 0;
+        table64.forEach((value, key) => {
+          sum = (sum + value.lo + value.hi + key) >>> 0;
+        });
+        return sum;
+      },
+    },
+    {
+      name: "SwissU32ToU64 forEachLanes, lanes kept",
+      prepare: () => {
+        const lo = new Uint32Array(count);
+        const hi = new Uint32Array(count);
+        return () => {
+          let at = 0;
+          table64.forEachLanes((entryLo, entryHi) => {
+            lo[at] = entryLo;
+            hi[at] = entryHi;
+            at++;
+          });
+          return at;
+        };
+      },
+    },
+    {
+      name: "SwissU32ToU64 forEach, lanes kept",
+      prepare: () => {
+        const kept = new Array<U64Lanes>(count);
+        return () => {
+          let at = 0;
+          table64.forEach((value) => {
+            kept[at++] = value;
+          });
+          return at;
+        };
+      },
+    },
+    {
+      name: "Map forEach",
+      prepare: () => () => {
+        let sum = 0;
+        map.forEach((value, key) => {
+          sum = (sum + value + key) >>> 0;
+        });
+        return sum;
+      },
+    },
+    {
+      name: "Map for..of entries()",
+      prepare: () => () => {
+        let sum = 0;
+        for (const [key, value] of map) sum = (sum + value + key) >>> 0;
+        return sum;
+      },
+    },
+  ];
+
+  report(
+    `iterate ${count.toLocaleString()} entries — sparse keys`,
+    await measureAll(contenders, count, true),
+  );
+}
+
+/**
+ * What a walk costs after the table has shrunk but its capacity has not.
+ *
+ * A scan visits every slot, so the cost of a walk tracks capacity, not size
+ * — and capacity only ever rises on its own. A table that peaked large and
+ * was then emptied keeps paying peak walk cost on every subsequent walk
+ * until shrinkToFit() hands the slots back. Reported per walk rather than
+ * per entry: there are almost no entries left, which is the point.
+ *
+ * The walks are measured as one operation each and explicitly not marked
+ * repeatable. A repeatable one-operation workload would be replayed until
+ * the round covered MIN_OPS_PER_ROUND, which here means two million walks.
+ */
+async function shrinkScenario(peak: number, remaining: number): Promise<void> {
+  const keys = makeSparseKeys(peak);
+  const table = await SwissU32ToU32.load(u32Bytes, peak);
+
+  for (let i = 0; i < peak; i++) table.set(keys[i]!, i);
+  for (let i = remaining; i < peak; i++) table.delete(keys[i]!);
+
+  const walk = (): number => {
+    let seen = 0;
+    table.forEach(() => {
+      seen++;
+    });
+    return seen;
+  };
+
+  const before = await measure({ name: "before", prepare: () => walk }, 1);
+  const grownCapacity = table.capacity;
+
+  table.shrinkToFit();
+
+  const after = await measure({ name: "after", prepare: () => walk }, 1);
+
+  console.log(
+    `\nwalk ${remaining} entries left from a peak of ${peak.toLocaleString()}`,
+  );
+  console.log("-".repeat(52));
+  console.log(
+    `  before shrinkToFit  ${(before.nsPerOp / 1000).toFixed(1).padStart(8)} us` +
+      `  ${grownCapacity.toLocaleString().padStart(9)} slots`,
+  );
+  console.log(
+    `  after  shrinkToFit  ${(after.nsPerOp / 1000).toFixed(1).padStart(8)} us` +
+      `  ${table.capacity.toLocaleString().padStart(9)} slots` +
+      `  ${(before.nsPerOp / after.nsPerOp).toFixed(1)}x faster`,
+  );
+}
+
 const sparseKeys = makeSparseKeys(ENTRY_COUNT);
 const denseKeys = makeDenseKeys(ENTRY_COUNT);
 
@@ -567,4 +757,6 @@ await lookupScenario("sparse keys", sparseKeys, false);
 await lookupScenario("dense keys", denseKeys, true);
 await bulkScenario(sparseKeys);
 await stringKeyScenario(ENTRY_COUNT);
+await iterationScenario(sparseKeys);
+await shrinkScenario(ENTRY_COUNT, 8);
 await scaleSweep([2_000, 8_000, 16_000, 32_000, 128_000, 512_000]);

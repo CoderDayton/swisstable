@@ -142,8 +142,15 @@ Interleaving removes one from the critical path — worth ~3 ns per lookup at
 
 The banks are fixed static arrays and the module links with
 `--initial-memory == --max-memory`, so an instance reserves its whole linear
-memory — 20 MiB for u32, 32 MiB for u64 — the moment it is instantiated,
+memory — 20 MiB for u32, 28 MiB for u64 — the moment it is instantiated,
 holding zero entries or 917,504.
+
+Both figures are derived from `MAX_CAPACITY`, not written down beside it:
+`scripts/build-wasm.ts` computes them from bytes-per-slot times the slot
+count plus fixed overhead, so lowering `SWISS_MAX_CAPACITY_LOG2` shrinks the
+reservation instead of leaving it stranded at the default. At `2^16` a u32
+instance costs 3.1 MiB and a u64 instance 3.6 MiB, which is the build to
+reach for when the workload is many small tables rather than one large one.
 
 Reserved is not resident. The host commits pages as they are touched, and an
 empty table touches only the control bytes of its initial 64 slots. Measured
@@ -222,9 +229,10 @@ over-reserve, never under-reserve.
 ```
 
 Initial and maximum memory are equal, which is what makes the cached views
-safe. The u32 module reserves 20 MiB, the u64 module 32 MiB — 2 MiB of
+safe. The u32 module reserves 20 MiB, the u64 module 28 MiB — 2 MiB of
 control bytes plus 24 MiB of 12-byte entry records, plus the staging buffers
-and the linker-placed stack.
+and the linker-placed stack. Both are computed from `MAX_CAPACITY_LOG2` in
+the build script rather than hardcoded, so the two cannot drift apart.
 
 Exports are declared per function with
 `__attribute__((export_name("...")))`, and `scripts/build-wasm.ts` passes a
@@ -236,8 +244,11 @@ expected symbol is present on the instance and throws `TypeError` otherwise,
 and `create()` routes through `load()` for the same reason.
 
 Capacity is `1 << 20` slots per bank, giving 917,504 live entries at the 7/8
-load factor. Raising it means editing `MAX_CAPACITY` **and** the memory
-figures, since the statics have to fit.
+load factor. Override it at build time with `SWISS_MAX_CAPACITY_LOG2`, a
+power-of-two exponent in `[4, 26]` — a power of two because the mask
+arithmetic depends on it. The C sources take it as `-DMAX_CAPACITY_LOG2` and
+fall back to 20 via `#ifndef`, and the build script sizes linear memory from
+the same number, so there are no longer two places to keep in step.
 
 ## Embedding
 

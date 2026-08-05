@@ -170,7 +170,7 @@ dozens of tables is fine, and the fixed cost that matters is per *process*,
 not per table.
 
 What this does not buy back is the small-table case. The reason `Map` wins
-below ~6k entries is the boundary crossing, not the footprint; see
+below ~8k entries is the boundary crossing, not the footprint; see
 [performance.md](performance.md#small-tables-the-crossing-is-the-whole-budget).
 
 ## Crossing the boundary

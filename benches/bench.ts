@@ -113,24 +113,30 @@ interface Result {
 }
 
 /**
- * Counts how many of `count` probes hit, without allocating per probe.
- * Every lookup contender below is "iterate probes, count hits" with a
- * different `hit` test — factoring the loop out is what keeps that shape
- * from being retyped for Map, Object, Int32Array, and every table variant.
+ * A {@link Contender} that counts how many of `count` probes hit, without
+ * allocating per probe.
+ *
+ * The loop is built per contender rather than shared. One shared counter
+ * taking `hit` as a parameter looks tidier and costs a great deal: its
+ * `hit(i)` call site sees every contender's callback, goes megamorphic, and
+ * stops inlining them. The containers that suffer are the ones whose lookup
+ * is a call chain rather than an intrinsic — the WASM path measured 12.0
+ * ns/op against 5.4 for the same work on a 2,000-entry table. It hides
+ * itself at large `N`, where memory latency covers the un-inlined call, so
+ * it reads as a small-table effect rather than as harness overhead.
  */
-function countMatches(count: number, hit: (index: number) => boolean): number {
-  let found = 0;
-  for (let i = 0; i < count; i++) if (hit(i)) found++;
-  return found;
-}
-
-/** A {@link Contender} whose timed region is {@link countMatches}. */
 function lookupContender(
   name: string,
   count: number,
   hit: (index: number) => boolean,
 ): Contender {
-  return { name, prepare: () => () => countMatches(count, hit) };
+  const run = (): number => {
+    let found = 0;
+    for (let i = 0; i < count; i++) if (hit(i)) found++;
+    return found;
+  };
+
+  return { name, prepare: () => run };
 }
 
 /**
@@ -795,17 +801,6 @@ async function stringKeyScenario(count: number): Promise<void> {
  * function of working-set size. The tables store ~10 B/entry against Map's
  * ~24-32 B/entry, which only pays off once Map spills a cache level and the
  * tables do not — a crossover in N, not a constant factor. Sweep to find it.
- *
- * KNOWN DEFECT — do not quote the two smallest rows. The table's side of
- * them reads about twice a direct standalone measurement of the same work
- * (2,000: 9.0 here against 4.7; 8,000: 11.1 against 5.2), while `Map`'s side
- * and every row from 16,000 up agree with it. The inflation is specific to
- * the table's path in this harness: it survives a forced GC, resident module
- * globals, instantiating from bytes rather than a cached module, and the
- * closure shape the timed region uses — none of which reproduce it in
- * isolation. Because it hits only the small sizes it lands exactly where the
- * crossover is decided, so the crossover quoted in docs/performance.md comes
- * from the standalone measurement (~6k entries), not from this table.
  */
 /** Builds one sweep row from the `[swiss, map]` pair measured for a size. */
 function sweepRow(entries: number, pair: readonly Result[]): ScaleSweepRow {

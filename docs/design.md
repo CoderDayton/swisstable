@@ -213,9 +213,9 @@ one WebAssembly *global* (`__stack_pointer`), so nothing was moved out of a
 register to make this work.
 
 The third decision lives on the JavaScript side: every key is passed as
-`x | 0`. See
-[performance.md](performance.md#what-dominates-the-int32-tagging-cliff) —
-this one is worth more than everything else combined.
+`x | 0`, so a key at or above `2^31` reaches WASM as an int32 rather than a
+boxed double. See
+[performance.md](performance.md#where-the-callers-keys-are-stored).
 
 ## Bulk staging
 

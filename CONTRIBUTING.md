@@ -47,7 +47,7 @@ never hand-edit, and stage the rebuilt files with any C change.
 ```
 native/         C sources for the wasm32 modules
 scripts/        build tooling (build-wasm.ts)
-benches/        throughput benchmarks (bench.ts)
+benches/        throughput benchmarks (bench.ts, one runtime per column)
 src/            TypeScript bindings and public entry point
 src/generated/  base64 module payloads (generated, committed)
 examples/       runnable examples, start at 01-basic.ts
@@ -65,7 +65,8 @@ bun run build:js   # src/*.ts   -> dist/js/*.js + .d.ts
 
 bun test           # 88 tests across 9 suites
 bun run typecheck  # tsc --noEmit
-bun run bench      # throughput against Map, Object, Int32Array
+bun run bench      # throughput against Map, Object, Int32Array (this runtime)
+bun run bench:all  # the same suite under bun, node, deno, chrome, firefox
 ```
 
 Run build, test, typecheck, and bench before opening a pull request.
@@ -121,10 +122,18 @@ small" if they do not, so the arithmetic is checked by every build.
 
 ## Changing the benchmarks
 
-`benches/bench.ts` has a few rules baked in that are easy to break:
+`benches/bench.ts` holds the scenarios, `benches/runtime.ts` holds everything
+that differs between hosts, and `benches/browser.ts` and `benches/run-all.ts`
+drive them. A few rules are baked in and easy to break:
 
-- **Contenders run one at a time.** Running them concurrently interleaves
-  their work inside each other's timed regions.
+- **Contenders run one at a time**, and so do runtimes. Running either
+  concurrently interleaves their work inside each other's timed regions.
+- **A scenario may not touch a host API directly.** Anything that differs
+  between bun, node, deno, and a page goes through `runtime.ts`, or the
+  scenario stops being one measurement and becomes several.
+- **A browser isolates contenders in workers**, which is the same guarantee a
+  child process gives: a fresh global, and inline caches no other contender
+  has specialized.
 - **Only read-only workloads may replay** within a round. Replaying a fill
   would overwrite rather than insert, and stop being the same workload.
 - **Nothing allocating belongs in the timed region.** An `Object.keys().length`
@@ -132,9 +141,15 @@ small" if they do not, so the arithmetic is checked by every build.
 - **Fill is measured pre-sized and grown from empty**, because `Map` and
   `Object` cannot be pre-sized and always pay for their own rehashes.
 
-If a change moves the published numbers, update the tables in
-[docs/performance.md](docs/performance.md) and the README together, and say
-in the pull request which direction they moved and why.
+Regenerate the published tables with `bun run bench:all` followed by
+`bun run bench:compare`, which reads `benches/results/*.json` and prints the
+markdown for [docs/performance.md](docs/performance.md) and the README. Update
+both together, and say in the pull request which direction the numbers moved
+and why.
+
+A runtime that is not installed is reported and skipped, so a partial sweep
+still produces a table — but the docs' columns are only as current as the last
+full sweep.
 
 ## Publishing
 

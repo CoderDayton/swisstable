@@ -70,8 +70,9 @@ reports a ceiling hit partway through a single chunk.
 `NaN`, and anything past `2³² − 1` throw `RangeError` rather than being
 coerced. The check is `(x >>> 0) === x`, which is exact on the u32 range, and
 the value is then passed as `x | 0` — the same 32 bits, but tagged as a
-machine int32. That tagging is worth ~14 ns per call; see
-[performance.md](performance.md#what-dominates-the-int32-tagging-cliff).
+machine int32, which is why keys above `2^31` cost no more than keys below
+it. Where the caller keeps its keys still matters; see
+[performance.md](performance.md#where-the-callers-keys-are-stored).
 
 **Capacity is fixed at build time.** The modules are freestanding and link
 without an allocator, so the ceiling is `1 << 20` slots — 917,504 live
@@ -81,9 +82,12 @@ move it either way; the build script sizes linear memory from the same
 number.
 
 **Each module instance owns exactly one table, and reserves its whole budget
-up front.** The banks are static arrays, so an instance costs 20 MiB (u32) or
-28 MiB (u64) of linear memory from instantiation whether it holds one entry
-or its maximum. Two tables mean two instances and twice that. Compile the
+up front.** The banks are static arrays, so an instance reserves 20 MiB (u32)
+or 28 MiB (u64) of linear memory from instantiation whether it holds one
+entry or its maximum. The reservation is address space and is committed page
+by page as the table touches it, so a small table still resides small — but
+two tables mean two instances and twice the reservation. See
+[performance.md](performance.md#memory) for what an entry costs. Compile the
 module once with `WebAssembly.compile` and pass it to `load` repeatedly — see
 [`examples/04-multiple-tables.ts`](../examples/04-multiple-tables.ts). For
 many small tables, build a second pair of modules with a lower
@@ -230,12 +234,15 @@ table.reserve(500_000);   // rehashes
 [...iterator];            // throws: rehashed during iteration
 ```
 
-**Cost.** `forEach` allocates nothing per entry and measures ~2.3x faster
-than `Map.prototype.forEach` over 100k entries. The iterator protocol is the
-other way round: `keys()`, `values()`, and `entries()` allocate a result
-record per entry the way the built-ins do, and `entries()` runs ~1.2x
-*slower* than `Map`'s, whose iterator is engine-internal. Prefer `forEach` on
-a hot path. Reproduce all of it with `bun run bench`.
+**Cost.** `forEach` allocates nothing per entry, and over 100k entries it
+beats `Map.prototype.forEach` by 2.3x on JavaScriptCore while losing to it by
+about 25% on V8. The iterator protocol is more expensive everywhere:
+`keys()`, `values()`, and `entries()` allocate a result record per entry the
+way the built-ins do, and `entries()` runs slower than `Map`'s, whose
+iterator is engine-internal. Prefer `forEach` when the values are needed and
+`keys()` when they are not — `keys()` is the cheapest walk on every engine.
+Reproduce all of it with `bun run bench`, or `bun run bench:all` for the
+per-engine spread.
 
 ```ts
 const table = await SwissU32ToU32.load(bytes, 100_000);

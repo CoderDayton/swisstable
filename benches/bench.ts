@@ -12,6 +12,7 @@
 
 import { InternedSwissMap, SwissU32ToU32, SwissU32ToU64 } from "../src/index.ts";
 import type { U64Lanes } from "../src/index.ts";
+import { ISOLATED_RESULT, runtime } from "./runtime.ts";
 
 const ENTRY_COUNT = 100_000;
 const WARMUP_ROUNDS = 3;
@@ -31,8 +32,8 @@ const NS_PER_SECOND = 1_000_000_000;
 const MIN_OPS_PER_ROUND = 2_000_000;
 const MISS_KEY_OFFSET = 0x4000_0000;
 
-const U32_WASM = new URL("../dist/wasm/swiss_u32.wasm", import.meta.url);
-const U64_WASM = new URL("../dist/wasm/swiss_u64.wasm", import.meta.url);
+const U32_WASM = "swiss_u32.wasm";
+const U64_WASM = "swiss_u64.wasm";
 
 /** xorshift32, so every run sees the same keys. */
 function makeSparseKeys(count: number, seed = 0x9e3779b9): Uint32Array {
@@ -184,9 +185,9 @@ async function runRound(
   // container per round, and that rebuild is not what is being measured.
   const run = await contender.prepare();
 
-  const start = Bun.nanoseconds();
+  const start = runtime.now();
   for (let replay = 0; replay < replays; replay++) checksum += run();
-  return (Bun.nanoseconds() - start) / replays;
+  return (runtime.now() - start) / replays;
 }
 
 /**
@@ -244,7 +245,7 @@ async function measureField(
     // pause is worth more than the work. Measured, it was doubling the
     // 2,000-entry sweep rows. What a contender allocates itself still
     // accrues during the measured rounds and is still counted.
-    if (round === WARMUP_ROUNDS) Bun.gc(true);
+    if (round === WARMUP_ROUNDS) runtime.gc();
 
     for (const index of shuffledIndices(contenders.length)) {
       const elapsed = await runRound(contenders[index]!, replays);
@@ -281,10 +282,28 @@ async function measure(
   return result!;
 }
 
-/** Marks the one line of a `--isolate` child's output the parent wants. */
-const ISOLATED_RESULT = "#result ";
+/**
+ * Unwinds an isolate that has done its one job.
+ *
+ * A child process exits, but a worker cannot — the page decides when it
+ * stops — so the scenario is unwound with a sentinel the entry point
+ * swallows. Either way nothing after the reported field runs.
+ */
+const RUN_COMPLETE = Symbol("bench: run complete");
 
-/** `--isolate=<field>:<contender>`, set only in a child process. */
+function stopRun(): never {
+  runtime.finish();
+  throw RUN_COMPLETE;
+}
+
+/**
+ * `--memory=<index>`, set only in a run spawned to measure one container's
+ * footprint. Separate from `--isolate` because a memory measurement has no
+ * field of contenders to index into.
+ */
+let memoryTarget: number | null = null;
+
+/** `--isolate=<field>:<contender>`, set only in an isolated run. */
 interface IsolationTarget {
   readonly field: number;
   readonly contender: number;
@@ -343,50 +362,24 @@ function unbuilt(length: number): Contender[] {
 }
 
 /**
- * Measures one contender in a process of its own and returns its result.
+ * Measures one contender in an isolate of its own and returns its result.
  *
- * The child re-runs this scenario's setup from scratch, which is the cost
+ * The isolate re-runs this scenario's setup from scratch, which is the cost
  * of the guarantee: it reaches the timed region having executed nothing but
- * its own contender's code path.
+ * its own contender's code path. What an isolate is depends on the host —
+ * a child process, or a worker in a browser — and {@link runtime} decides.
  */
 async function spawnContender(
   scenario: string,
   field: number,
   index: number,
 ): Promise<Result> {
-  const child = Bun.spawn({
-    cmd: [
-      process.execPath,
-      import.meta.path,
-      `--scenario=${scenario}`,
-      `--isolate=${field}:${index}`,
-    ],
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-
-  const [stdout, stderr] = await Promise.all([
-    new Response(child.stdout).text(),
-    new Response(child.stderr).text(),
+  const line = await runtime.isolate([
+    `--scenario=${scenario}`,
+    `--isolate=${field}:${index}`,
   ]);
 
-  if ((await child.exited) !== 0) {
-    throw new Error(
-      `bench: isolated ${scenario} field ${field} contender ${index} failed\n${stderr}`,
-    );
-  }
-
-  const line = stdout
-    .split("\n")
-    .find((candidate) => candidate.startsWith(ISOLATED_RESULT));
-
-  if (line === undefined) {
-    throw new Error(
-      `bench: isolated ${scenario} field ${field} contender ${index} produced no result\n${stdout}`,
-    );
-  }
-
-  return JSON.parse(line.slice(ISOLATED_RESULT.length)) as Result;
+  return JSON.parse(line) as Result;
 }
 
 /**
@@ -423,11 +416,11 @@ async function measureAll(
     }
 
     const [result] = await measureField([contender], operations, repeatable);
-    console.log(ISOLATED_RESULT + JSON.stringify(result));
+    runtime.emit(ISOLATED_RESULT + JSON.stringify(result));
 
     // The parent wants exactly this one field; whatever the scenario would
-    // go on to measure is another child's job.
-    process.exit(0);
+    // go on to measure belongs to another isolate.
+    stopRun();
   }
 
   if (!isolateFields || currentScenario === null) {
@@ -460,6 +453,31 @@ interface ScaleSweepReport {
   readonly rows: readonly ScaleSweepRow[];
 }
 
+interface MemoryRow {
+  readonly name: string;
+  /**
+   * Bytes of JavaScript heap per entry, or null for a container that does
+   * not live on it — a WASM table's entries are in linear memory, which the
+   * collector never sees.
+   */
+  readonly heapBytesPerEntry: number | null;
+  /** Resident bytes per entry: what the process actually pays. */
+  readonly residentBytesPerEntry: number;
+  readonly residentTotalBytes: number;
+}
+
+interface MemoryReport {
+  readonly kind: "memory";
+  readonly entries: number;
+  /** Linear memory each slot occupies, both banks counted. */
+  readonly slotBytes: { readonly u32: number; readonly u64: number };
+  /** Linear memory an instance reserves, whatever it holds. */
+  readonly reservedBytes: { readonly u32: number; readonly u64: number };
+  /** Slots the u32 table holds `entries` in. */
+  readonly slots: number;
+  readonly rows: readonly MemoryRow[];
+}
+
 interface ShrinkReport {
   readonly kind: "shrink";
   readonly peak: number;
@@ -470,7 +488,11 @@ interface ShrinkReport {
   readonly shrunkCapacitySlots: number;
 }
 
-type ReportEntry = ContenderReport | ScaleSweepReport | ShrinkReport;
+type ReportEntry =
+  | ContenderReport
+  | ScaleSweepReport
+  | ShrinkReport
+  | MemoryReport;
 
 /** Every scenario's results, in run order — dumped whole under `--json`. */
 const reports: ReportEntry[] = [];
@@ -498,8 +520,8 @@ function report(scenario: string, results: readonly Result[]): void {
   }
 }
 
-const u32Bytes = await Bun.file(U32_WASM).arrayBuffer();
-const u64Bytes = await Bun.file(U64_WASM).arrayBuffer();
+const u32Bytes = await runtime.readWasm(U32_WASM);
+const u64Bytes = await runtime.readWasm(U64_WASM);
 
 const swiss = await SwissU32ToU32.load(u32Bytes, ENTRY_COUNT);
 const swiss64 = await SwissU32ToU64.load(u64Bytes, ENTRY_COUNT);
@@ -1081,6 +1103,272 @@ async function shrinkScenario(peak: number, remaining: number): Promise<void> {
 }
 
 /**
+ * Bytes of linear memory each slot costs.
+ *
+ * Two banks are reserved so a rehash has somewhere to move entries to, and
+ * both are static arrays sized to the compiled ceiling — so a slot costs its
+ * per-bank layout twice, whether or not a rehash is in progress. Kept in
+ * step with `bankBytesPerSlot` in scripts/build-wasm.ts, which is what the
+ * modules are actually linked against.
+ */
+const U32_BYTES_PER_SLOT = 2 * (1 + 8);
+const U64_BYTES_PER_SLOT = 2 * (1 + 12);
+
+/**
+ * Entries the footprint scenario builds, which is larger than the rest of
+ * the suite uses.
+ *
+ * A process costs a few megabytes to reach the measurement — compiled code,
+ * the collector's own structures, the module — and that is charged to
+ * whichever container is being built. At 100,000 entries it is most of the
+ * reading and the runtimes disagree by 4x; at 500,000 the containers are
+ * several times larger than it and they agree. Still inside the compiled
+ * ceiling of 917,504 entries.
+ */
+const MEMORY_ENTRY_COUNT = 500_000;
+
+/** Holds a measured container past its readings, so it cannot be freed. */
+let retained: unknown = null;
+
+interface Footprint {
+  readonly heapBytes: number | null;
+  readonly residentBytes: number;
+}
+
+/**
+ * What one container costs, built exactly once in a process of its own.
+ *
+ * Once rather than repeatedly, because neither figure survives repetition.
+ * Resident bytes do not come back down when a container is dropped — the
+ * allocator keeps the pages — so only the first build in a process measures
+ * anything. The heap figure drifts for its own reasons: JavaScriptCore
+ * reports the same `Map` at 84 B/entry for the first few build-and-collect
+ * cycles and 126 from the fifth on, which is its accounting moving rather
+ * than the container.
+ *
+ * The keys are built before the first reading and shared by every container,
+ * so what the deltas contain is the container and its entries, not the
+ * inputs.
+ */
+async function footprintOf(
+  build: () => unknown | Promise<unknown>,
+  count: number,
+): Promise<Footprint> {
+  runtime.gc();
+  const heapBefore = runtime.heapUsed();
+  const residentBefore = runtime.residentBytes()!;
+
+  // Stored before the collection rather than after it. A container held only
+  // in a local is dead as far as the engine is concerned by the time the
+  // collection runs, and JavaScriptCore duly collects it — which reports
+  // every container as costing nothing.
+  retained = await build();
+
+  runtime.gc();
+  const heapAfter = runtime.heapUsed();
+  const residentAfter = runtime.residentBytes()!;
+
+  retained = null;
+
+  return {
+    heapBytes:
+      heapBefore === null || heapAfter === null
+        ? null
+        : (heapAfter - heapBefore) / count,
+    residentBytes: (residentAfter - residentBefore) / count,
+  };
+}
+
+/** The fixed linear memory an instance of `bytes` reserves. */
+async function linearMemoryBytes(bytes: ArrayBuffer): Promise<number> {
+  const { instance } = await WebAssembly.instantiate(bytes, {});
+  const memory = instance.exports.memory as WebAssembly.Memory;
+  return memory.buffer.byteLength;
+}
+
+/**
+ * What the containers cost to hold, rather than to use.
+ *
+ * Every row is measured the same way — one container, built once, in a
+ * process of its own — because that is the only comparison that means
+ * anything across a heap and a WASM arena. A table's entries live in linear
+ * memory, which the collector never sees and a heap reading never counts,
+ * so a heap-against-heap table would report a SwissTable as free.
+ *
+ * Linear memory is reserved at the compiled ceiling but committed page by
+ * page as it is touched, so what a table costs the process is set by how
+ * much of the arena the entries reach, not by the size of the reservation.
+ * The reservation is reported alongside, because it is what a caller's
+ * address space and a memory-capped container see.
+ */
+async function memoryScenario(keys: Uint32Array): Promise<void> {
+  const count = keys.length;
+
+  if (runtime.heapUsed() === null) {
+    // Nothing partial is worth publishing here: the tables' figures would be
+    // derived and the containers' measured, and only one of the two would be
+    // missing — which reads as a comparison and is not one.
+    return;
+  }
+
+  const valsLo = Uint32Array.from({ length: count }, (_, i) => i);
+  const valsHi = Uint32Array.from({ length: count }, (_, i) => i * 2);
+
+  const containers: readonly (readonly [
+    string,
+    () => unknown | Promise<unknown>,
+  ])[] = [
+    [
+      "SwissU32ToU32",
+      async () => {
+        const table = await SwissU32ToU32.load(u32Bytes, count);
+        for (let i = 0; i < count; i++) table.set(keys[i]!, i);
+        return table;
+      },
+    ],
+    [
+      "SwissU32ToU64",
+      async () => {
+        const table = await SwissU32ToU64.load(u64Bytes, count);
+        for (let i = 0; i < count; i++) {
+          table.set(keys[i]!, valsLo[i]!, valsHi[i]!);
+        }
+        return table;
+      },
+    ],
+    [
+      "Map<number, number>",
+      () => {
+        const map = new Map<number, number>();
+        for (let i = 0; i < count; i++) map.set(keys[i]!, i);
+        return map;
+      },
+    ],
+    [
+      "Object (numeric keys)",
+      () => {
+        const object: Record<number, number> = {};
+        for (let i = 0; i < count; i++) object[keys[i]!] = i;
+        return object;
+      },
+    ],
+    [
+      "Map<number, {lo,hi}>",
+      () => {
+        const map = new Map<number, { lo: number; hi: number }>();
+        for (let i = 0; i < count; i++) {
+          map.set(keys[i]!, { lo: valsLo[i]!, hi: valsHi[i]! });
+        }
+        return map;
+      },
+    ],
+    [
+      "Map<number, bigint>",
+      () => {
+        const map = new Map<number, bigint>();
+        for (let i = 0; i < count; i++) {
+          map.set(keys[i]!, (BigInt(valsHi[i]!) << 32n) | BigInt(valsLo[i]!));
+        }
+        return map;
+      },
+    ],
+  ];
+
+  // One container per process: a reading is only as good as the process it
+  // is taken in, and one that has already built three containers is not a
+  // fresh one.
+  if (memoryTarget !== null) {
+    const container = containers[memoryTarget];
+    if (container === undefined) {
+      throw new Error(`bench: no memory container ${memoryTarget}`);
+    }
+
+    const footprint = await footprintOf(container[1], count);
+    runtime.emit(ISOLATED_RESULT + JSON.stringify(footprint));
+    stopRun();
+  }
+
+  const rows: MemoryRow[] = [];
+
+  for (let index = 0; index < containers.length; index++) {
+    const [name, build] = containers[index]!;
+
+    const footprint = isolateFields
+      ? ((JSON.parse(
+          await runtime.isolate(["--scenario=memory", `--memory=${index}`]),
+        ) as Footprint))
+      : await footprintOf(build, count);
+
+    rows.push({
+      name,
+      // A table's entries are in linear memory, so its heap delta is the
+      // binding object and nothing else — reporting it as the container's
+      // cost would be reporting the wrong number, not a small one.
+      heapBytesPerEntry: name.startsWith("Swiss")
+        ? null
+        : footprint.heapBytes,
+      residentBytesPerEntry: footprint.residentBytes,
+      residentTotalBytes: footprint.residentBytes * count,
+    });
+  }
+
+  const reserved = {
+    u32: await linearMemoryBytes(u32Bytes),
+    u64: await linearMemoryBytes(u64Bytes),
+  };
+
+  // Exact rather than measured: the slot count is a power of two the table
+  // reports, and the per-slot layout is what the modules are linked with.
+  // This is the figure that scales, and the one a reader should compare
+  // against a container's measured bytes per entry.
+  const sized = await SwissU32ToU32.load(u32Bytes, count);
+  const slots = sized.capacity;
+  const ceilingEntries = (slots * 7) / 8;
+
+  reports.push({
+    kind: "memory",
+    entries: count,
+    slotBytes: { u32: U32_BYTES_PER_SLOT, u64: U64_BYTES_PER_SLOT },
+    reservedBytes: reserved,
+    slots,
+    rows,
+  });
+  if (jsonMode) return;
+
+  console.log(`\nmemory at ${count.toLocaleString()} entries`);
+  console.log("-".repeat(58));
+
+  const width = Math.max(...rows.map((row) => row.name.length));
+  for (const row of rows) {
+    const resident = row.residentBytesPerEntry.toFixed(1).padStart(6);
+    const total = (row.residentTotalBytes / (1024 * 1024)).toFixed(2).padStart(6);
+    const heap =
+      row.heapBytesPerEntry === null
+        ? "       —"
+        : `${row.heapBytesPerEntry.toFixed(1).padStart(6)} B`;
+
+    console.log(
+      `  ${row.name.padEnd(width)}  ${resident} B/entry resident` +
+        `  ${total} MiB  heap ${heap}`,
+    );
+  }
+
+  console.log(
+    `  u32 structure: ${U32_BYTES_PER_SLOT} B/slot over ` +
+      `${slots.toLocaleString()} slots — ` +
+      `${((slots * U32_BYTES_PER_SLOT) / ceilingEntries).toFixed(1)} B/entry at ` +
+      `the 7/8 ceiling, ` +
+      `${((slots * (U32_BYTES_PER_SLOT / 2)) / ceilingEntries).toFixed(1)} ` +
+      `in the live bank alone`,
+  );
+  console.log(
+    `  linear memory reserved per instance: ` +
+      `${(reserved.u32 / (1024 * 1024)).toFixed(0)} MiB (u32), ` +
+      `${(reserved.u64 / (1024 * 1024)).toFixed(0)} MiB (u64)`,
+  );
+}
+
+/**
  * Removal, which nothing else here covers.
  *
  * Not repeatable: the second pass would delete keys that are already gone
@@ -1583,6 +1871,7 @@ const SCENARIO_NAMES = [
   "iteration",
   "maintenance",
   "shrink",
+  "memory",
   "scale-sweep",
 ] as const;
 type ScenarioName = (typeof SCENARIO_NAMES)[number];
@@ -1592,6 +1881,7 @@ interface CliOptions {
   readonly scenarios: ReadonlySet<ScenarioName> | null;
   readonly isolate: boolean;
   readonly target: IsolationTarget | null;
+  readonly memory: number | null;
 }
 
 /** Parses `--isolate=<field>:<contender>`, which only a child is given. */
@@ -1609,7 +1899,7 @@ function parseIsolate(value: string): IsolationTarget {
 function printUsage(): void {
   console.log(
     [
-      "Usage: bun run bench [options]",
+      "Usage: bun run bench [options]   (also runs under node, deno, and a browser)",
       "",
       "Options:",
       "  --scenario=<name,...>  Run only the named scenarios (repeatable, comma-separated).",
@@ -1628,6 +1918,7 @@ function parseArgs(argv: readonly string[]): CliOptions {
   let scenarios: Set<ScenarioName> | null = null;
   let isolate = true;
   let target: IsolationTarget | null = null;
+  let memory: number | null = null;
 
   for (const arg of argv) {
     if (arg === "--json") {
@@ -1636,9 +1927,14 @@ function parseArgs(argv: readonly string[]): CliOptions {
       isolate = false;
     } else if (arg.startsWith("--isolate=")) {
       target = parseIsolate(arg.slice("--isolate=".length));
+    } else if (arg.startsWith("--memory=")) {
+      memory = Number(arg.slice("--memory=".length));
+      if (!Number.isInteger(memory)) {
+        throw new Error(`bench: --memory expects an index, got "${arg}"`);
+      }
     } else if (arg === "--help" || arg === "-h") {
       printUsage();
-      process.exit(0);
+      stopRun();
     } else if (arg.startsWith("--scenario=")) {
       scenarios ??= new Set();
       for (const raw of arg.slice("--scenario=".length).split(",")) {
@@ -1655,13 +1951,14 @@ function parseArgs(argv: readonly string[]): CliOptions {
     }
   }
 
-  return { json, scenarios, isolate, target };
+  return { json, scenarios, isolate, target, memory };
 }
 
-const options = parseArgs(Bun.argv.slice(2));
+const options = parseArgs(runtime.argv());
 jsonMode = options.json;
 isolateFields = options.isolate;
 isolationTarget = options.target;
+memoryTarget = options.memory;
 
 const sparseKeys = makeSparseKeys(ENTRY_COUNT);
 const denseKeys = makeDenseKeys(ENTRY_COUNT);
@@ -1693,6 +1990,7 @@ const scenarios: Record<ScenarioName, () => Promise<void>> = {
   iteration: () => iterationScenario(sparseKeys),
   maintenance: () => maintenanceScenario(ENTRY_COUNT),
   shrink: () => shrinkScenario(ENTRY_COUNT, 8),
+  memory: () => memoryScenario(makeSparseKeys(MEMORY_ENTRY_COUNT)),
   "scale-sweep": () => scaleSweep([2_000, 8_000, 16_000, 32_000, 128_000, 512_000]),
 };
 
@@ -1701,20 +1999,48 @@ const selected = options.scenarios ?? new Set<ScenarioName>(SCENARIO_NAMES);
 if (!jsonMode && isolationTarget === null) {
   console.log(
     `${ENTRY_COUNT.toLocaleString()} entries, median of ${MEASURED_ROUNDS} rounds` +
-      ` after ${WARMUP_ROUNDS} warmups — Bun ${Bun.version}` +
-      (isolateFields ? ", one process per contender" : ", shared process"),
+      ` after ${WARMUP_ROUNDS} warmups — ${runtime.host.label}` +
+      (isolateFields ? ", one isolate per contender" : ", shared isolate"),
   );
 }
 
-for (const name of SCENARIO_NAMES) {
-  if (!selected.has(name)) continue;
+try {
+  for (const name of SCENARIO_NAMES) {
+    if (!selected.has(name)) continue;
 
-  // Both counters are per scenario, so a child given --scenario reaches the
-  // same field number the parent asked for.
-  currentScenario = name;
-  fieldCounter = 0;
+    // Both counters are per scenario, so an isolate given --scenario reaches
+    // the same field number the parent asked for.
+    currentScenario = name;
+    fieldCounter = 0;
 
-  await scenarios[name]();
+    await scenarios[name]();
+  }
+} catch (error) {
+  // An isolate that has reported its one field unwinds through here.
+  if (error !== RUN_COMPLETE) throw error;
 }
 
-if (jsonMode) console.log(JSON.stringify(reports, null, 2));
+/**
+ * A finished run, as data.
+ *
+ * The host block is not decoration: a ns/op figure means nothing without
+ * the engine, the CPU, and whether the run could collect on demand, and
+ * comparing two runtimes means comparing two of these.
+ */
+const payload = {
+  schema: 1,
+  host: runtime.host,
+  entryCount: ENTRY_COUNT,
+  warmupRounds: WARMUP_ROUNDS,
+  measuredRounds: MEASURED_ROUNDS,
+  isolated: isolateFields,
+  scenarios: [...selected],
+  reports,
+};
+
+// A browser has no stdout, so a page always hands its results back; on the
+// server that is what --json asks for. An isolate reaches here only after
+// unwinding, and has already reported the one field it was spawned for.
+if (isolationTarget === null && (jsonMode || runtime.host.runtime === "browser")) {
+  await runtime.publish(JSON.stringify(payload, null, 2));
+}

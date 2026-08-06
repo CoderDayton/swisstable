@@ -11,10 +11,13 @@ freestanding `wasm32`, with thin TypeScript bindings. Keys are `u32`.
 The table lives entirely inside WebAssembly linear memory: keys, values,
 control bytes, and probing never cross the JavaScript boundary, so a lookup
 costs one WASM call and a bulk operation costs one call per chunk regardless
-of batch size. Above ~8k entries that makes it 1.3–9x faster than `Map` on
-sparse integer keys, and the margin is widest on mutation — `delete` is 6.8x.
-Below that, or with string keys, `Map` wins, and for dense keys a typed array
-beats both — see [when not to use this](#when-not-to-use-this).
+of batch size. At 100k entries that makes it 1.4–12x faster than `Map` on
+sparse integer keys — on Bun, Node, Deno, Chrome, and Firefox alike — and the
+margin is widest on mutation and bulk transfer rather than on lookup. The
+entry count where it starts winning depends on the engine, from ~2,000 on V8
+to ~10,000 on JavaScriptCore. With string keys `Map` wins, and for dense keys
+a typed array beats both — see
+[when not to use this](#when-not-to-use-this).
 
 The original C++ version can be found [here], and this [CppCon talk] gives an
 overview of how the algorithm works.
@@ -30,9 +33,12 @@ Docs: [API](docs/api.md) · [Design](docs/design.md) ·
 ## Features
 
 - One byte of metadata per slot, compared sixteen at a time with `wasm_simd128`.
-- Lower memory usage: ~10 bytes per entry against `Map`'s ~24–32.
+- Lower memory usage: 10.3 bytes per entry in the live bank — 20.6 counting
+  the standby bank a rehash needs — against a measured 37 B/entry for `Map`
+  on V8 and 67 B on JavaScriptCore.
 - Bulk `setMany`/`getMany`/`deleteMany` stage a whole batch and cross once —
-  8.1 ns/op against `Map`'s 58.5 for a 100k-entry fill.
+  7.1–8.8 ns/op against `Map`'s 48–78 for a 100k-entry u64 fill, on every
+  runtime measured.
 - No allocator: fixed linear memory, linked `-nostdlib`, never calls
   `memory.grow`, and no allocation on any hot path.
 - The modules are compiled into the package, so there is no `.wasm` file to
@@ -85,7 +91,7 @@ runnable programs.
 
 | Situation | Use instead | Why |
 | --- | --- | --- |
-| Fewer than ~8k entries | `Map` | A crossing costs ~2.6 ns before doing any work; a cache-resident `Map` lookup costs ~4 ns in total. |
+| Fewer than ~2k entries | `Map` | A crossing costs a few ns before any work happens, and both containers are cache-resident. Between 2k and 16k the winner depends on the engine. |
 | String keys, looked up repeatedly | `Map<string, V>` | Engines cache a string's hash on the string object; a WASM table must copy and rehash the bytes. |
 | Dense integer keys with no gaps | `Int32Array` | Direct indexing is 0.5 ns and needs no hashing. |
 | Non-integer or `> 2^32 - 1` keys | `Map` | Anything outside `u32` throws. |
@@ -95,30 +101,37 @@ Both limits are structural rather than tuning problems;
 
 ## Benchmarks
 
-100k entries, median of 21 rounds, each contender in its own process, probed
-in a shuffled order, median of three runs. Bun 1.3.14 on x64 Linux. Ratios
-are portable, absolute figures are not.
+Speedup against `Map` at 100k sparse `u32` keys — above 1.00x the table is
+faster. Median of 21 rounds and of 3 passes, each contender in an isolate of
+its own, probed in a shuffled order. i9-13900K on x64 Linux.
 
-| Workload | SwissTable | `Map` | Speedup |
-| --- | --- | --- | --- |
-| fill, sparse keys | **7.9 ns** | 71.1 ns | 9.0x |
-| lookup hit, sparse | **8.1 ns** | 12.0 ns | 1.5x |
-| lookup miss, sparse | **9.1 ns** | 12.1 ns | 1.3x |
-| `has`, sparse | **6.7 ns** | 12.1 ns | 1.8x |
-| overwrite existing key | **7.1 ns** | 16.6 ns | 2.3x |
-| delete | **5.7 ns** | 38.7 ns | 6.8x |
-| churn (delete + reinsert) | **11.1 ns** | 40.6 ns | 3.7x |
-| u64 bulk fill (`setMany`) | **8.1 ns** | 58.5 ns | 7.2x |
-| u64 bulk lookup (`getMany`) | **7.1 ns** | 11.4 ns | 1.6x |
+| Workload | Bun 1.3 | Node 24 | Deno 2.9 | Chrome 151 | Firefox 152 |
+| --- | --- | --- | --- | --- | --- |
+| fill (pre-sized) | 8.8x | 7.2x | 6.6x | 3.5x | 5.1x |
+| lookup hit | 1.55x | 3.2x | 3.6x | 3.0x | 1.76x |
+| lookup miss | 1.40x | 3.7x | 3.8x | 2.8x | 1.72x |
+| `has` | 1.89x | 3.7x | 4.2x | 3.6x | 2.1x |
+| overwrite existing key | 2.4x | 3.1x | 3.3x | 2.9x | 3.4x |
+| delete | 5.6x | 6.2x | 6.3x | 5.0x | 4.4x |
+| churn (delete + reinsert) | 3.3x | 3.9x | 4.0x | 3.1x | 2.8x |
+| u64 bulk fill (`setMany`) | 6.4x | 11x | 8.3x | 5.4x | 9.3x |
+| u64 bulk lookup (`getMany`) | 1.72x | 4.2x | 3.8x | 3.4x | 2.5x |
 
-Reproduce with `bun run build && bun run bench`. The full table, the cost
-model behind it, and the int32 argument-tagging cliff that dominates
-everything else are in [docs/performance.md](docs/performance.md).
+The table itself costs about the same on every engine — a sparse lookup hit
+is 7.0–11.0 ns across all five. The columns differ because `Map` does: 11.0
+ns on JavaScriptCore against 25–26 ns on V8.
+
+Reproduce with `bun run build && bun run bench`, or `bun run bench:all` for
+every runtime installed. Absolute figures, the cost model, the crossover by
+engine, and where the caller's own key storage costs 1.7x are in
+[docs/performance.md](docs/performance.md).
 
 ## Contributing
 
 Contributions are welcome. Bug reports and benchmark results on other
 hardware are especially useful — the numbers above are from one machine.
+`bun run bench:all` followed by `bun run bench:compare` produces them in the
+same form, and records the engine, CPU, and clock each column was taken on.
 
 ```bash
 bun install
@@ -126,7 +139,8 @@ bun run hooks      # lefthook pre-commit and pre-push gates
 bun run build      # compile native/*.c to dist/wasm/*.wasm
 bun test           # 88 tests across 9 suites
 bun run typecheck
-bun run bench
+bun run bench      # this runtime
+bun run bench:all  # bun, node, deno, chrome, firefox — three passes each
 ```
 
 Run all four before opening a pull request; `bun run build` is not optional

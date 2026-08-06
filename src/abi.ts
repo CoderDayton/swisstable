@@ -633,7 +633,8 @@ export function asString(value: unknown, name: string): string {
  * Translates a native status code into a thrown error, or returns silently.
  *
  * @param status - Value returned by a fallible export.
- * @param operation - Export name, used to build the error message.
+ * @param operation - The public method or parameter that hit the ceiling,
+ *   so the message names something the caller wrote rather than an export.
  * @param table - Class name of the binding that issued the call.
  * @throws {RangeError} If the module reported that its compiled capacity
  *   would be exceeded.

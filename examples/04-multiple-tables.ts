@@ -36,7 +36,7 @@ console.log("reverse has 2:", reverse.has(2)); // false — separate tables
 try {
   await SwissU32ToU32.create(2_000_000);
 } catch (error) {
-  console.log("oversized load:", (error as RangeError).message);
+  console.log("oversized create:", (error as RangeError).message);
 }
 
 // `reserve` grows an existing table in place, preserving its contents. It

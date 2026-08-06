@@ -121,6 +121,19 @@ describe.skipIf(!wasmBuilt)("SwissU32ToU32", () => {
     expect(() => table.set(inserted + 1, 1)).toThrow(RangeError);
   });
 
+  // A ceiling is reported against what the caller wrote, so the message can
+  // never name a WASM export the public API does not mention.
+  test("a capacity ceiling names the caller's own argument", async () => {
+    await expect(SwissU32ToU32.create(2_000_000)).rejects.toThrow(
+      "expectedEntries exceeded the compiled SwissU32ToU32 capacity",
+    );
+
+    const table = await loadTable(0);
+    expect(() => {
+      for (let key = 0; ; key++) table.set(key, key);
+    }).toThrow("set exceeded the compiled SwissU32ToU32 capacity");
+  });
+
   test("rejects keys and values outside the u32 range", async () => {
     const table = await loadTable();
 

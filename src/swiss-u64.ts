@@ -486,7 +486,7 @@ export class SwissU32ToU64 {
 
     assertStatus(
       wasm.init(asWasmI32(expectedEntries, "expectedEntries")),
-      "init",
+      "expectedEntries",
       "SwissU32ToU64",
     );
 
@@ -558,7 +558,7 @@ export class SwissU32ToU64 {
    * @throws {Error} If the module reports a failure.
    */
   shrinkToFit(): void {
-    assertStatus(this.wasm.shrink_to_fit(), "shrink_to_fit", "SwissU32ToU64");
+    assertStatus(this.wasm.shrink_to_fit(), "shrinkToFit", "SwissU32ToU64");
   }
 
   /**
@@ -725,7 +725,7 @@ export class SwissU32ToU64 {
           this.scratch.valsHiPtr,
           chunk,
         ),
-        "set_many",
+        "setMany",
         "SwissU32ToU64",
       );
     }
@@ -787,7 +787,7 @@ export class SwissU32ToU64 {
           this.scratch.foundPtr,
           chunk,
         ),
-        "get_many",
+        "getMany",
         "SwissU32ToU64",
       );
 

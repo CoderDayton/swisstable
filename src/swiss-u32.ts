@@ -306,7 +306,7 @@ export class SwissU32ToU32 {
 
     assertStatus(
       wasm.init(asWasmI32(expectedEntries, "expectedEntries")),
-      "init",
+      "expectedEntries",
       "SwissU32ToU32",
     );
 
@@ -368,7 +368,7 @@ export class SwissU32ToU32 {
    * @throws {Error} If the module reports a failure.
    */
   shrinkToFit(): void {
-    assertStatus(this.wasm.shrink_to_fit(), "shrink_to_fit", "SwissU32ToU32");
+    assertStatus(this.wasm.shrink_to_fit(), "shrinkToFit", "SwissU32ToU32");
   }
 
   /**

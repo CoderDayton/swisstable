@@ -17,12 +17,10 @@ the widest margins on mutation and bulk transfer. `Map` wins below ~2,000
 entries and on string keys, and dense integer keys belong in a typed array —
 see [when not to use this](#when-not-to-use-this).
 
-The original C++ version can be found [here], and this [CppCon talk] gives an
-overview of how the algorithm works.
+The original C++ version can be found [here].
 
 [SwissTable]: https://abseil.io/blog/20180927-swisstables
 [here]: https://github.com/abseil/abseil-cpp/blob/master/absl/container/internal/raw_hash_set.h
-[CppCon talk]: https://www.youtube.com/watch?v=ncHmEUmJZf4
 
 Docs: [API](docs/api.md) · [Design](docs/design.md) ·
 [Performance](docs/performance.md) · [Examples](examples/README.md) ·
@@ -31,22 +29,18 @@ Docs: [API](docs/api.md) · [Design](docs/design.md) ·
 ## Features
 
 - One byte of metadata per slot, compared sixteen at a time with `wasm_simd128`.
-- 10.3 bytes per entry at full occupancy — 20.6 counting the standby bank a
-  rehash needs — against a measured 37 B/entry for `Map` on V8 and 67 B on
-  JavaScriptCore.
-- Memory is reserved up front, 20 MiB per u32 instance and 28 MiB per u64, and
-  committed by page as the table grows: an empty table adds 1.7 MiB RSS and
-  each further instance about 50 KiB. Lower `SWISS_MAX_CAPACITY_LOG2` at build
-  time for many small tables — see [Footprint](docs/design.md#footprint).
-- Bulk `setMany`/`getMany`/`deleteMany` stage a whole batch and cross once —
-  7.1–8.8 ns/op against `Map`'s 47–78 for a 100,000-entry u64 fill, on every
-  runtime measured.
-- No allocator: fixed linear memory, linked `-nostdlib`, never calls
-  `memory.grow`, and no allocation on any hot path.
-- The modules are compiled into the package, so there is no `.wasm` file to
-  locate, copy, or serve, and no loader to write per runtime.
-- Ships compiled ESM with type declarations. Nothing is built on install and
-  there are no runtime dependencies.
+- 10.3 bytes per entry at full occupancy, 20.6 with the standby bank a rehash
+  needs, against a measured 37 for `Map` on V8 and 67 on JavaScriptCore.
+- An instance reserves 20 MiB (u32) or 28 MiB (u64) up front and commits it
+  by page: an empty table costs 1.7 MiB RSS, each further one about 50 KiB.
+  Lower `SWISS_MAX_CAPACITY_LOG2` for many small tables — see
+  [Footprint](docs/design.md#footprint).
+- Bulk `setMany`/`getMany`/`deleteMany` cross once per batch: 7.1–8.8 ns/op
+  against `Map`'s 47–78 on a 100,000-entry u64 fill.
+- No allocator — fixed linear memory, linked `-nostdlib`, never calls
+  `memory.grow`, nothing allocated on a hot path.
+- Ships compiled ESM with type declarations, and the modules are compiled in:
+  no `.wasm` to serve, no loader to write, no install step, no dependencies.
 - Runs in Node, Bun, Deno, bundlers, and browsers — anything with WebAssembly
   SIMD (Node 16.9+, Chrome 91+, Firefox 89+, Safari 16.4+), which
   `supportsSimd()` reports for the current runtime.

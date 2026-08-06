@@ -37,6 +37,9 @@
     "native"
   ],
   "sideEffects": false,
+  "engines": {
+    "node": ">=16.9.0"
+  },
   "scripts": {
     "build": "bun run build:wasm && bun run build:js",
     "build:wasm": "bun run scripts/build-wasm.ts",
@@ -46,9 +49,10 @@
     "bench:browser": "bun run benches/browser.ts",
     "bench:compare": "bun run benches/compare.ts",
     "test": "bun test",
+    "smoke": "node scripts/smoke-node.mjs",
     "typecheck": "tsc --noEmit",
     "hooks": "lefthook install",
-    "prepublishOnly": "bun run build && bun run typecheck && bun test"
+    "prepublishOnly": "bun run build && bun run typecheck && bun test && bun run smoke"
   },
   "devDependencies": {
     "@types/bun": "latest",

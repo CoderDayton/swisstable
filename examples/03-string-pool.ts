@@ -13,7 +13,7 @@
  *    the shape that actually wins: the string cost is paid once at load,
  *    and every later access is a numeric lookup.
  *
- * Run with `bun run examples/03-string-pool.ts` (after `bun run build`).
+ * Run with `bun run examples/03-string-pool.ts`.
  */
 
 import {

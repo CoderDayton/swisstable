@@ -13,6 +13,8 @@ export type { BulkU32Source } from "./abi.ts";
 
 export type { WasmSource } from "./wasm.ts";
 
+export { supportsSimd } from "./embedded.ts";
+
 export { SwissU32ToU32 } from "./swiss-u32.ts";
 
 export { SwissU32ToU64, spanToLanes, lanesToSpan } from "./swiss-u64.ts";
@@ -26,5 +28,6 @@ export type {
 export { InternedSwissMap, StringInterner } from "./string-interner.ts";
 export type {
   NumericKeyTable,
+  OwnedStringInterner,
   StringInternerOptions,
 } from "./string-interner.ts";

@@ -135,9 +135,13 @@ export interface Span {
 
 /** Result of {@link SwissU32ToU64.getMany}, as parallel arrays. */
 export interface BulkGetResult {
-  /** Low lanes, one per requested key. Undefined where `found` is 0. */
+  /**
+   * Low lanes, one per requested key. Written as 0 where `found` is 0, so a
+   * miss is indistinguishable from a stored 0 — read `found` to tell them
+   * apart.
+   */
   valsLo: Uint32Array;
-  /** High lanes, one per requested key. Undefined where `found` is 0. */
+  /** High lanes, one per requested key. Written as 0 where `found` is 0. */
   valsHi: Uint32Array;
   /** 1 where the key was present, 0 where it was absent. */
   found: Uint8Array;
@@ -741,7 +745,9 @@ export class SwissU32ToU64 {
    * @returns Parallel result arrays, each covering `keys.length` keys —
    *   `out` when given, else freshly allocated.
    * @throws {RangeError} If an element is not a 32-bit integer, or an `out`
-   *   array is shorter than `keys`.
+   *   array is shorter than `keys`. A rejected element writes nothing,
+   *   whatever its position, so a reused `out` never comes back holding a
+   *   mixture of this batch's results and the last one's.
    */
   getMany(keys: BulkU32Source, out?: BulkGetResult): BulkGetResult {
     const total = bulkLength(keys, "keys");
@@ -761,6 +767,12 @@ export class SwissU32ToU64 {
     }
 
     const { maxBatch } = this.scratch;
+
+    // Results land chunk by chunk, so a bad element in a later chunk would
+    // otherwise throw with the earlier chunks already copied into `out` —
+    // and a caller reusing `out` cannot tell those apart from the previous
+    // batch's results. See setMany.
+    if (total > maxBatch) keys = materializeU32(keys, total, "keys");
 
     for (let offset = 0; offset < total; offset += maxBatch) {
       const chunk = Math.min(maxBatch, total - offset);

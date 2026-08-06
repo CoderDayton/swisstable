@@ -65,7 +65,6 @@ before the first call. A capacity ceiling is the one failure that is not
 atomic — `setMany` keeps the chunks that preceded it, the same way the module
 reports a ceiling hit partway through a single chunk.
 
-
 **Keys and values are strictly unsigned 32-bit.** Negatives, fractions,
 `NaN`, and anything past `2³² − 1` throw `RangeError` rather than being
 coerced. The check is `(x >>> 0) === x`, which is exact on the u32 range, and
@@ -87,17 +86,28 @@ or 28 MiB (u64) of linear memory from instantiation whether it holds one
 entry or its maximum. The reservation is address space and is committed page
 by page as the table touches it, so a small table still resides small — but
 two tables mean two instances and twice the reservation. See
-[performance.md](performance.md#memory) for what an entry costs. Compile the
-module once with `WebAssembly.compile` and pass it to `load` repeatedly — see
+[performance.md](performance.md#memory) for what an entry costs. `create()`
+shares one compiled module across every table it makes; with `load`, compile
+once with `WebAssembly.compile` and pass the module in each time. Several
+instances alongside each other are shown in
 [`examples/04-multiple-tables.ts`](../examples/04-multiple-tables.ts). For
 many small tables, build a second pair of modules with a lower
 `SWISS_MAX_CAPACITY_LOG2`: at `2^16` a u32 instance costs 3.1 MiB instead of
 20, capped at 57,344 entries.
 
+**A table is released by dropping it; there is no `dispose`.** Its memory
+belongs to the `WebAssembly.Instance` behind it and comes back when the
+garbage collector runs, not when the last reference goes out of scope — so a
+table built per request holds its reservation until then, and a burst of them
+holds several at once. Reuse one long-lived table and `clear()` it between
+rounds: one pass over the control bytes, no new reservation. Linear memory
+never shrinks, so neither `clear()` nor `shrinkToFit()` returns pages to the
+host; they ready the table for the next round rather than shrink the process.
+
 **A stored `0` is never confused with an absent key.** Presence is reported
 separately from the value, so no sentinel is overloaded anywhere in the API.
 
-**Loading is async, everything else is synchronous.** `load` is the only
+**Loading is async, everything else is synchronous** — `load` is the only
 method that returns a promise.
 
 ## `SwissU32ToU32`
@@ -122,6 +132,10 @@ recompiling bytes on every call.
 `expectedEntries` behaves as it does for `load`.
 
 Throws `RangeError` if `expectedEntries` exceeds the compiled capacity.
+
+Requires WebAssembly SIMD (v128): Node 16.9+, Chrome 91+, Firefox 89+, or
+Safari 16.4+. Call `supportsSimd()` first to branch on an unknown runtime;
+without it, this rejects with an `Error` naming the requirement.
 
 Prefer this unless you need control over loading, in which case use `load`.
 
@@ -172,15 +186,13 @@ const reverse = await SwissU32ToU32.load(module, 1_000);
 
 | Member | Returns | Notes |
 | --- | --- | --- |
-| `size` | `number` | Live entries, excluding tombstones. |
-| `capacity` | `number` | Allocated slots, always a power of two. The table rehashes at 7/8 of this. |
+| `size` | `number` | Live entries, excluding tombstones. Read out of linear memory rather than called, so it is as cheap as a local — safe in a loop condition. |
+| `capacity` | `number` | Allocated slots, always a power of two. The table rehashes at 7/8 of this. Read the same way as `size`. |
 
 ### Methods
 
 | Method | Returns | Notes |
 | --- | --- | --- |
-| `size` | `number` | Read out of linear memory, not a call. As cheap as a local — safe in a loop condition. |
-| `capacity` | `number` | Same. Always a power of two; the table rehashes at 7/8 of it. |
 | `has(key)` | `boolean` | Prefer `get` when you also want the value — it costs the same single crossing. |
 | `get(key)` | `number \| undefined` | One boundary crossing; the value is read from a cached view over linear memory. |
 | `set(key, value)` | `this` | Inserts or overwrites. Overwriting works even at the capacity ceiling. |
@@ -206,8 +218,8 @@ compiled ceiling.
 so the cost tracks the slot space rather than what is in it — and capacity
 only ever rises on its own: `reserve` and the growth path raise it, `clear`
 retains it, and a `delete` leaves a tombstone rather than a freed slot. A
-table that peaked at 100k entries and now holds 8 takes 36 µs per walk;
-`shrinkToFit()` brings that to 0.5 µs. Call it after a bulk removal on a
+table that peaked at 100k entries and now holds 8 takes 41–72 µs per walk;
+`shrinkToFit()` brings that to 1.3–1.5 µs. Call it after a bulk removal on a
 long-lived table that is walked repeatedly.
 
 **Order is unspecified.** It is slot order, which depends on the hash and
@@ -264,9 +276,10 @@ The reassembled value is `(hi × 2³²) + lo`.
 
 ### Everything `SwissU32ToU32` has
 
-`create`, `load`, `size`, `capacity`, `has`, `delete`, `reserve`, and `clear`
-behave identically, `create` and `load` instantiating `swiss_u64.wasm`
-instead. Only the value-carrying methods differ:
+`create`, `load`, `size`, `capacity`, `has`, `delete`, `reserve`,
+`shrinkToFit`, and `clear` behave identically, with `create` and `load`
+instantiating `swiss_u64.wasm` instead. Only the value-carrying methods
+differ:
 
 | Method | Returns |
 | --- | --- |
@@ -283,9 +296,10 @@ an open iterator cannot disturb it.
 value argument, so it must box the two lanes into a `U64Lanes` per entry.
 **`forEachLanes(callback, thisArg?)`** is the same walk without that: it
 calls `callback(lo, hi, key, table)` and allocates nothing. When the callback
-discards the lanes the two run level, because escape analysis removes the
-object; when it keeps them it cannot, and `forEachLanes` measures ~1.6x
-faster. Prefer it on a hot path.
+discards the lanes the two run at the same speed, because escape analysis
+removes the object; when it keeps them it cannot, and `forEachLanes` is
+faster on every engine — by 10% on Bun, by 2x on Firefox. Prefer it on a hot
+path.
 
 ```ts
 table.forEachLanes((lo, hi, key) => {
@@ -329,8 +343,8 @@ table.setSpan(42, { offset: 1024, length: 256 });
 table.getSpan(42);   // { offset: 1024, length: 256 }
 ```
 
-`setMany` is **not atomic**: if a batch outgrows the table partway, the pairs
-before the failure are applied and `size` reflects them.
+`setMany` is **not atomic** on a capacity ceiling — see
+[Rules that apply everywhere](#rules-that-apply-everywhere).
 
 ## `StringInterner`
 
@@ -421,7 +435,7 @@ means. A fresh one is created when omitted.
 | Member | Returns | Notes |
 | --- | --- | --- |
 | `size` | `number` | Live entries in the table, not strings interned. |
-| `interner` | `StringInterner` | Readonly. |
+| `interner` | `OwnedStringInterner` | Readonly, and narrowed — see below. |
 | `table` | `NumericKeyTable<V>` | Readonly. |
 | `preloadVocabulary(vocabulary)` | `Uint32Array` | Interns up front so later calls never assign on the hot path. |
 | `set(key, value)` | `this` | |
@@ -460,6 +474,13 @@ If the underlying table rejects a write, an ID assigned for that call is
 released again, so a failed `set` does not permanently consume an ID for a
 key that was never stored. IDs from earlier successful calls are untouched.
 
+The `interner` property hands back the live interner so several maps can share
+it, but typed as `OwnedStringInterner`: `claim`, `release`, and `forgetLast`
+are not on it. Those run the ID lifecycle, which is the map's to run — calling
+`release` for a key the map still holds would let a later string take that ID
+and answer for the old key's value. Construct the interner yourself and keep
+your own reference if you need the full surface.
+
 `size` and `interner.size` answer different questions and diverge as soon as
 anything is deleted. `size` counts live entries; `interner.size` counts every
 distinct string ever seen, and never decreases, because IDs stay stable for
@@ -469,9 +490,14 @@ the lifetime of the interner. In a long-lived map with churning keys,
 ## Functions and types
 
 ```ts
+function supportsSimd(): boolean              // can this runtime run the modules
 function spanToLanes(span: Span): U64Lanes    // { lo: offset, hi: length }
 function lanesToSpan(lanes: U64Lanes): Span   // { offset: lo, length: hi }
 ```
+
+`supportsSimd()` validates a one-instruction v128 module, so it answers for
+the feature the tables actually need. It is synchronous and cheap enough to
+call on a code path that picks between this and a `Map` fallback.
 
 Both carry their fields through unchanged rather than masking with `>>> 0`.
 Masking would turn an out-of-range `offset` into a different, silently valid
@@ -479,12 +505,13 @@ u32 and defeat the validation `set` performs at the boundary.
 
 | Type | Shape |
 | --- | --- |
-| `WasmSource` | `ArrayBufferLike \| Uint8Array<ArrayBufferLike>` |
+| `WasmSource` | `ArrayBuffer \| Uint8Array<ArrayBufferLike>` |
 | `U64Lanes` | `{ lo: number; hi: number }` |
 | `Span` | `{ offset: number; length: number }` |
 | `BulkGetResult` | `{ valsLo: Uint32Array; valsHi: Uint32Array; found: Uint8Array }` |
 | `BulkDeleteResult` | `{ deleted: Uint8Array; removedCount: number }` |
 | `NumericKeyTable<V>` | `set`/`get`/`has`/`delete`, plus optional `forEach`/`entries` — the contract `InternedSwissMap` needs |
+| `OwnedStringInterner` | `StringInterner` without `claim`/`release`/`forgetLast` — what `InternedSwissMap.interner` returns |
 
 `SwissU32ToU32` satisfies `NumericKeyTable<number>` directly, optional members
 included. `SwissU32ToU64` takes its value as two lanes, so wrap its

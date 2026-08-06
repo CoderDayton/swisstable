@@ -13,16 +13,18 @@ The layout follows Google's SwissTable — see
 - [Load factor and tombstones](#load-factor-and-tombstones)
 - [Two banks instead of an allocator](#two-banks-instead-of-an-allocator)
 - [Memory layout](#memory-layout)
+- [Footprint](#footprint)
 - [Crossing the boundary](#crossing-the-boundary)
 - [Bulk staging](#bulk-staging)
 - [Build](#build)
+- [Embedding](#embedding)
 
 ## The core idea
 
 A SwissTable keeps two parallel arrays: one byte of metadata per slot, and
 the entries themselves.
 
-```
+```text
 control:  [ EMPTY | 0x2a | DELETED | 0x7f | EMPTY | ... ]   1 byte per slot
 entries:  [       | k,v  |         | k,v  |       | ... ]   8 or 12 bytes per slot
 ```
@@ -58,8 +60,7 @@ static inline uint32_t h2(uint32_t hash) { return hash & 0x7f; } // fingerprint
 **The `>> 7` is load-bearing.** Without it, the low bits selecting the group
 and the bits forming the fingerprint come from the same place, so every slot
 within a group shares part of its fingerprint and the SIMD match degenerates
-into a near-constant candidate set. This was a real bug in an early revision,
-found by reading cwisstable's design notes.
+into a near-constant candidate set.
 
 The finalizer matters too. Keys are frequently dense or strided — indices,
 IDs, pointers shifted right — which a bare identity hash would pile onto a
@@ -69,7 +70,7 @@ handful of groups.
 
 Probing walks whole groups, quadratically:
 
-```
+```text
 position₀ = h1(hash) & mask, rounded down to a group boundary
 positionₙ₊₁ = (positionₙ + 16n) & mask
 ```
@@ -97,7 +98,7 @@ would truncate the probe sequences of every key that hashed through it. The
 next rehash drops tombstones and reclaims the slots.
 
 The invariant that makes insertion terminate is subtler than the load factor
-itself. `growth_left` is decremented **only when an insert consumes an
+itself. `g_growth_left` is decremented **only when an insert consumes an
 `EMPTY` slot**, never when it reuses a tombstone. That guarantees at least
 `capacity/8` slots stay `EMPTY` at all times, which is what stops
 `find_insert_slot` — a loop with no other bound — from spinning forever.
@@ -143,7 +144,7 @@ Interleaving removes one from the critical path — worth ~3 ns per lookup at
 The banks are fixed static arrays and the module links with
 `--initial-memory == --max-memory`, so an instance reserves its whole linear
 memory — 20 MiB for u32, 28 MiB for u64 — the moment it is instantiated,
-holding zero entries or 917,504.
+whether it holds one entry or its maximum.
 
 Both figures are derived from `MAX_CAPACITY`, not written down beside it:
 `scripts/build-wasm.ts` computes them from bytes-per-slot times the slot
@@ -201,7 +202,7 @@ field. Measured through the real binding:
 | `wasm.size()` (export call) | 0.945 ns |
 | hoisted local (the floor) | 0.188 ns |
 
-So the property now costs what a local costs. This is not a cached count:
+So the property costs what a local costs. This is not a cached count:
 the view is over the module's own counter, at the address the module
 reported, so there is no second copy and nothing to invalidate. The `size()`
 and `capacity()` exports remain — they are the definition these addresses
@@ -230,10 +231,9 @@ uint32_t bulk_vals_hi_ptr(void);
 uint32_t bulk_flags_ptr(void);
 ```
 
-Ownership direction is the whole point. An earlier revision picked the
-staging offsets on the JavaScript side, and they silently aliased the table
-banks — the buffers sat *inside* live entry storage. Letting the linker place
-them and exporting the addresses makes that class of bug unrepresentable.
+Ownership direction is the whole point: the linker places the buffers and the
+module exports their addresses, so JavaScript never picks an offset that
+could alias the table banks.
 
 `set_many` reserves once for the whole batch rather than once per key, which
 is the primary amortization over N individual `set` calls. The bound is
@@ -244,24 +244,29 @@ over-reserve, never under-reserve.
 
 `scripts/build-wasm.ts` drives clang directly:
 
-```
+```text
 --target=wasm32 -O3 -msimd128 -nostdlib
--Wl,--no-entry -Wl,--export-memory
+-Wl,--no-entry -Wl,--export-memory -Wl,--strip-all
 -Wl,--initial-memory=N -Wl,--max-memory=N
 -Wl,--export=<symbol>   (one per exported function)
 ```
 
+`--strip-all` drops the name, producers, and target-features sections — a
+tenth of the output, and the only place the compiler's version string would
+appear in a committed payload. CI pins clang to one major version, so
+`src/generated` tracks `native/*.c` and nothing else.
+
 Initial and maximum memory are equal, which is what makes the cached views
-safe. The u32 module reserves 20 MiB, the u64 module 28 MiB — 2 MiB of
-control bytes plus 24 MiB of 12-byte entry records, plus the staging buffers
-and the linker-placed stack. Both are computed from `MAX_CAPACITY_LOG2` in
-the build script rather than hardcoded, so the two cannot drift apart.
+safe. The reservation covers both banks — one control byte and one entry
+record per slot — plus the staging buffers and the linker-placed stack, and
+is computed from `MAX_CAPACITY_LOG2` rather than hardcoded, so the module and
+the build script cannot drift apart. [Footprint](#footprint) has the totals.
 
 Exports are declared per function with
 `__attribute__((export_name("...")))`, and `scripts/build-wasm.ts` passes a
-`--export=` for each one. Note that this list is **not** a build-time
-guarantee: renaming an export in the C source still links cleanly, because
-`wasm-ld` does not treat a missing `--export=` symbol as an error. The check
+`--export=` for each one. This list is **not** a build-time guarantee:
+renaming an export in the C source still links cleanly, because `wasm-ld`
+does not treat a missing `--export=` symbol as an error. The check
 that actually catches it is in the bindings — `load()` verifies every
 expected symbol is present on the instance and throws `TypeError` otherwise,
 and `create()` routes through `load()` for the same reason.
@@ -280,13 +285,17 @@ in `src/generated/<name>.ts`. `create()` decodes the latter, which is why it
 needs no loader and behaves the same on every runtime — no `fs`, no `fetch`,
 no bundler asset handling.
 
-base64 costs 33% over the raw bytes, about 1.3 KiB across both modules.
+The stripped modules are 4.4 KiB and 5.7 KiB, and base64 costs 33% over the
+raw bytes — about 3.4 KiB across both.
 Decoding runs once per process and takes a few microseconds against a
 compile that is orders of magnitude more, so the payload size is the only
 real cost and it is small.
 
 The compiled `WebAssembly.Module` is cached per module for the lifetime of
 the process, so only the first `create()` pays validation and codegen.
-Rejections are cached too: the way compilation fails here is a runtime that
-cannot compile these modules at all, usually missing SIMD, and that does not
-change on a retry.
+Rejections are cached too. Compilation fails here when the runtime cannot run
+these modules at all — it lacks SIMD — and that does not change on a retry.
+The loader distinguishes the two causes by validating a one-instruction v128
+module: if that fails, the error names the missing feature; if it passes, the
+engine's own error propagates unchanged. `supportsSimd()` exposes the same
+check for callers that want to branch before constructing a table.

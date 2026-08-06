@@ -1,6 +1,19 @@
 import { describe, expect, test } from "bun:test";
 
+import { supportsSimd } from "../src/embedded.ts";
 import { SwissU32ToU32, SwissU32ToU64 } from "../src/index.ts";
+
+// The probe is what decides whether a compile failure is reported as a
+// missing runtime feature or passed through as it arrived. A probe that
+// disagreed with the modules would relabel every genuine failure -- a
+// truncated payload, a bad build -- as "this runtime lacks SIMD".
+describe("SIMD detection", () => {
+  test("agrees with the modules on a runtime that can compile them", async () => {
+    await SwissU32ToU32.create(16);
+
+    expect(supportsSimd()).toBe(true);
+  });
+});
 
 // Unlike the load()-based suites, these need no compiled .wasm on disk:
 // the module bytes are generated into src/generated and committed.

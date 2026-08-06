@@ -173,6 +173,34 @@ describe("InternedSwissMap with a recycling interner", () => {
     expect(map.interner.size).toBe(2);
   });
 
+  // The ID lifecycle is the map's to run: an ID released behind its back
+  // strands the table entry that ID named. The guard is the declared type,
+  // so `tsc --noEmit` is what proves this one -- each @ts-expect-error below
+  // fails the build if the method becomes reachable through the map again.
+  // The map hands back the interner itself rather than a wrapper, so the
+  // methods are still there at runtime, and this records that boundary.
+  test("does not expose the ID lifecycle through the map", async () => {
+    const map = new InternedSwissMap(
+      await SwissU32ToU32.create(16),
+      new StringInterner({ recycleIds: true }),
+    );
+
+    map.set("x", 1);
+
+    // @ts-expect-error release would strand the table entry it named
+    const release = map.interner.release;
+    // @ts-expect-error forgetLast would strand the table entry it named
+    const forgetLast = map.interner.forgetLast;
+    // @ts-expect-error claim is the constructor's to call
+    const claim = map.interner.claim;
+
+    expect([release, forgetLast, claim].map((m) => typeof m)).toEqual([
+      "function",
+      "function",
+      "function",
+    ]);
+  });
+
   test("a rotating key set leaves the interner bounded", async () => {
     const map = new InternedSwissMap(
       await SwissU32ToU32.create(WINDOW * 2),

@@ -2,10 +2,10 @@
 
 **On sparse `u32` keys at 100,000 entries these tables beat `Map` on every
 runtime measured — by 1.4x to 12x, with the widest margins on mutation and
-bulk transfer rather than on lookup. The entry count where they start winning
-depends on the engine: from ~2,000 entries on V8 to ~10,000 on
-JavaScriptCore. For string keys `Map` wins everywhere, and for dense keys a
-typed array beats both.**
+bulk transfer rather than on lookup. Below ~2,000 entries `Map` wins nearly
+everywhere; by 8,000 the tables are ahead on every engine except
+JavaScriptCore, which crosses over near 10,000. For string keys `Map` wins
+everywhere, and for dense keys a typed array beats both.**
 
 Four things explain the whole picture:
 
@@ -25,11 +25,11 @@ Four things explain the whole picture:
 
 | runtime | engine | collector on demand | clock resolution |
 | --- | --- | --- | --- |
-| Bun 1.3.14 | JavaScriptCore | yes | 0.03 us |
-| Node 24.15.0 | V8 | yes | 0.06 us |
-| Deno 2.9.4 | V8 | yes | 0.15 us |
-| Chrome 151 | V8 | yes | 5 us |
-| Firefox 152 | SpiderMonkey | no | 20 us |
+| Bun 1.3.14 | JavaScriptCore | yes | 0.03 µs |
+| Node 24.15.0 | V8 | yes | 0.06 µs |
+| Deno 2.9.4 | V8 | yes | 0.15 µs |
+| Chrome 151 | V8 | yes | 5 µs |
+| Firefox 152 | SpiderMonkey | no | 20 µs |
 
 13th Gen Intel Core i9-13900K, Linux x64. 100,000 entries, median of 21
 rounds, median of 3 passes, one isolate per contender. Treat the ratios
@@ -193,7 +193,7 @@ the engine had already committed. Measured that way Deno reports its `Map` at
 
 A single-key operation costs
 
-```
+```text
 T = c + g + r + a * mu(N)
 ```
 
@@ -307,8 +307,8 @@ rather than padding it.
 
 | operation | Bun | Node | Deno |
 | --- | --- | --- | --- |
-| `clear()` | 4.3 us | 3.1 us | 3.4 us |
-| `shrinkToFit()` after emptying | 164 us | 67 us | 71 us |
+| `clear()` | 4.3 µs | 3.1 µs | 3.4 µs |
+| `shrinkToFit()` after emptying | 164 µs | 67 µs | 71 µs |
 | `reserve()` forcing one rehash | 1.54 ms | 1.48 ms | 1.44 ms |
 
 `clear()` is a memset of the control bytes. The other two rehash, and a
@@ -318,7 +318,7 @@ for passing `expectedEntries` up front.
 Capacity only ever rises on its own, and a scan visits every slot, so a table
 that peaked large and was then emptied keeps paying peak walk cost until
 `shrinkToFit()` hands the slots back: walking the 8 entries left from a peak
-of 100,000 costs 41–72 us before the call and 1.3–1.5 us after it.
+of 100,000 costs 41–72 µs before the call and 1.3–1.5 µs after it.
 
 ## Iteration is the one place the engine changes the answer
 

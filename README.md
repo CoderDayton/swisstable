@@ -11,13 +11,11 @@ freestanding `wasm32`, with thin TypeScript bindings. Keys are `u32`.
 The table lives entirely inside WebAssembly linear memory: keys, values,
 control bytes, and probing never cross the JavaScript boundary, so a lookup
 costs one WASM call and a bulk operation costs one call per chunk regardless
-of batch size. At 100k entries that makes it 1.4–12x faster than `Map` on
-sparse integer keys — on Bun, Node, Deno, Chrome, and Firefox alike — and the
-margin is widest on mutation and bulk transfer rather than on lookup. The
-entry count where it starts winning depends on the engine, from ~2,000 on V8
-to ~10,000 on JavaScriptCore. With string keys `Map` wins, and for dense keys
-a typed array beats both — see
-[when not to use this](#when-not-to-use-this).
+of batch size. At 100,000 entries that makes it 1.4–12x faster than `Map` on
+sparse integer keys — on Bun, Node, Deno, Chrome, and Firefox alike — with
+the widest margins on mutation and bulk transfer. `Map` wins below ~2,000
+entries and on string keys, and dense integer keys belong in a typed array —
+see [when not to use this](#when-not-to-use-this).
 
 The original C++ version can be found [here], and this [CppCon talk] gives an
 overview of how the algorithm works.
@@ -33,11 +31,15 @@ Docs: [API](docs/api.md) · [Design](docs/design.md) ·
 ## Features
 
 - One byte of metadata per slot, compared sixteen at a time with `wasm_simd128`.
-- Lower memory usage: 10.3 bytes per entry in the live bank — 20.6 counting
-  the standby bank a rehash needs — against a measured 37 B/entry for `Map`
-  on V8 and 67 B on JavaScriptCore.
+- 10.3 bytes per entry at full occupancy — 20.6 counting the standby bank a
+  rehash needs — against a measured 37 B/entry for `Map` on V8 and 67 B on
+  JavaScriptCore.
+- Memory is reserved up front, 20 MiB per u32 instance and 28 MiB per u64, and
+  committed by page as the table grows: an empty table adds 1.7 MiB RSS and
+  each further instance about 50 KiB. Lower `SWISS_MAX_CAPACITY_LOG2` at build
+  time for many small tables — see [Footprint](docs/design.md#footprint).
 - Bulk `setMany`/`getMany`/`deleteMany` stage a whole batch and cross once —
-  7.1–8.8 ns/op against `Map`'s 48–78 for a 100k-entry u64 fill, on every
+  7.1–8.8 ns/op against `Map`'s 47–78 for a 100,000-entry u64 fill, on every
   runtime measured.
 - No allocator: fixed linear memory, linked `-nostdlib`, never calls
   `memory.grow`, and no allocation on any hot path.
@@ -46,7 +48,8 @@ Docs: [API](docs/api.md) · [Design](docs/design.md) ·
 - Ships compiled ESM with type declarations. Nothing is built on install and
   there are no runtime dependencies.
 - Runs in Node, Bun, Deno, bundlers, and browsers — anything with WebAssembly
-  SIMD (Node 16+, Chrome 91+, Firefox 89+, Safari 16.4+).
+  SIMD (Node 16.9+, Chrome 91+, Firefox 89+, Safari 16.4+), which
+  `supportsSimd()` reports for the current runtime.
 
 ## Usage
 
@@ -101,7 +104,7 @@ Both limits are structural rather than tuning problems;
 
 ## Benchmarks
 
-Speedup against `Map` at 100k sparse `u32` keys — above 1.00x the table is
+Speedup against `Map` at 100,000 sparse `u32` keys — above 1.00x the table is
 faster. Median of 21 rounds and of 3 passes, each contender in an isolate of
 its own, probed in a shuffled order. i9-13900K on x64 Linux.
 
@@ -117,9 +120,8 @@ its own, probed in a shuffled order. i9-13900K on x64 Linux.
 | u64 bulk fill (`setMany`) | 6.4x | 11x | 8.3x | 5.4x | 9.3x |
 | u64 bulk lookup (`getMany`) | 1.72x | 4.2x | 3.8x | 3.4x | 2.5x |
 
-The table itself costs about the same on every engine — a sparse lookup hit
-is 7.0–11.0 ns across all five. The columns differ because `Map` does: 11.0
-ns on JavaScriptCore against 25–26 ns on V8.
+The table costs about the same on every engine. The columns differ because
+`Map` does.
 
 Reproduce with `bun run build && bun run bench`, or `bun run bench:all` for
 every runtime installed. Absolute figures, the cost model, the crossover by
@@ -137,7 +139,7 @@ same form, and records the engine, CPU, and clock each column was taken on.
 bun install
 bun run hooks      # lefthook pre-commit and pre-push gates
 bun run build      # compile native/*.c to dist/wasm/*.wasm
-bun test           # 88 tests across 9 suites
+bun test           # 167 tests across 14 suites
 bun run typecheck
 bun run bench      # this runtime
 bun run bench:all  # bun, node, deno, chrome, firefox — three passes each

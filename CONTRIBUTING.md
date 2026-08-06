@@ -22,7 +22,9 @@ Requirements:
 
 - [Bun](https://bun.com) 1.3+
 - TypeScript 7.0+ (a devDependency; `bun run typecheck` uses it)
-- clang with the `wasm32` target, and `wasm-ld` (LLVM lld) on `PATH`
+- clang with the `wasm32` target, and `wasm-ld` (LLVM lld) on `PATH`. CI pins
+  clang 21, since codegen differs between major versions and `src/generated`
+  is committed — build with a different one and expect those files to change
 
 Set `CLANG` to select a specific compiler:
 
@@ -44,15 +46,15 @@ never hand-edit, and stage the rebuilt files with any C change.
 
 ## Layout
 
-```
+```text
 native/         C sources for the wasm32 modules
-scripts/        build tooling (build-wasm.ts)
-benches/        throughput benchmarks (bench.ts, one runtime per column)
+scripts/        build tooling (build-wasm.ts) and the Node smoke test
+benches/        throughput benchmarks, one runtime per column
 src/            TypeScript bindings and public entry point
 src/generated/  base64 module payloads (generated, committed)
 examples/       runnable examples, start at 01-basic.ts
 test/           bun test suites
-docs/           api.md, design.md, performance.md
+docs/           api.md, design.md, performance.md, and plans/
 dist/wasm/      build output (generated, not committed)
 ```
 
@@ -63,7 +65,7 @@ bun run build      # both steps below
 bun run build:wasm # native/*.c -> dist/wasm/*.wasm + src/generated/*.ts
 bun run build:js   # src/*.ts   -> dist/js/*.js + .d.ts
 
-bun test           # 88 tests across 9 suites
+bun test           # 167 tests across 14 suites
 bun run typecheck  # tsc --noEmit
 bun run bench      # throughput against Map, Object, Int32Array (this runtime)
 bun run bench:all  # the same suite under bun, node, deno, chrome, firefox
@@ -96,7 +98,7 @@ bearing and not obvious from the code:
 
 - **`h1` must discard the bits `h2` uses.** Without the `>> 7`, group index
   and fingerprint come from the same hash bits and the SIMD match degenerates.
-- **`growth_left` may only be decremented when an insert consumes an `EMPTY`
+- **`g_growth_left` may only be decremented when an insert consumes an `EMPTY`
   slot**, never a tombstone. That is the sole guarantee that
   `find_insert_slot` terminates.
 - **Probe positions must stay group-aligned and below capacity.** The 16-byte
@@ -153,8 +155,15 @@ full sweep.
 
 ## Publishing
 
-`prepublishOnly` runs the full gate — build, typecheck, tests — so
-`npm publish` cannot ship a broken or stale `dist/`.
+`prepublishOnly` runs the full gate — build, typecheck, tests, and
+`bun run smoke` — so `npm publish` cannot ship a broken or stale `dist/`.
+`scripts/smoke-node.mjs` is plain ESM with no build step: it exercises the
+compiled package under Node, which is the runtime the published output has to
+satisfy.
+
+The release workflow rebuilds `src/generated` from `native/*.c` and fails if
+the result differs from the tag, so the published wasm is the wasm the tag
+committed.
 
 Before releasing, verify the package from a consumer's point of view rather
 than from inside the repo:
@@ -185,6 +194,8 @@ worth keeping around, already in the suite:
 - overwriting an existing key on a table at its capacity ceiling
 - batches larger than `bulk_capacity`, which exercise chunking
 - the staging buffers not overlapping the table banks
+- bulk validation being all-or-nothing across chunk boundaries, so a rejected
+  batch leaves the caller's output buffer untouched
 
 ## Style
 

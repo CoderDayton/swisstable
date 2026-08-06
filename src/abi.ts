@@ -474,7 +474,8 @@ function bigintToU32(value: bigint, name: string, index: number): number {
  * @param count - Number of elements to copy.
  * @param name - Parameter name, for messages.
  * @throws {TypeError} If `source` is not a supported sequence.
- * @throws {RangeError} If an element is not a 32-bit integer.
+ * @throws {RangeError} If `source` holds fewer than `from + count` elements,
+ *   or an element is not a 32-bit integer.
  * @internal
  */
 export function stageU32(
@@ -484,6 +485,17 @@ export function stageU32(
   count: number,
   name: string,
 ): void {
+  // The integer-view path copies without inspecting anything, so a source
+  // too short for the requested range would leave `dest` holding whatever
+  // the previous batch staged there. Checked once for every path, ahead of
+  // the copy, so the range is a precondition of the function rather than of
+  // how its callers happen to compute `count`.
+  if (from + count > source.length) {
+    throw new RangeError(
+      `${name} has ${source.length} elements, but ${from + count} were requested`,
+    );
+  }
+
   if (isIntegerView(source)) {
     // Nothing in an integer view can fail, so this is a single bulk copy.
     dest.set(source.subarray(from, from + count));
@@ -547,7 +559,8 @@ export function stageU32(
  * @param name - Parameter name, for messages.
  * @returns `source` itself, or its elements converted to a Uint32Array.
  * @throws {TypeError} If `source` is not a supported sequence.
- * @throws {RangeError} If an element is not a 32-bit integer.
+ * @throws {RangeError} If `source` holds fewer than `count` elements, or an
+ *   element is not a 32-bit integer.
  * @internal
  */
 export function materializeU32(
@@ -555,7 +568,14 @@ export function materializeU32(
   count: number,
   name: string,
 ): BulkU32Source {
-  if (isIntegerView(source)) return source;
+  if (isIntegerView(source)) {
+    if (count > source.length) {
+      throw new RangeError(
+        `${name} has ${source.length} elements, but ${count} were requested`,
+      );
+    }
+    return source;
+  }
 
   const copy = new Uint32Array(count);
   stageU32(source, copy, 0, count, name);

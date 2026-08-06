@@ -359,6 +359,23 @@ function encodeParts(parts: readonly string[]): string {
 }
 
 /**
+ * The interner surface {@link InternedSwissMap} hands out.
+ *
+ * Everything a caller needs to work in IDs — interning a vocabulary once and
+ * using the numeric table directly afterwards is the point of the facade —
+ * minus the three calls that move an ID between the assigned and free pools.
+ * Those decide which table entry an ID names, so the map runs them itself,
+ * in step with the entry they belong to.
+ *
+ * Structural, so a {@link StringInterner} satisfies it without conversion:
+ * the map hands back the interner itself, not a wrapper.
+ */
+export type OwnedStringInterner = Omit<
+  StringInterner,
+  "claim" | "release" | "forgetLast"
+>;
+
+/**
  * A string-keyed facade over a u32-keyed numeric table.
  *
  * Strings are interned in JavaScript and the resulting IDs are what reach
@@ -377,11 +394,26 @@ function encodeParts(parts: readonly string[]): string {
  * ```
  */
 export class InternedSwissMap<V> {
-  /** The interner assigning IDs to keys. Shareable across several maps. */
-  readonly interner: StringInterner;
+  /** The interner assigning IDs to keys, at its full surface. */
+  private readonly ids: StringInterner;
 
   /** The numeric table holding the values. */
   readonly table: NumericKeyTable<V>;
+
+  /**
+   * The interner assigning IDs to keys. Shareable across several maps.
+   *
+   * Narrowed to the operations that cannot desync the map: the ID lifecycle
+   * is the map's to run. A key's ID is what the table stores it under, so
+   * releasing or forgetting one behind the map's back strands the table
+   * entry it named — either leaked, or silently overwritten when the ID is
+   * handed out again, or reported as a key the interner cannot resolve on
+   * the next walk. Use {@link InternedSwissMap.delete}, which retires the
+   * ID and the entry together.
+   */
+  get interner(): OwnedStringInterner {
+    return this.ids;
+  }
 
   /**
    * @param table - Numeric table to store values in.
@@ -413,7 +445,7 @@ export class InternedSwissMap<V> {
     if (interner.recyclesIds) interner.claim();
 
     this.table = table;
-    this.interner = interner;
+    this.ids = interner;
   }
 
   /**
@@ -437,7 +469,7 @@ export class InternedSwissMap<V> {
    * @returns Their IDs, positionally matching `vocabulary`.
    */
   preloadVocabulary(vocabulary: Iterable<string>): Uint32Array {
-    return this.interner.internAll(vocabulary);
+    return this.ids.internAll(vocabulary);
   }
 
   /**
@@ -453,18 +485,18 @@ export class InternedSwissMap<V> {
    * @throws Whatever the underlying table throws, unchanged.
    */
   set(key: string, value: V): this {
-    return this.store(this.interner.lookup(key), () => this.interner.intern(key), value);
+    return this.store(this.ids.lookup(key), () => this.ids.intern(key), value);
   }
 
   /** Returns the value stored for `key`, or `undefined` if absent. */
   get(key: string): V | undefined {
-    const id = this.interner.lookup(key);
+    const id = this.ids.lookup(key);
     return id === undefined ? undefined : this.table.get(id);
   }
 
   /** Reports whether `key` is present. */
   has(key: string): boolean {
-    const id = this.interner.lookup(key);
+    const id = this.ids.lookup(key);
     return id !== undefined && this.table.has(id);
   }
 
@@ -478,7 +510,7 @@ export class InternedSwissMap<V> {
    * @returns `true` if the key was present.
    */
   delete(key: string): boolean {
-    return this.remove(this.interner.lookup(key));
+    return this.remove(this.ids.lookup(key));
   }
 
   /**
@@ -491,8 +523,8 @@ export class InternedSwissMap<V> {
    */
   setParts(parts: readonly string[], value: V): this {
     return this.store(
-      this.interner.lookupParts(parts),
-      () => this.interner.internParts(parts),
+      this.ids.lookupParts(parts),
+      () => this.ids.internParts(parts),
       value,
     );
   }
@@ -515,7 +547,7 @@ export class InternedSwissMap<V> {
     try {
       this.table.set(id, value);
     } catch (error) {
-      if (known === undefined) this.interner.forgetLast(id);
+      if (known === undefined) this.ids.forgetLast(id);
       throw error;
     }
 
@@ -524,13 +556,13 @@ export class InternedSwissMap<V> {
 
   /** {@link InternedSwissMap.get} for a composite key. */
   getParts(parts: readonly string[]): V | undefined {
-    const id = this.interner.lookupParts(parts);
+    const id = this.ids.lookupParts(parts);
     return id === undefined ? undefined : this.table.get(id);
   }
 
   /** {@link InternedSwissMap.delete} for a composite key. */
   deleteParts(parts: readonly string[]): boolean {
-    return this.remove(this.interner.lookupParts(parts));
+    return this.remove(this.ids.lookupParts(parts));
   }
 
   /**
@@ -545,7 +577,7 @@ export class InternedSwissMap<V> {
    * @throws {Error} If `id` was never interned.
    */
   private keyOf(id: number): string {
-    const key = this.interner.resolve(id);
+    const key = this.ids.resolve(id);
 
     if (key === undefined) {
       throw new Error(
@@ -687,7 +719,7 @@ export class InternedSwissMap<V> {
   private remove(id: number | undefined): boolean {
     if (id === undefined || !this.table.delete(id)) return false;
 
-    if (this.interner.recyclesIds) this.interner.release(id);
+    if (this.ids.recyclesIds) this.ids.release(id);
 
     return true;
   }

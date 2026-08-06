@@ -7,6 +7,46 @@ import {
   SwissU32ToU64,
   spanToLanes,
 } from "../src/index.ts";
+import { materializeU32, stageU32 } from "../src/abi.ts";
+
+// The staging helpers are reached through the bulk methods, which derive the
+// element count from the source itself. These call them directly, so the
+// range they are asked for is a precondition of the helper rather than of
+// the caller that happens to compute it.
+describe("staging range", () => {
+  test("a source shorter than the requested range is rejected", () => {
+    const dest = new Uint32Array(4).fill(0xdead);
+
+    // An integer view stages with one bulk copy and inspects no element, so
+    // without the check the missing tail would keep the previous batch's
+    // bytes and reach WASM as keys.
+    expect(() => stageU32(new Uint32Array([1, 2]), dest, 0, 4, "keys")).toThrow(
+      RangeError,
+    );
+    expect(dest[2]).toBe(0xdead);
+
+    expect(() => stageU32(new Uint32Array([1, 2, 3]), dest, 2, 2, "keys")).toThrow(
+      "keys has 3 elements, but 4 were requested",
+    );
+
+    // The same range applies to sources that are converted element by
+    // element, including the BigInt path, whose native conversion error
+    // would otherwise name neither the parameter nor the length.
+    expect(() => stageU32([1, 2], dest, 0, 4, "keys")).toThrow(RangeError);
+    expect(() => stageU32(new BigInt64Array([1n]), dest, 0, 2, "keys")).toThrow(
+      "keys has 1 elements, but 2 were requested",
+    );
+  });
+
+  test("materializeU32 rejects a short integer view it would hand back", () => {
+    expect(() => materializeU32(new Uint32Array([1, 2]), 4, "keys")).toThrow(
+      "keys has 2 elements, but 4 were requested",
+    );
+
+    const source = new Uint32Array([1, 2, 3]);
+    expect(materializeU32(source, 3, "keys")).toBe(source);
+  });
+});
 
 describe("bulk argument types", () => {
   // Every accepted source has to agree on what a key means, whatever its
@@ -106,6 +146,32 @@ describe("bulk argument types", () => {
 
     expect(() => table.deleteMany(keys)).toThrow(RangeError);
     expect(table.size).toBe(1);
+  });
+
+  // getMany writes its results chunk by chunk, and the documented steady
+  // state hands the previous result back as `out`. A late rejection that
+  // left the early chunks written would hand back a silent mixture of this
+  // batch and the last one.
+  test("a rejected element past maxBatch writes nothing", async () => {
+    const table = await SwissU32ToU64.create(100);
+    const total = table.maxBatch + 1;
+
+    table.setMany([0], [111], [222]);
+
+    const out = table.getMany(new Uint32Array(total));
+    expect(out.valsLo[0]).toBe(111);
+
+    // A key that is absent, so a chunk allowed to land would zero the lanes
+    // and clear the flag — visibly different from what `out` already holds.
+    const keys: number[] = Array.from({ length: total }, () => 7);
+    keys[total - 1] = 1.5;
+
+    expect(() => table.getMany(keys, out)).toThrow(`keys[${total - 1}]`);
+
+    // Untouched, not overwritten by the chunks that would have run first.
+    expect(out.valsLo[0]).toBe(111);
+    expect(out.valsHi[0]).toBe(222);
+    expect(out.found[0]).toBe(1);
   });
 
   test("rejects unsupported sequences by name", async () => {

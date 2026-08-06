@@ -10,7 +10,7 @@
  * run several times slower than the steady-state figures in that document.
  * Use `bun run bench` for numbers worth comparing.
  *
- * Run with `bun run examples/02-bulk.ts` (after `bun run build`).
+ * Run with `bun run examples/02-bulk.ts`.
  */
 
 import { SwissU32ToU64 } from "../src/index.ts";

@@ -83,6 +83,13 @@ const COMMON_FLAGS = [
   // size pins the linker default so the budget is explicit.
   "-Wl,--stack-first",
   "-Wl,-z,stack-size=65536",
+  // The module is freestanding and has no debugging use case, so the name,
+  // producers, and target-features sections are dead weight — about a tenth
+  // of the output. Stripping also removes the compiler version string the
+  // producers section embeds, which would otherwise put the toolchain's
+  // identity in the committed payload and make src/generated change on a CI
+  // image bump with no source change behind it.
+  "-Wl,--strip-all",
 ];
 
 interface WasmTarget {

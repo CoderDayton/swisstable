@@ -28,6 +28,44 @@ export function decodeBase64(text: string): Uint8Array<ArrayBuffer> {
 }
 
 /**
+ * Smallest module that uses a SIMD instruction: one function returning the
+ * result of `i8x16.splat`.
+ *
+ * Validated rather than instantiated, so the probe costs a parse of thirty
+ * bytes and never allocates a memory. A runtime without SIMD rejects it at
+ * the opcode, which is the same reason it rejects the table modules — but
+ * this one says so unambiguously, where their failure is just a compile
+ * error somewhere in five kilobytes.
+ */
+const SIMD_PROBE = Uint8Array.of(
+  0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // magic and version
+  0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7b, // type: () -> v128
+  0x03, 0x02, 0x01, 0x00, // one function of that type
+  0x0a, 0x08, 0x01, 0x06, 0x00, 0x41, 0x00, 0xfd, 0x0f, 0x0b, // i8x16.splat
+);
+
+/**
+ * Runtimes this package supports, for the message a failure to compile
+ * raises. These are the versions that shipped WebAssembly SIMD.
+ */
+const SIMD_RUNTIMES = "Node 16.9+, Chrome 91+, Firefox 89+, or Safari 16.4+";
+
+/**
+ * Reports whether this runtime supports WebAssembly SIMD.
+ *
+ * Exported so a test can assert it agrees with the table modules: a probe
+ * that wrongly answered `false` would report every compile failure — a
+ * truncated payload, a corrupt build — as a missing runtime feature, which
+ * is worse than the bare error it replaces.
+ *
+ * @returns `true` if the runtime accepts a v128 instruction.
+ * @internal
+ */
+export function supportsSimd(): boolean {
+  return WebAssembly.validate(SIMD_PROBE);
+}
+
+/**
  * Returns a compiler for an embedded module that compiles at most once.
  *
  * Validation and code generation are the expensive part of creating a table,
@@ -37,6 +75,12 @@ export function decodeBase64(text: string): Uint8Array<ArrayBuffer> {
  * A rejection is cached along with the success. The only way compilation
  * fails here is a runtime that cannot compile these modules at all — no SIMD
  * support, most likely — and that does not become true on a retry.
+ *
+ * That case is diagnosed rather than passed through. A runtime without SIMD
+ * rejects the module with a bare `CompileError` naming an opcode offset,
+ * which tells a caller nothing about what their runtime is missing; the
+ * probe distinguishes it from genuinely corrupt bytes, which are reported
+ * as they arrive.
  *
  * @param base64 - The embedded module payload.
  * @returns A function returning the shared compiled module.
@@ -48,7 +92,17 @@ export function embeddedModule(
   let compiled: Promise<WebAssembly.Module> | undefined;
 
   return () => {
-    compiled ??= WebAssembly.compile(decodeBase64(base64));
+    compiled ??= WebAssembly.compile(decodeBase64(base64)).catch(
+      (cause: unknown) => {
+        if (supportsSimd()) throw cause;
+
+        throw new Error(
+          `swisstable requires WebAssembly SIMD (v128), which this runtime ` +
+            `does not support. It needs ${SIMD_RUNTIMES}.`,
+          { cause },
+        );
+      },
+    );
     return compiled;
   };
 }

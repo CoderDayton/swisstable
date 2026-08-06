@@ -11,6 +11,15 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # Kept in step with .github/workflows/release.yml: the two must build the
+  # wasm with the same compiler, or the release drift gate fails on a payload
+  # CI accepted.
+  CLANG_VERSION: "21"
+  # The oldest Node the package claims to run on. Checked against
+  # package.json's engines field by the job that uses it.
+  NODE_FLOOR: "16.9.0"
+
 jobs:
   build-and-test:
     name: Build and test
@@ -20,10 +29,19 @@ jobs:
       - uses: actions/checkout@v7
 
       # clang provides the wasm32 target; wasm-ld ships in the lld package.
+      #
+      # Pinned to a major version rather than tracking the runner's default:
+      # the payload committed in src/generated is compiler output, so an
+      # image bump that changed clang would fail the drift gate below on a
+      # pull request that touched nothing.
       - name: Install the wasm toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang lld
+          sudo apt-get install -y clang-${{ env.CLANG_VERSION }} lld-${{ env.CLANG_VERSION }}
+          sudo update-alternatives --install /usr/bin/clang clang \
+            /usr/bin/clang-${{ env.CLANG_VERSION }} 100
+          sudo update-alternatives --install /usr/bin/wasm-ld wasm-ld \
+            /usr/bin/wasm-ld-${{ env.CLANG_VERSION }} 100
 
       # Printed on its own so a missing or mismatched linker is obvious in
       # the log rather than surfacing as a confusing clang failure below.
@@ -63,6 +81,30 @@ jobs:
 
       - name: Build JavaScript and type declarations
         run: bun run build:js
+
+      # bun test runs the TypeScript sources under Bun, which says nothing
+      # about whether the emitted JavaScript loads under the runtime most
+      # consumers install it on. This imports dist/js the way a dependency
+      # would.
+      - name: Smoke-test the build under Node
+        run: node scripts/smoke-node.mjs
+
+      # The runner's Node is far newer than what package.json promises, so it
+      # cannot catch emitted syntax or a standard-library call that the oldest
+      # supported release lacks.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_FLOOR }}
+
+      - name: Smoke-test the build under the oldest supported Node
+        run: |
+          declared="$(node -p "require('./package.json').engines.node")"
+          if [ "$declared" != ">=${{ env.NODE_FLOOR }}" ]; then
+            echo "engines.node is $declared but this job runs ${{ env.NODE_FLOOR }}" >&2
+            echo "the floor the package promises is not the floor CI proves" >&2
+            exit 1
+          fi
+          node scripts/smoke-node.mjs
 
       # Covers tests, scripts, and examples, which the publish build in
       # build:js does not include.

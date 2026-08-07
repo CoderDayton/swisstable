@@ -1,8 +1,9 @@
 # Examples
 
-Four programs, in reading order. `01` establishes the API, `02` covers the
+Five programs, in reading order. `01` establishes the API, `02` covers the
 batching that produces the largest margin over `Map`, `03` covers string keys
-and their caveat, and `04` covers instance lifecycle and sizing.
+and their caveat, and `04` covers instance lifecycle and sizing. `05` puts
+them together in a whole application.
 
 Every example uses `create()`, which decodes the module compiled into the
 package, so none of them needs a build first:
@@ -17,8 +18,10 @@ bun run examples/01-basic.ts
 | [`02-bulk.ts`](02-bulk.ts) | `setMany`/`getMany`/`deleteMany`, automatic chunking, spans |
 | [`03-string-pool.ts`](03-string-pool.ts) | `InternedSwissMap`, composite keys, and interning once to stay numeric |
 | [`04-multiple-tables.ts`](04-multiple-tables.ts) | One compiled module shared across several instances, `reserve`, the capacity ceiling |
+| [`05-prefix-cache.ts`](05-prefix-cache.ts) | An LLM server's KV-cache prefix index, measured against `Map` on the same workload |
 
-The timings `02` prints are single-shot and include JIT warmup, so they run
-several times slower than steady state. Use `bun run bench` for numbers worth
-comparing, and see [`../docs/performance.md`](../docs/performance.md) for
-where these tables win and where they do not.
+The timings `02` and `05` print are single-shot and include JIT warmup, so
+they run several times slower than steady state. Use `bun run bench` for
+numbers worth comparing, and see
+[`../docs/performance.md`](../docs/performance.md) for where these tables win
+and where they do not.

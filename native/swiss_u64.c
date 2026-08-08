@@ -45,9 +45,7 @@
 #define BULK_CAPACITY 65536u
 
 /*
- * Slots one scan() call visits. Never more than BULK_CAPACITY, whose
- * buffers it borrows: the caller copies each chunk out before it can issue
- * another bulk call, so only one of the two ever holds live data at a time.
+ * Slots one scan() call visits.
  *
  * At MAX_CAPACITY a full walk is 16 crossings. A larger window costs only
  * staging memory; a smaller one costs crossings. See scan() in
@@ -87,17 +85,32 @@ static uint32_t g_bulk_vals_lo[BULK_CAPACITY];
 static uint32_t g_bulk_vals_hi[BULK_CAPACITY];
 static uint8_t  g_bulk_flags[BULK_CAPACITY];
 
+/*
+ * Staging buffers for scan(), separate from the bulk ones above.
+ *
+ * Sharing them would cost nothing in memory and would be correct for the
+ * shipped binding, which copies each window out before it issues anything
+ * else. It would still be wrong: an exported function is reachable by every
+ * holder of the instance, and a caller that staged a bulk batch, walked the
+ * table, then issued the batch would read the walk's entries back as its
+ * own arguments — wrong values, no trap, nothing in the data to show it.
+ * Separate arrays make that unrepresentable rather than merely documented.
+ */
+static uint32_t g_scan_keys[SCAN_WINDOW];
+static uint32_t g_scan_vals_lo[SCAN_WINDOW];
+static uint32_t g_scan_vals_hi[SCAN_WINDOW];
+
 /* Latches the payload has_get() reports. See g_last_value. */
 static void latch_value(const Entry *entry) {
   g_last_value[0] = entry->lo;
   g_last_value[1] = entry->hi;
 }
 
-/* Stages one live entry during scan(), through the bulk buffers. */
+/* Stages one live entry during scan(). */
 static void stage_entry(uint32_t index, const Entry *entry) {
-  g_bulk_keys[index] = entry->key;
-  g_bulk_vals_lo[index] = entry->lo;
-  g_bulk_vals_hi[index] = entry->hi;
+  g_scan_keys[index] = entry->key;
+  g_scan_vals_lo[index] = entry->lo;
+  g_scan_vals_hi[index] = entry->hi;
 }
 
 /*
@@ -315,3 +328,12 @@ uint32_t bulk_vals_hi_ptr(void) { return (uint32_t)(uintptr_t)g_bulk_vals_hi; }
 /* Doubles as the delete_many() output buffer; only one is live at a time. */
 __attribute__((export_name("bulk_flags_ptr")))
 uint32_t bulk_flags_ptr(void) { return (uint32_t)(uintptr_t)g_bulk_flags; }
+
+__attribute__((export_name("scan_keys_ptr")))
+uint32_t scan_keys_ptr(void) { return (uint32_t)(uintptr_t)g_scan_keys; }
+
+__attribute__((export_name("scan_vals_lo_ptr")))
+uint32_t scan_vals_lo_ptr(void) { return (uint32_t)(uintptr_t)g_scan_vals_lo; }
+
+__attribute__((export_name("scan_vals_hi_ptr")))
+uint32_t scan_vals_hi_ptr(void) { return (uint32_t)(uintptr_t)g_scan_vals_hi; }

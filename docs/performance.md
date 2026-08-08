@@ -173,7 +173,7 @@ is 3.6x less live, or 1.8x less counting the standby bank; against
 JavaScriptCore's 67.1 B, 6.5x and 3.3x.
 
 **An instance reserves its whole arena up front**: 20 MiB of linear memory
-for the u32 module, 28 MiB for the u64 one, whether it holds one entry or
+for the u32 module, 29 MiB for the u64 one, whether it holds one entry or
 917,504. That is address space, committed page by page as the table touches
 it, so what a process actually resides tracks the entries rather than the
 reservation — 9 MiB at 500,000 u32 entries on Node. The reservation still

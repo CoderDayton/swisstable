@@ -1,8 +1,11 @@
 import {
+  DISPOSED_COUNTER,
+  DISPOSED_STAGING,
   ScanIterator,
   asCallback,
   asWasmI32,
   assertStatus,
+  disposedExports,
   scanColumns,
 } from "./abi.ts";
 import type { ScanExports } from "./abi.ts";
@@ -184,8 +187,13 @@ const compileEmbedded = embeddedModule(SWISS_U32_WASM_BASE64);
  *   implements.
  */
 export class SwissU32ToU32 {
-  /** The instantiated module. */
-  private readonly wasm: SwissU32WasmExports;
+  /**
+   * The instantiated module.
+   *
+   * Not `readonly`: {@link SwissU32ToU32.dispose} swaps it, which is both how
+   * the instance is released and how a later call is caught.
+   */
+  private wasm: SwissU32WasmExports;
 
   /**
    * View over the module's latched-result slot.
@@ -194,16 +202,16 @@ export class SwissU32ToU32 {
    * crossing instead of two. The view is built once because the module's
    * memory is fixed and never grows, so the backing buffer is never detached.
    */
-  private readonly lastValue: Uint32Array;
+  private lastValue: Uint32Array;
 
   /** Slots one scan call visits, and the length of the staging views. */
   private readonly scanWindow: number;
 
   /** View over the module's staging key buffer, filled by `scan`. */
-  private readonly scanKeys: Uint32Array;
+  private scanKeys: Uint32Array;
 
   /** View over the module's staging value buffer, filled by `scan`. */
-  private readonly scanValues: Uint32Array;
+  private scanValues: Uint32Array;
 
   /**
    * Views over the module's live-entry and slot counters.
@@ -218,8 +226,17 @@ export class SwissU32ToU32 {
    * the addresses it reported, so there is nothing to invalidate and no way
    * for them to disagree with `size()` and `capacity()`.
    */
-  private readonly sizeView: Uint32Array;
-  private readonly capacityView: Uint32Array;
+  private sizeView: Uint32Array;
+  private capacityView: Uint32Array;
+
+  /**
+   * Alias for {@link SwissU32ToU32.dispose}, so a table works with `using`.
+   *
+   * Declared rather than defined here: `Symbol.dispose` postdates the oldest
+   * Node the package supports, so it is attached below only where the
+   * runtime has it.
+   */
+  declare [Symbol.dispose]: () => void;
 
   private constructor(wasm: SwissU32WasmExports) {
     this.wasm = wasm;
@@ -369,6 +386,34 @@ export class SwissU32ToU32 {
    */
   shrinkToFit(): void {
     assertStatus(this.wasm.shrink_to_fit(), "shrinkToFit", "SwissU32ToU32");
+  }
+
+  /**
+   * Releases the module instance backing this table.
+   *
+   * One table is one instance, and an instance reserves its whole capacity
+   * of linear memory up front — 20 MiB by default — which nothing can
+   * reclaim while the instance is reachable. Dropping the last reference to
+   * the table lets the collector take it eventually; this is how to make
+   * "eventually" now, which is what a process building a table per request
+   * or per document needs.
+   *
+   * Idempotent. Afterwards {@link SwissU32ToU32.size} and
+   * {@link SwissU32ToU32.capacity} read 0 and every other method throws,
+   * rather than reading through an instance that was handed back.
+   *
+   * An iterator opened before the call is not affected: it holds the exports
+   * and the staging views it started with, so it keeps walking the instance
+   * and keeps it alive until the walk ends. Finish or abandon a walk before
+   * disposing the table it is walking.
+   */
+  dispose(): void {
+    this.wasm = disposedExports(REQUIRED_U32_EXPORTS, "SwissU32ToU32");
+    this.lastValue = DISPOSED_COUNTER;
+    this.scanKeys = DISPOSED_STAGING;
+    this.scanValues = DISPOSED_STAGING;
+    this.sizeView = DISPOSED_COUNTER;
+    this.capacityView = DISPOSED_COUNTER;
   }
 
   /**
@@ -542,4 +587,13 @@ export class SwissU32ToU32 {
       }
     }
   }
+}
+
+/*
+ * `using` needs Symbol.dispose, which the oldest Node the package supports
+ * predates. Attaching it conditionally keeps the class loadable there while
+ * still giving newer runtimes the block-scoped form.
+ */
+if (typeof Symbol.dispose === "symbol") {
+  SwissU32ToU32.prototype[Symbol.dispose] = SwissU32ToU32.prototype.dispose;
 }

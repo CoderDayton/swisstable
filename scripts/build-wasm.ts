@@ -4,19 +4,34 @@
  * and emits each one a second time as a base64 TypeScript module so the
  * bindings can instantiate without the caller supplying bytes.
  *
- * Requires clang with the WebAssembly target and `wasm-ld` (LLVM lld) on
- * PATH. Override the compiler with the CLANG environment variable.
+ * The compiler is the pinned Zig toolchain, installed on demand by
+ * scripts/toolchain.ts. It carries its own clang, lld, and headers, so the
+ * output is identical on Linux, macOS, and Windows.
+ *
+ * Set SWISS_UBSAN=1 to build the checked variant instead: same sources with
+ * UndefinedBehaviorSanitizer in trapping mode, written to dist/wasm-ubsan
+ * and never embedded. `bun run check:ubsan` exercises it.
  */
 
 import { mkdir } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 
+import { zigExecutable } from "./toolchain.ts";
+
 const ROOT = resolve(import.meta.dir, "..");
 const NATIVE_DIR = join(ROOT, "native");
-const OUTPUT_DIR = join(ROOT, "dist", "wasm");
 const GENERATED_DIR = join(ROOT, "src", "generated");
 
-const CLANG = Bun.env.CLANG ?? "clang";
+/**
+ * Trapping UBSan needs no runtime library, so it links under -nostdlib and
+ * costs nothing but code size. It is a verification build, not a shipping
+ * one: a trap aborts the instance, which is a worse outcome in production
+ * than the arithmetic that would have provoked it.
+ */
+const UBSAN = Bun.env.SWISS_UBSAN === "1";
+
+const OUTPUT_DIR = join(ROOT, "dist", UBSAN ? "wasm-ubsan" : "wasm");
+
 const MIB = 1024 * 1024;
 
 /** WebAssembly linear memory is reserved in units of this. */
@@ -68,20 +83,37 @@ function maxCapacityLog2(): number {
 const MAX_CAPACITY_LOG2 = maxCapacityLog2();
 
 const COMMON_FLAGS = [
-  "--target=wasm32",
+  "--target=wasm32-freestanding",
   "-O3",
   "-flto",
   "-msimd128",
   "-mbulk-memory",
   "-nostdlib",
+  // The module defines its own memset, and clang lowers bulk stores to a
+  // memset call. Without this, the byte loop inside that definition is
+  // itself a memset-shaped loop, and only an LLVM heuristic that declines
+  // to transform loops in a function of that name keeps it from being
+  // rewritten into a call to itself. Naming the builtin removes the
+  // recursion risk from the optimiser's discretion; the one call site that
+  // wants the `memory.fill` instruction asks for it as __builtin_memset.
+  "-fno-builtin-memset",
+  // Zig turns UBSan on by default, and its handlers live in a runtime this
+  // module does not link, so the default build has to switch it off. The
+  // checked build instead keeps the instrumentation and lowers each report
+  // to an `unreachable` instruction, which needs no runtime at all.
+  ...(UBSAN
+    ? ["-fsanitize=undefined", "-fsanitize-trap=undefined"]
+    : ["-fno-sanitize=undefined"]),
   "-Wall",
   "-Wextra",
   "-Wl,--no-entry",
   "-Wl,--export-memory",
-  // Stack below all data: an overflow then traps as an out-of-bounds
-  // access instead of silently corrupting the table banks in .bss. The
-  // size pins the linker default so the budget is explicit.
-  "-Wl,--stack-first",
+  // Stack below all data, so an overflow traps as an out-of-bounds access
+  // instead of silently corrupting the table banks in .bss. `zig cc` passes
+  // --stack-first to wasm-ld itself for freestanding wasm and rejects it as
+  // a user linker argument, so it is not repeated here; the layout is
+  // asserted by test/memory-layout.test.ts rather than assumed. The size
+  // pins the linker default so the budget is explicit.
   "-Wl,-z,stack-size=65536",
   // The module is freestanding and has no debugging use case, so the name,
   // producers, and target-features sections are dead weight — about a tenth
@@ -148,8 +180,9 @@ const TARGETS: readonly WasmTarget[] = [
     source: "swiss_u64.c",
     // 2 banks x (1 control byte + a 12-byte Entry): 26 MiB at 2^20.
     bankBytesPerSlot: 2 * (1 + 12),
-    // ~0.81 MiB of bulk staging buffers, plus stack and section headroom.
-    overheadBytes: 2 * MIB,
+    // ~1.6 MiB of staging buffers — bulk and scan hold separate arrays —
+    // plus stack and section headroom.
+    overheadBytes: 3 * MIB,
     exports: [
       "init",
       "reserve",
@@ -170,6 +203,9 @@ const TARGETS: readonly WasmTarget[] = [
       "bulk_flags_ptr",
       "scan",
       "scan_window",
+      "scan_keys_ptr",
+      "scan_vals_lo_ptr",
+      "scan_vals_hi_ptr",
       "generation",
       "size",
       "capacity",
@@ -200,14 +236,15 @@ function linkFlags(target: WasmTarget, memory: number): string[] {
   ];
 }
 
-async function build(target: WasmTarget): Promise<void> {
+async function build(zig: string, target: WasmTarget): Promise<void> {
   const outputPath = join(OUTPUT_DIR, `${target.name}.wasm`);
   await mkdir(dirname(outputPath), { recursive: true });
 
   const memory = memoryBytes(target);
 
   const argv = [
-    CLANG,
+    zig,
+    "cc",
     ...COMMON_FLAGS,
     `-DMAX_CAPACITY_LOG2=${MAX_CAPACITY_LOG2}`,
     ...linkFlags(target, memory),
@@ -219,16 +256,19 @@ async function build(target: WasmTarget): Promise<void> {
   const result = Bun.spawnSync(argv, { stdout: "inherit", stderr: "inherit" });
 
   if (result.exitCode !== 0) {
-    throw new Error(`${target.source}: clang exited with ${result.exitCode}`);
+    throw new Error(`${target.source}: zig cc exited with ${result.exitCode}`);
   }
 
   const bytes = await Bun.file(outputPath).bytes();
-  await emitEmbedded(target, bytes);
+  // The checked build is a throwaway the tests instantiate directly. Writing
+  // it into src/generated would ship trapping code and, worse, make the
+  // committed payload depend on which variant was built last.
+  if (!UBSAN) await emitEmbedded(target, bytes);
 
   console.log(
     `built ${target.name}.wasm (${bytes.length} bytes, ` +
       `${(memory / MIB).toFixed(1)} MiB of linear memory, ` +
-      `max capacity 2^${MAX_CAPACITY_LOG2})`,
+      `max capacity 2^${MAX_CAPACITY_LOG2}${UBSAN ? ", ubsan" : ""})`,
   );
 }
 
@@ -251,7 +291,10 @@ async function emitEmbedded(
     "// Do not edit; rebuild with `bun run build:wasm`.",
     "",
     `/** ${target.name}.wasm, base64 encoded. */`,
-    `export const ${constant} =`,
+    // Annotated rather than inferred: without it the declaration emit
+    // widens to the literal type and repeats the whole payload in the
+    // .d.ts, which ships a second copy of every module for no one.
+    `export const ${constant}: string =`,
     `  "${Buffer.from(bytes).toString("base64")}";`,
     "",
   ].join("\n");
@@ -259,8 +302,10 @@ async function emitEmbedded(
   await Bun.write(join(GENERATED_DIR, `${target.name}.ts`), source);
 }
 
+const zig = await zigExecutable();
+
 await mkdir(GENERATED_DIR, { recursive: true });
 
 for (const target of TARGETS) {
-  await build(target);
+  await build(zig, target);
 }

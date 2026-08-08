@@ -29,6 +29,9 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 .env.production.local
 .env.local
 
+# pinned Zig toolchain, installed on demand by scripts/toolchain.ts
+.zig
+
 # caches
 .eslintcache
 .cache

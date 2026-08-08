@@ -16,42 +16,34 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
-env:
-  # Kept in step with .github/workflows/ci.yml: the two must build the wasm
-  # with the same compiler, or the drift gate below fails on a payload CI
-  # already accepted.
-  CLANG_VERSION: "21"
-
 jobs:
   release:
     name: Publish and release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
-      - uses: actions/checkout@v7
+      # Actions are pinned to a commit, not a tag. This job holds the npm
+      # token and the OIDC permission provenance is signed with, so a moved
+      # tag here would be a supply-chain compromise of the published package.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # clang provides the wasm32 target; wasm-ld ships in the lld package.
-      # Pinned so the published wasm is built by the same compiler CI checked
-      # the committed payload against.
-      - name: Install the wasm toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang-${{ env.CLANG_VERSION }} lld-${{ env.CLANG_VERSION }}
-          sudo update-alternatives --install /usr/bin/clang clang \
-            /usr/bin/clang-${{ env.CLANG_VERSION }} 100
-          sudo update-alternatives --install /usr/bin/wasm-ld wasm-ld \
-            /usr/bin/wasm-ld-${{ env.CLANG_VERSION }} 100
-
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: "1.3.14"
 
       # Only for `npm publish`. The registry-url is what writes the .npmrc
       # that picks up NODE_AUTH_TOKEN below.
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
+
+      # The version scripts/toolchain.ts pins, verified against its published
+      # SHA-256 before it is unpacked. Reproducing a tag's bytes depends on
+      # the exact compiler, which is why this is pinned rather than installed
+      # from the image; CI builds the committed payload with the same one.
+      - name: Install the pinned Zig toolchain
+        run: bun run toolchain
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
@@ -96,6 +88,12 @@ jobs:
       # to catch a build that Bun runs and Node cannot load.
       - name: Smoke-test the build under Node
         run: node scripts/smoke-node.mjs
+
+      # The browser has no Node compatibility layer behind it, so it is the
+      # only place a `node:` import reaching into src/ would surface. Chrome
+      # ships on the runner.
+      - name: Smoke-test the build in a browser
+        run: bun run smoke:browser
 
       # Produces the tarball attached to the release. It is packed from the
       # same tree publish uses, so the contents match, but npm publishes its

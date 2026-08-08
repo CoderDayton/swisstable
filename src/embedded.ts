@@ -83,18 +83,23 @@ export function supportsSimd(): boolean {
  * as they arrive.
  *
  * @param base64 - The embedded module payload.
+ * @param probeSimd - How to tell a runtime without SIMD from a bad payload.
+ *   Injectable because the diagnostic below is unreachable on any runtime
+ *   able to run the test suite, and an untested error path is one that has
+ *   never been seen to work.
  * @returns A function returning the shared compiled module.
  * @internal
  */
 export function embeddedModule(
   base64: string,
+  probeSimd: () => boolean = supportsSimd,
 ): () => Promise<WebAssembly.Module> {
   let compiled: Promise<WebAssembly.Module> | undefined;
 
   return () => {
     compiled ??= WebAssembly.compile(decodeBase64(base64)).catch(
       (cause: unknown) => {
-        if (supportsSimd()) throw cause;
+        if (probeSimd()) throw cause;
 
         throw new Error(
           `swisstable requires WebAssembly SIMD (v128), which this runtime ` +

@@ -22,15 +22,30 @@ Requirements:
 
 - [Bun](https://bun.com) 1.3+
 - TypeScript 7.0+ (a devDependency; `bun run typecheck` uses it)
-- clang with the `wasm32` target, and `wasm-ld` (LLVM lld) on `PATH`. CI pins
-  clang 21, since codegen differs between major versions and `src/generated`
-  is committed — build with a different one and expect those files to change
+- Nothing else. There is no C compiler to install.
 
-Set `CLANG` to select a specific compiler:
+`build:wasm` compiles with a pinned [Zig](https://ziglang.org) release, which
+ships clang, lld, and its headers in one archive. `scripts/toolchain.ts`
+downloads it into `.zig/` on first use, checks it against the SHA-256 that
+ziglang.org publishes, and refuses to continue on a mismatch. Install it ahead
+of time with `bun run toolchain`.
+
+A hermetic toolchain is what makes the committed `src/generated` workable:
+codegen differs between compiler builds, so a distro clang would produce a
+different payload on every machine and the drift gate would blame the C.
+Linux, macOS, and Windows all compile the same bytes, and CI proves it by
+building on all three and comparing hashes.
+
+Two escape hatches, both for a build that cannot use the pinned archive:
 
 ```bash
-CLANG=clang-21 bun run build
+ZIG=/path/to/zig bun run build:wasm            # air-gapped, or a local build
+SWISS_NO_FETCH=1 bun run build:wasm            # fail instead of downloading
 ```
+
+`ZIG` is version-checked, because a different release compiles different
+bytes and the failure would otherwise surface as an unexplained diff in
+`src/generated`. Set `SWISS_ALLOW_ZIG_MISMATCH=1` to build anyway.
 
 The `.wasm` modules are build output and are not checked in, so
 `bun run build` has to run before the tests or benchmarks mean anything.
@@ -40,7 +55,7 @@ so `bun test` still works on a fresh clone.
 `src/generated/*.ts` is the exception: `build:wasm` writes each module out a
 second time as base64, and those files **are** committed. They have to be,
 because `src` imports them — without them the package would not typecheck on
-a clone that has no clang. CI rebuilds and fails if the committed copy drifts
+a clone that has no toolchain. CI rebuilds and fails if the committed copy drifts
 from `native/*.c`, so treat them as build output that happens to be tracked:
 never hand-edit, and stage the rebuilt files with any C change.
 
@@ -48,7 +63,7 @@ never hand-edit, and stage the rebuilt files with any C change.
 
 ```text
 native/         C sources for the wasm32 modules
-scripts/        build tooling (build-wasm.ts) and the Node smoke test
+scripts/        build tooling (toolchain.ts, build-wasm.ts) and smoke tests
 benches/        throughput benchmarks, one runtime per column
 src/            TypeScript bindings and public entry point
 src/generated/  base64 module payloads (generated, committed)
@@ -61,12 +76,16 @@ dist/wasm/      build output (generated, not committed)
 ## The loop
 
 ```bash
+bun run toolchain  # install the pinned Zig into .zig/ (build:wasm does this)
 bun run build      # both steps below
 bun run build:wasm # native/*.c -> dist/wasm/*.wasm + src/generated/*.ts
 bun run build:js   # src/*.ts   -> dist/js/*.js + .d.ts
 
-bun test           # 167 tests across 14 suites
+bun test           # 201 tests across 20 suites
 bun run typecheck  # tsc --noEmit
+bun run check:ubsan  # rebuild with UBSan trapping and exercise every path
+bun run smoke      # the built package under plain Node
+bun run smoke:browser  # the built package in Chrome or Firefox
 bun run bench      # throughput against Map, Object, Int32Array (this runtime)
 bun run bench:all  # the same suite under bun, node, deno, chrome, firefox
 ```

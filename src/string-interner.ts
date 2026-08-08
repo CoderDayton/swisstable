@@ -53,6 +53,26 @@ export interface StringInternerOptions {
    * when IDs are held anywhere outside the one map that owns the interner.
    */
   recycleIds?: boolean;
+
+  /**
+   * Largest number of strings that may be interned at once.
+   *
+   * Unlimited by default. Without recycling an interner never forgets, so a
+   * caller that interns something per request — a correlation ID, a URL, a
+   * session token — grows without bound for as long as the process lives.
+   * That is the intended behaviour for a fixed vocabulary and a leak for a
+   * rotating one, and nothing in the types distinguishes them.
+   *
+   * Setting this makes the second case fail at a chosen point instead of
+   * degrading for days: interning a *new* string past the cap throws
+   * {@link RangeError}. Strings already interned keep resolving, and
+   * re-interning one of them never throws, so a cap only ever rejects
+   * growth.
+   *
+   * @throws {RangeError} At construction, if this is neither a positive
+   * integer nor `Infinity`.
+   */
+  maxSize?: number;
 }
 
 /**
@@ -68,6 +88,10 @@ export interface StringInternerOptions {
  * to the next new string instead, which bounds the ID space at the number of
  * strings live at once rather than the number ever seen — at the cost of
  * that stability. See {@link StringInterner.release}.
+ *
+ * An interner never forgets on its own. For a rotating key space, either
+ * recycle IDs and release them, or set {@link StringInternerOptions.maxSize}
+ * so unbounded growth fails at a chosen point rather than silently.
  *
  * Interning itself is a JavaScript `Map` lookup, so it is worth doing once
  * per string and reusing the ID; a table keyed by IDs is where the win is.
@@ -115,10 +139,33 @@ export class StringInterner {
   readonly recyclesIds: boolean;
 
   /**
+   * Largest number of strings interned at once, or `Infinity` when uncapped.
+   *
+   * Held as `Infinity` rather than `undefined` so {@link StringInterner.intern}
+   * tests one comparison on its assignment path whether or not a cap is set.
+   */
+  readonly maxSize: number;
+
+  /**
    * @param options - See {@link StringInternerOptions}.
+   * @throws {RangeError} If `maxSize` is neither a positive integer nor
+   * `Infinity`, which {@link StringInterner.maxSize} reports for an uncapped
+   * instance and so must round-trip back through here.
    */
   constructor(options: StringInternerOptions = {}) {
     this.recyclesIds = options.recycleIds === true;
+
+    const { maxSize } = options;
+    if (
+      maxSize !== undefined &&
+      maxSize !== Number.POSITIVE_INFINITY &&
+      (!Number.isInteger(maxSize) || maxSize < 1)
+    ) {
+      throw new RangeError(
+        `maxSize must be a positive integer or Infinity; got ${String(maxSize)}`,
+      );
+    }
+    this.maxSize = maxSize ?? Number.POSITIVE_INFINITY;
   }
 
   /**
@@ -205,13 +252,23 @@ export class StringInterner {
    *
    * @param text - String to intern.
    * @returns The stable ID for `text`.
-   * @throws {RangeError} If the u32 ID space is exhausted.
+   * @throws {RangeError} If the u32 ID space is exhausted, or if assigning a
+   *   new ID would exceed {@link StringInternerOptions.maxSize}.
    */
   intern(text: string): number {
     asString(text, "text");
 
     const existing = this.stringToId.get(text);
     if (existing !== undefined) return existing;
+
+    // Only the assignment path is capped, so a cap rejects growth and never
+    // a lookup of something already interned.
+    if (this.stringToId.size >= this.maxSize) {
+      throw new RangeError(
+        `StringInterner reached its maxSize of ${this.maxSize} strings; ` +
+          `release IDs, or raise the cap`,
+      );
+    }
 
     const recycled = this.pool.pop();
     const id = recycled ?? this.idToString.length;

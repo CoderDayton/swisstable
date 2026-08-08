@@ -6,81 +6,229 @@ on:
   pull_request:
     branches: [main]
 
+# Nothing here writes: no release, no push, no comment. Stating it keeps the
+# job on a read-only token whatever the repository or organization default is.
+permissions:
+  contents: read
+
 # A newer push to the same branch makes the in-flight run irrelevant.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 env:
-  # Kept in step with .github/workflows/release.yml: the two must build the
-  # wasm with the same compiler, or the release drift gate fails on a payload
-  # CI accepted.
-  CLANG_VERSION: "21"
+  BUN_VERSION: "1.3.14"
+  DENO_VERSION: "2.9.4"
   # The oldest Node the package claims to run on. Checked against
   # package.json's engines field by the job that uses it.
   NODE_FLOOR: "16.9.0"
 
 jobs:
-  build-and-test:
-    name: Build and test
-    runs-on: ubuntu-latest
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      # One platform failing should still report the others.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest, windows-latest]
+
+    # git-bash ships on the Windows runners, so one script covers all three.
+    defaults:
+      run:
+        shell: bash
 
     steps:
-      - uses: actions/checkout@v7
+      # Actions are pinned to a commit, not a tag: a tag can be moved after
+      # review, and this job runs on every pull request.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # clang provides the wasm32 target; wasm-ld ships in the lld package.
-      #
-      # Pinned to a major version rather than tracking the runner's default:
-      # the payload committed in src/generated is compiler output, so an
-      # image bump that changed clang would fail the drift gate below on a
-      # pull request that touched nothing.
-      - name: Install the wasm toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang-${{ env.CLANG_VERSION }} lld-${{ env.CLANG_VERSION }}
-          sudo update-alternatives --install /usr/bin/clang clang \
-            /usr/bin/clang-${{ env.CLANG_VERSION }} 100
-          sudo update-alternatives --install /usr/bin/wasm-ld wasm-ld \
-            /usr/bin/wasm-ld-${{ env.CLANG_VERSION }} 100
-
-      # Printed on its own so a missing or mismatched linker is obvious in
-      # the log rather than surfacing as a confusing clang failure below.
-      - name: Report toolchain versions
-        run: |
-          clang --version
-          wasm-ld --version
-
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: "1.3.14"
+          bun-version: ${{ env.BUN_VERSION }}
+
+      # The pinned toolchain is a 50-100 MiB download. Keyed on the script
+      # that pins it, so a version bump misses the cache instead of quietly
+      # building against the previous release.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: .zig
+          key: zig-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/toolchain.ts') }}
+
+      # Split out so a download or checksum failure is not reported as a
+      # compile error. Verifies the archive against its published SHA-256.
+      - name: Install the pinned Zig toolchain
+        run: bun run toolchain
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      # Split from the JS build so the log attributes a failure to the
-      # right half of the toolchain.
       - name: Build wasm modules
         run: bun run build:wasm
 
+      # Zig carries its own clang, lld, and headers, so the same release
+      # compiles the same bytes on every host. The compare job below holds
+      # that claim to account rather than asserting it in a comment.
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: wasm-${{ matrix.os }}
+          path: dist/wasm/*.wasm
+          retention-days: 1
+          if-no-files-found: error
+
       # src/generated is committed so the package typechecks on a clone with
-      # no clang. The build just rewrote it from native/*.c, so anything the
-      # working tree reports here means the committed copy is out of date.
+      # no toolchain. The build just rewrote it from native/*.c, so anything
+      # the working tree reports here means the committed copy is out of date.
       #
       # git status rather than git diff: diff only reports tracked files, so a
       # payload for a newly added module that was never committed would land
       # untracked and pass silently -- the case this gate most needs to catch.
+      #
+      # Linux only. The Windows checkout rewrites line endings, which would
+      # report the whole directory as modified for reasons unrelated to the
+      # payload; the compare job covers the other platforms' output instead.
       - name: Verify generated sources are current
+        if: runner.os == 'Linux'
         run: |
           changes="$(git status --porcelain --untracked-files=all src/generated)"
           if [ -n "$changes" ]; then
-            echo "src/generated is stale or incomplete:" >&2
+            echo "::error::src/generated is stale or incomplete" >&2
             echo "$changes" >&2
             echo "run 'bun run build:wasm' and commit the result" >&2
             exit 1
           fi
 
       - name: Build JavaScript and type declarations
+        if: runner.os == 'Linux'
         run: bun run build:js
+
+      # Handed to the test jobs rather than rebuilt there. A consumer installs
+      # this package, never compiles it, so the artifact every platform should
+      # be tested against is one build's output.
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        if: runner.os == 'Linux'
+        with:
+          name: dist
+          path: dist
+          retention-days: 1
+          if-no-files-found: error
+
+  compare:
+    name: Compare cross-platform output
+    needs: build
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          pattern: wasm-*
+          path: wasm
+
+      # The reason for compiling with Zig rather than a distro clang: one
+      # pinned toolchain, identical bytes on every host. If that ever stops
+      # holding, only whichever platform happened to run the drift gate could
+      # commit a payload, and every other contributor would see a spurious
+      # diff. Failing here says so directly.
+      - name: Every platform must produce identical modules
+        run: |
+          set -euo pipefail
+          find wasm -name '*.wasm' | sort
+
+          # One per platform in the build matrix. Counted rather than assumed:
+          # a download that matched nothing would otherwise leave every
+          # comparison below vacuously true and report the gate as passing.
+          platforms=3
+
+          for module in swiss_u32 swiss_u64; do
+            copies="$(find wasm -name "${module}.wasm" | wc -l)"
+            if [ "$copies" -ne "$platforms" ]; then
+              echo "::error::found ${copies} ${module}.wasm, expected ${platforms}" >&2
+              exit 1
+            fi
+
+            digests="$(
+              find wasm -name "${module}.wasm" -exec sha256sum {} + \
+                | awk '{print $1}' | sort -u
+            )"
+            count="$(echo "$digests" | wc -l)"
+            echo "${module}.wasm: ${digests}"
+            if [ "$count" -ne 1 ]; then
+              echo "::error::${module}.wasm differs between platforms" >&2
+              find wasm -name "${module}.wasm" -exec sha256sum {} + >&2
+              exit 1
+            fi
+          done
+
+  ubsan:
+    name: Checked build
+    needs: build
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: .zig
+          key: zig-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/toolchain.ts') }}
+
+      - name: Install the pinned Zig toolchain
+        run: bun run toolchain
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      # Rebuilds the sources with UndefinedBehaviorSanitizer trapping, then
+      # drives them through growth, compaction, tombstone reuse, the group
+      # scan, and the bulk API. The shipped modules are compiled without it,
+      # so this is the only place UB in native/*.c would be reported.
+      - name: Build with UBSan and exercise every path
+        run: bun run check:ubsan
+
+  test:
+    name: Test on ${{ matrix.os }}
+    needs: build
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest, windows-latest]
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      # No toolchain here: these jobs test the built package, the way an
+      # installing consumer receives it.
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: dist
+          path: dist
+
+      # Covers tests, scripts, and examples, which the publish build in
+      # build:js does not include.
+      - name: Typecheck
+        run: bun run typecheck
+
+      # Loads dist/wasm, which the build job produced.
+      - name: Test
+        run: bun test
 
       # bun test runs the TypeScript sources under Bun, which says nothing
       # about whether the emitted JavaScript loads under the runtime most
@@ -89,28 +237,39 @@ jobs:
       - name: Smoke-test the build under Node
         run: node scripts/smoke-node.mjs
 
+      # The package advertises Deno, which resolves the emitted ESM through
+      # its own module graph rather than Node's.
+      - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
+        with:
+          deno-version: ${{ env.DENO_VERSION }}
+
+      - name: Smoke-test the build under Deno
+        run: deno run --allow-read scripts/smoke-node.mjs
+
       # The runner's Node is far newer than what package.json promises, so it
       # cannot catch emitted syntax or a standard-library call that the oldest
-      # supported release lacks.
-      - uses: actions/setup-node@v7
+      # supported release lacks. Once is enough: this checks the emitted
+      # JavaScript, which is the same file on every platform.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        if: runner.os == 'Linux'
         with:
           node-version: ${{ env.NODE_FLOOR }}
 
       - name: Smoke-test the build under the oldest supported Node
+        if: runner.os == 'Linux'
         run: |
           declared="$(node -p "require('./package.json').engines.node")"
           if [ "$declared" != ">=${{ env.NODE_FLOOR }}" ]; then
-            echo "engines.node is $declared but this job runs ${{ env.NODE_FLOOR }}" >&2
+            echo "::error::engines.node is $declared but this job runs ${{ env.NODE_FLOOR }}" >&2
             echo "the floor the package promises is not the floor CI proves" >&2
             exit 1
           fi
           node scripts/smoke-node.mjs
 
-      # Covers tests, scripts, and examples, which the publish build in
-      # build:js does not include.
-      - name: Typecheck
-        run: bun run typecheck
-
-      # Loads the modules built above, so build:wasm is a prerequisite.
-      - name: Test
-        run: bun test
+      # The browser is the one advertised runtime with no Node compatibility
+      # layer behind it, so it is where a `node:` import or a stray `Buffer`
+      # reaching into src/ would surface. Linux only: the other images carry
+      # no Chrome, and the file under test is platform-independent.
+      - name: Smoke-test the build in a browser
+        if: runner.os == 'Linux'
+        run: bun run smoke:browser

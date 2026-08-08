@@ -143,7 +143,7 @@ Interleaving removes one from the critical path — worth ~3 ns per lookup at
 
 The banks are fixed static arrays and the module links with
 `--initial-memory == --max-memory`, so an instance reserves its whole linear
-memory — 20 MiB for u32, 28 MiB for u64 — the moment it is instantiated,
+memory — 20 MiB for u32, 29 MiB for u64 — the moment it is instantiated,
 whether it holds one entry or its maximum.
 
 Both figures are derived from `MAX_CAPACITY`, not written down beside it:
@@ -235,6 +235,15 @@ Ownership direction is the whole point: the linker places the buffers and the
 module exports their addresses, so JavaScript never picks an offset that
 could alias the table banks.
 
+`scan` stages into a second set of buffers of its own, reached through
+`scan_keys_ptr`, `scan_vals_lo_ptr`, and `scan_vals_hi_ptr`. Sharing the bulk
+buffers would be correct for the shipped binding, which copies each window
+out before it issues anything else, and wrong for anyone else holding the
+instance: a caller that staged a batch, walked the table, then issued the
+batch would read the walk's entries back as its own arguments. Separate
+arrays cost 0.75 MiB and make that unrepresentable instead of merely
+documented.
+
 `set_many` reserves once for the whole batch rather than once per key, which
 is the primary amortization over N individual `set` calls. The bound is
 pessimistic — keys already present overwrite rather than insert — so it can
@@ -242,18 +251,54 @@ over-reserve, never under-reserve.
 
 ## Build
 
-`scripts/build-wasm.ts` drives clang directly:
+`scripts/build-wasm.ts` drives `zig cc`:
 
 ```text
---target=wasm32 -O3 -msimd128 -nostdlib
+--target=wasm32-freestanding -O3 -flto -msimd128 -mbulk-memory -nostdlib
+-fno-builtin-memset -fno-sanitize=undefined
 -Wl,--no-entry -Wl,--export-memory -Wl,--strip-all
+-Wl,-z,stack-size=65536
 -Wl,--initial-memory=N -Wl,--max-memory=N
 -Wl,--export=<symbol>   (one per exported function)
 ```
 
+The compiler is Zig rather than a system clang because the base64 payload in
+`src/generated` is committed, which makes the compiler part of the source.
+Zig ships clang, lld, and its headers as one archive, so pinning one release
+pins the output: Linux, macOS, and Windows compile the same bytes, and CI
+builds on all three and compares hashes. A distro clang links against
+whatever system LLVM the image carries and cannot make that promise.
+`scripts/toolchain.ts` installs the pinned release and verifies it against
+its published SHA-256.
+
+`-fno-builtin-memset` is load bearing. A freestanding build has no libc, but
+clang still lowers bulk stores to a `memset` call, so the module defines one
+as a byte loop — which is itself a `memset`-shaped loop. Without the flag,
+the only thing stopping the optimizer from rewriting that loop into a call to
+itself is a heuristic that declines to transform loops inside a function of
+that name. The flag takes the recursion off the optimizer's discretion. The
+one place that wants the hardware instruction rather than the loop —
+clearing a bank's control bytes, up to a megabyte per clear, reserve, and
+rehash — asks for it as `__builtin_memset`, which lowers to `memory.fill`.
+
+`-fno-sanitize=undefined` switches off the UndefinedBehaviorSanitizer that
+`zig cc` enables by default, whose handlers live in a runtime this module
+does not link. `bun run check:ubsan` rebuilds with it on in trapping mode —
+each report lowered to an `unreachable`, which needs no runtime — and drives
+the result through growth, compaction, tombstone reuse, the group scan, and
+the bulk API, checking every answer against a `Map`. That build is not
+shipped: a trap aborts the instance, which is a worse production outcome than
+the arithmetic that provoked it.
+
+`--stack-first` is absent because `zig cc` passes it to `wasm-ld` itself for
+freestanding wasm and rejects it as a user argument. The property it buys —
+the stack below all data, so an overflow traps instead of overwriting the
+banks — is asserted by `test/memory-layout.test.ts` rather than read off a
+flag.
+
 `--strip-all` drops the name, producers, and target-features sections — a
 tenth of the output, and the only place the compiler's version string would
-appear in a committed payload. CI pins clang to one major version, so
+appear in a committed payload. With the toolchain pinned to an exact release,
 `src/generated` tracks `native/*.c` and nothing else.
 
 Initial and maximum memory are equal, which is what makes the cached views

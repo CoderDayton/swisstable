@@ -85,6 +85,21 @@
 #define MAX_CAPACITY_LOG2 20
 #endif
 
+/*
+ * Both ends are load bearing, and neither is enforced by the arithmetic
+ * itself, so the header refuses the build rather than trusting its caller:
+ * scripts/build-wasm.ts applies the same bounds, but the sources compile
+ * standalone with -DMAX_CAPACITY_LOG2 and would otherwise miscompute in
+ * silence. Below 4 a bank holds less than one SIMD group, so a group load
+ * would run past it. Above 26 the two banks and the staging buffers no
+ * longer address inside wasm32's 4 GiB; further out still, MAX_LIVE()'s
+ * 32-bit product wraps at 30 and every load-factor decision inverts, and
+ * at 32 the shift below is undefined.
+ */
+#if MAX_CAPACITY_LOG2 < 4 || MAX_CAPACITY_LOG2 > 26
+#error "MAX_CAPACITY_LOG2 must be in [4, 26]"
+#endif
+
 #define MAX_CAPACITY (1u << MAX_CAPACITY_LOG2)
 
 /*
@@ -274,9 +289,15 @@ static uint32_t capacity_for_entries(uint32_t entries) {
 /*
  * Marks every slot of a bank EMPTY. Entries are left as they are: a slot
  * is only ever read after its control byte says it is live.
+ *
+ * Spelled as the builtin so it lowers to the `memory.fill` instruction the
+ * engine implements, rather than to a call to the byte loop above: the
+ * build passes -fno-builtin-memset to keep that loop from recursing, and
+ * that would otherwise cost this path a megabyte of scalar stores per
+ * clear, reserve, and rehash.
  */
 static void initialize_bank(uint32_t bank, uint32_t capacity) {
-  memset(g_ctrl[bank], CTRL_EMPTY, capacity);
+  __builtin_memset(g_ctrl[bank], CTRL_EMPTY, capacity);
 }
 
 /*
@@ -399,6 +420,16 @@ static void insert_known_absent(
 ) {
   const uint32_t hash = mix_u32(entry->key);
   const uint32_t slot = find_insert_slot(bank, mask, hash);
+
+  /*
+   * find_insert_slot() reports UINT32_MAX for a bank with neither an empty
+   * nor a deleted slot. rehash() is the only caller and always writes into
+   * a bank it has just emptied, so this cannot fire — but the alternative
+   * to checking is an out-of-bounds write, and upsert_slot() guards the
+   * same return for the same reason. Trapping keeps a broken invariant
+   * loud instead of turning it into silent corruption or a dropped entry.
+   */
+  if (slot == UINT32_MAX) __builtin_trap();
 
   g_ctrl[bank][slot] = (uint8_t)h2(hash);
   g_entries[bank][slot] = *entry;

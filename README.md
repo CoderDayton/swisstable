@@ -31,10 +31,11 @@ Docs: [API](docs/api.md) · [Design](docs/design.md) ·
 - One byte of metadata per slot, compared sixteen at a time with `wasm_simd128`.
 - 10.3 bytes per entry at full occupancy, 20.6 with the standby bank a rehash
   needs, against a measured 37 for `Map` on V8 and 67 on JavaScriptCore.
-- An instance reserves 20 MiB (u32) or 28 MiB (u64) up front and commits it
+- An instance reserves 20 MiB (u32) or 29 MiB (u64) up front and commits it
   by page: an empty table costs 1.7 MiB RSS, each further one about 50 KiB.
   Lower `SWISS_MAX_CAPACITY_LOG2` for many small tables — see
-  [Footprint](docs/design.md#footprint).
+  [Footprint](docs/design.md#footprint). `dispose()`, or a `using`
+  declaration, hands an instance back without waiting for the collector.
 - Bulk `setMany`/`getMany`/`deleteMany` cross once per batch: 7.1–8.8 ns/op
   against `Map`'s 47–78 on a 100,000-entry u64 fill.
 - No allocator — fixed linear memory, linked `-nostdlib`, never calls
@@ -81,8 +82,15 @@ Four exports:
 Keys and values are strictly `u32` and anything else throws `RangeError`;
 capacity is fixed at build time (917,504 entries); a stored `0` is always
 distinguishable from an absent key. See [docs/api.md](docs/api.md) for every
-method and thrown error, and [`examples/`](examples/README.md) for four
+method and thrown error, and [`examples/`](examples/README.md) for five
 runnable programs.
+
+Two operational notes. Keys are hashed with an unseeded finalizer, so keys
+chosen by an attacker can be made to collide; the cost is bounded rather
+than unbounded, but budget for it when keys come from untrusted input. And a
+table is single-threaded — one instance is one table, and no instance may be
+shared across workers. Both are covered in
+[Untrusted keys and threading](docs/api.md#untrusted-keys-and-threading).
 
 ## When not to use this
 
@@ -133,15 +141,20 @@ same form, and records the engine, CPU, and clock each column was taken on.
 bun install
 bun run hooks      # lefthook pre-commit and pre-push gates
 bun run build      # compile native/*.c to dist/wasm/*.wasm
-bun test           # 167 tests across 14 suites
+bun test           # 201 tests across 20 suites
 bun run typecheck
+bun run smoke      # the built package under plain Node
+bun run smoke:browser  # the built package in Chrome or Firefox
 bun run bench      # this runtime
 bun run bench:all  # bun, node, deno, chrome, firefox — three passes each
 ```
 
-Run all four before opening a pull request; `bun run build` is not optional
-even for a TypeScript-only change, since the tests load the compiled modules.
-Building needs clang with the `wasm32` target and `wasm-ld` on `PATH`. Read
+Run `build`, `test`, and `typecheck` before opening a pull request; `bun run
+build` is not optional even for a TypeScript-only change, since the tests
+load the compiled modules.
+Building needs nothing installed: `bun run build` downloads the pinned Zig
+toolchain into `.zig/`, verifies it against its published checksum, and
+compiles with it. Read
 [docs/design.md](docs/design.md) before touching the C — several invariants
 are load bearing and not obvious from the code, and
 [CONTRIBUTING.md](CONTRIBUTING.md) has the full guide.

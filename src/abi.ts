@@ -654,3 +654,62 @@ export function assertStatus(
 
   throw new Error(`${operation} failed with status ${status}`);
 }
+
+/**
+ * Counter view a disposed table reads through, so `size` and `capacity`
+ * answer 0 rather than indexing a view onto a released instance.
+ *
+ * Shared by every disposed table: nothing writes to it, and a disposed table
+ * has nothing to distinguish.
+ */
+export const DISPOSED_COUNTER = new Uint32Array(1);
+
+/** Staging view a disposed table's iterators bind to. Yields no entries. */
+export const DISPOSED_STAGING = new Uint32Array(0);
+
+/** Per-key flag view a disposed table's bulk buffers bind to. */
+export const DISPOSED_FLAGS = new Uint8Array(0);
+
+/**
+ * Builds the exports object a disposed table swaps its own for.
+ *
+ * Every call the bindings make goes through the exports object, so replacing
+ * it is what turns use-after-dispose into a named error instead of a read
+ * through a released instance. Replacing it is also the release itself: the
+ * reserved linear memory stays reachable, and so uncollectable, for as long
+ * as the binding holds the real exports.
+ *
+ * Swapping the object rather than testing a flag keeps the check off the hot
+ * path — a live table pays nothing for the ability to be disposed.
+ *
+ * @param names - Every export the binding calls, so none is left callable.
+ * @param className - Named in the error, so the message says which table.
+ * @internal
+ */
+export function disposedExports<T>(
+  names: readonly string[],
+  className: string,
+): T {
+  const fail = (): never => {
+    throw disposedError(className);
+  };
+
+  const exports: Record<string, unknown> = { memory: undefined };
+  for (const name of names) exports[name] = fail;
+
+  return exports as T;
+}
+
+/**
+ * The error a disposed table reports.
+ *
+ * Shared with the paths that touch a released staging view before they reach
+ * the exports object: staging into a zero-length view fails on its own, with
+ * a message about buffer offsets that says nothing about dispose.
+ *
+ * @param className - Named in the error, so the message says which table.
+ * @internal
+ */
+export function disposedError(className: string): Error {
+  return new Error(`${className} was used after dispose()`);
+}

@@ -43,6 +43,8 @@
   "scripts": {
     "build": "bun run build:wasm && bun run build:js",
     "build:wasm": "bun run scripts/build-wasm.ts",
+    "toolchain": "bun run scripts/toolchain.ts",
+    "check:ubsan": "bun run scripts/check-ubsan.ts",
     "build:js": "tsc -p tsconfig.build.json",
     "bench": "bun run benches/bench.ts",
     "bench:all": "bun run benches/run-all.ts",
@@ -50,6 +52,7 @@
     "bench:compare": "bun run benches/compare.ts",
     "test": "bun test",
     "smoke": "node scripts/smoke-node.mjs",
+    "smoke:browser": "bun run scripts/smoke-browser.ts",
     "typecheck": "tsc --noEmit",
     "hooks": "lefthook install",
     "prepublishOnly": "bun run build && bun run typecheck && bun test && bun run smoke"

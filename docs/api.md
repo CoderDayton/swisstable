@@ -82,7 +82,7 @@ number.
 
 **Each module instance owns exactly one table, and reserves its whole budget
 up front.** The banks are static arrays, so an instance reserves 20 MiB (u32)
-or 28 MiB (u64) of linear memory from instantiation whether it holds one
+or 29 MiB (u64) of linear memory from instantiation whether it holds one
 entry or its maximum. The reservation is address space and is committed page
 by page as the table touches it, so a small table still resides small — but
 two tables mean two instances and twice the reservation. See
@@ -95,14 +95,16 @@ many small tables, build a second pair of modules with a lower
 `SWISS_MAX_CAPACITY_LOG2`: at `2^16` a u32 instance costs 3.1 MiB instead of
 20, capped at 57,344 entries.
 
-**A table is released by dropping it; there is no `dispose`.** Its memory
-belongs to the `WebAssembly.Instance` behind it and comes back when the
-garbage collector runs, not when the last reference goes out of scope — so a
-table built per request holds its reservation until then, and a burst of them
-holds several at once. Reuse one long-lived table and `clear()` it between
-rounds: one pass over the control bytes, no new reservation. Linear memory
-never shrinks, so neither `clear()` nor `shrinkToFit()` returns pages to the
-host; they ready the table for the next round rather than shrink the process.
+**Dropping a table does not release it promptly.** Its memory belongs to the
+`WebAssembly.Instance` behind it and comes back when the garbage collector
+runs, not when the last reference goes out of scope — so a table built per
+request holds its reservation until then, and a burst of them holds several
+at once. Call `dispose()`, or bind the table with `using`, to hand the
+instance back at a point you choose. Reusing one long-lived table and
+calling `clear()` between rounds avoids the question entirely: one pass over
+the control bytes, no new reservation. Linear memory never shrinks, so
+neither `clear()` nor `shrinkToFit()` returns pages to the host; they ready
+the table for the next round rather than shrink the process.
 
 **A stored `0` is never confused with an absent key.** Presence is reported
 separately from the value, so no sentinel is overloaded anywhere in the API.
@@ -200,6 +202,7 @@ const reverse = await SwissU32ToU32.load(module, 1_000);
 | `reserve(entries)` | `void` | Grows in place, preserving contents. No-op if the capacity already suffices. |
 | `shrinkToFit()` | `void` | Rehashes down to the smallest capacity holding the live entries. No-op if already there. |
 | `clear()` | `void` | Empties the table but **retains capacity**. Follow with `shrinkToFit()` to hand the slots back. |
+| `dispose()` | `void` | Releases the module instance. Idempotent, and aliased as `Symbol.dispose` so a table works with `using`. Afterwards `size` and `capacity` read 0, and every method that would touch the instance throws. An iterator opened beforehand keeps walking, and keeps the instance alive until it ends. |
 
 ### Iteration
 
@@ -231,6 +234,15 @@ table does not rehash; whether the walk observes the change is unspecified. A
 rehash renumbers the slots, so a walk that continued across one would skip
 some entries and repeat others with nothing in the data to show it — it
 throws instead. `clear()` and `shrinkToFit()` both count as a rehash here.
+
+**A walk over a table of 57,344 entries or fewer sees no second window**,
+because its whole slot space fits the first: once that window has been handed
+over, every entry has been reported and nothing is left to check, so mutating
+from inside the loop cannot throw. Above that, the same code does throw. Test
+a walk that mutates against a table larger than one window, or it will pass at
+development sizes and fail in production. (The check does run before the first
+window, so rehashing between opening an iterator and its first `next()` throws
+at any size.)
 
 The generation check runs once per slot window, so read this as **may throw**
 rather than always throws: a rehash after the last window has been handed
@@ -288,9 +300,9 @@ differ:
 
 Iteration works the same way, with the same order and mutation rules, except
 that `values()` yields `U64Lanes` and `entries()` yields `[key, lanes]`. The
-scan borrows the same staging buffers the bulk methods use, so each chunk is
-copied out before it is handed over — a `getMany` issued between two steps of
-an open iterator cannot disturb it.
+scan stages into buffers of its own and each chunk is copied out before it is
+handed over, so a `getMany` issued between two steps of an open iterator
+cannot disturb it, and neither can the reverse.
 
 `forEach` is here too, and matches `Map`'s callback shape — which has one
 value argument, so it must box the two lanes into a `U64Lanes` per entry.
@@ -352,13 +364,14 @@ Assigns `u32` IDs to exact strings, in first-seen order starting at 0. By
 default IDs remain stable for the lifetime of the instance.
 
 ```ts
-new StringInterner(options?: { recycleIds?: boolean })
+new StringInterner(options?: { recycleIds?: boolean; maxSize?: number })
 ```
 
 | Member | Returns | Notes |
 | --- | --- | --- |
 | `size` | `number` | Strings currently interned. Only ever grows unless IDs are recycled. |
 | `recyclesIds` | `boolean` | The mode, fixed at construction. |
+| `maxSize` | `number` | The cap, or `Infinity` when uncapped. Fixed at construction. |
 | `release(id)` | `boolean` | Frees an ID for reuse. **Throws `TypeError` unless `recycleIds` is on.** |
 | `intern(text)` | `number` | Existing ID, or a newly assigned one. |
 | `internAll(texts)` | `Uint32Array` | IDs positionally matching `texts`. |
@@ -378,6 +391,25 @@ that follow, and stable IDs are the point of the class. It exists so a caller
 that interns a key and then fails to store it can avoid leaking the ID. With
 recycling on it also accepts an ID `intern` has just taken from the pool,
 which is not at the end of the ID space and so cannot be found by position.
+
+### Capping growth
+
+`{ maxSize: n }` refuses to assign an ID once `n` strings are interned,
+throwing `RangeError`. Only assignment is capped: re-interning a string
+already held returns its ID at the cap, and `resolve` and `lookup` keep
+working. The constructor throws `RangeError` unless `maxSize` is a positive
+integer or `Infinity`, the value `maxSize` reports for an uncapped interner.
+
+An interner never forgets on its own, so a rotating key space grows for as
+long as the process lives. A cap turns that from a slow leak into a failure
+at a point you chose:
+
+```ts
+// A vocabulary this size is a bug, not a workload.
+const interner = new StringInterner({ maxSize: 1_000_000 });
+```
+
+Recycling and a cap compose: releasing an ID frees room under it.
 
 ### Recycling IDs
 
@@ -486,6 +518,26 @@ anything is deleted. `size` counts live entries; `interner.size` counts every
 distinct string ever seen, and never decreases, because IDs stay stable for
 the lifetime of the interner. In a long-lived map with churning keys,
 `interner.size` is the one that grows without bound.
+
+## Untrusted keys and threading
+
+**The hash is not seeded.** Keys go through a fixed Murmur3 finalizer, which
+is a public, invertible permutation, so an attacker who chooses key values
+can compute keys that share a probe group.
+
+The cost is bounded rather than unbounded, and the `u32` key space is what
+bounds it. The group index takes 20 bits of the hash at the default
+capacity, leaving 12 free — so **at most 4,096 distinct keys can share a
+group**, and the worst case measures about 5x slower lookups, not a stall.
+That is a budgeting question for a service whose keys come from user input,
+not a denial-of-service hole. If keys are fully attacker-chosen and the
+margin matters, hash them yourself before interning.
+
+**A table is single-threaded.** One module instance is one table, and its
+state is plain memory with no atomics. Do not share an instance across
+workers: give each worker its own table. `load()` accepts an already-compiled
+`WebAssembly.Module`, so workers can share the *compiled code* — which is
+immutable — while each instantiates its own memory.
 
 ## Functions and types
 

@@ -1,10 +1,15 @@
 import {
   DELETE_MANY_FAILED,
+  DISPOSED_COUNTER,
+  DISPOSED_FLAGS,
+  DISPOSED_STAGING,
   ScanIterator,
   asCallback,
   asWasmI32,
   assertStatus,
   bulkLength,
+  disposedError,
+  disposedExports,
   materializeU32,
   scanColumns,
   stageU32,
@@ -90,10 +95,17 @@ export interface SwissU64WasmExports extends ScanExports {
    * Stages the live entries in the slot window at `cursor`, returning how
    * many, or a negative status if it rejected the cursor.
    *
-   * Writes through the same staging buffers as the bulk methods.
+   * Writes through the scan buffers, which are the module's own and are not
+   * the ones the bulk methods stage into.
    */
   scan(cursor: number): number;
-  /** Slots one `scan` visits, never more than `bulk_capacity()`. */
+  /** Address of the scan key buffer. */
+  scan_keys_ptr(): number;
+  /** Address of the scan low-lane buffer. */
+  scan_vals_lo_ptr(): number;
+  /** Address of the scan high-lane buffer. */
+  scan_vals_hi_ptr(): number;
+  /** Slots one `scan` visits. */
   scan_window(): number;
   /** Counter bumped by every rehash, clear, and init. */
   generation(): number;
@@ -151,7 +163,9 @@ export interface BulkGetResult {
 interface SwissU64Scan {
   readonly wasm: SwissU64WasmExports;
   readonly scanWindow: number;
-  readonly scratch: BulkScratch;
+  readonly scanKeys: Uint32Array;
+  readonly scanValsLo: Uint32Array;
+  readonly scanValsHi: Uint32Array;
 }
 
 /*
@@ -161,10 +175,10 @@ interface SwissU64Scan {
  *
  * Each lists only the columns it reads, and binds them to its own fields
  * rather than indexing `columns` per entry. Copying out of the module is
- * scanColumns' job, and here that also isolates a walk from the bulk
- * methods: the scan writes through the same staging buffers getMany does,
- * so an iterator that read them lazily would hand back whatever an
- * interleaved call left behind.
+ * scanColumns' job, and here that also isolates one walk from the next: the
+ * scan buffers are the module's own and hold only the window staged last, so
+ * an iterator that read them lazily would hand back whatever a later scan
+ * left behind.
  */
 
 /** Yields each key. Never copies the lanes, which it does not read. */
@@ -172,7 +186,7 @@ class KeyIterator extends ScanIterator<number> {
   private readonly keys: Uint32Array;
 
   constructor(source: SwissU64Scan) {
-    super(source.wasm, source.scanWindow, [source.scratch.keys]);
+    super(source.wasm, source.scanWindow, [source.scanKeys]);
     this.keys = this.columns[0]!;
   }
 
@@ -188,8 +202,8 @@ class ValueIterator extends ScanIterator<U64Lanes> {
 
   constructor(source: SwissU64Scan) {
     super(source.wasm, source.scanWindow, [
-      source.scratch.valsLo,
-      source.scratch.valsHi,
+      source.scanValsLo,
+      source.scanValsHi,
     ]);
     this.valsLo = this.columns[0]!;
     this.valsHi = this.columns[1]!;
@@ -208,9 +222,9 @@ class EntryIterator extends ScanIterator<[number, U64Lanes]> {
 
   constructor(source: SwissU64Scan) {
     super(source.wasm, source.scanWindow, [
-      source.scratch.keys,
-      source.scratch.valsLo,
-      source.scratch.valsHi,
+      source.scanKeys,
+      source.scanValsLo,
+      source.scanValsHi,
     ]);
     this.keys = this.columns[0]!;
     this.valsLo = this.columns[1]!;
@@ -289,6 +303,9 @@ const REQUIRED_U64_EXPORTS = [
   "bulk_flags_ptr",
   "scan",
   "scan_window",
+  "scan_keys_ptr",
+  "scan_vals_lo_ptr",
+  "scan_vals_hi_ptr",
   "generation",
   "size",
   "capacity",
@@ -323,14 +340,22 @@ class BulkScratch {
   /** Address of {@link BulkScratch.found} in linear memory. */
   readonly foundPtr: number;
 
+  /*
+   * The four views are not `readonly`: {@link BulkScratch.release} drops
+   * them when the owning table is disposed.
+   */
+
+  /** Whether {@link BulkScratch.release} has dropped the views. */
+  released = false;
+
   /** Staged keys for the current chunk. */
-  readonly keys: Uint32Array;
+  keys: Uint32Array;
   /** Staged or returned low lanes for the current chunk. */
-  readonly valsLo: Uint32Array;
+  valsLo: Uint32Array;
   /** Staged or returned high lanes for the current chunk. */
-  readonly valsHi: Uint32Array;
+  valsHi: Uint32Array;
   /** Returned per-key flags for the current chunk. */
-  readonly found: Uint8Array;
+  found: Uint8Array;
 
   constructor(wasm: SwissU64WasmExports) {
     this.maxBatch = wasm.bulk_capacity() >>> 0;
@@ -351,6 +376,21 @@ class BulkScratch {
     this.valsLo = new Uint32Array(buffer, this.valsLoPtr, this.maxBatch);
     this.valsHi = new Uint32Array(buffer, this.valsHiPtr, this.maxBatch);
     this.found = new Uint8Array(buffer, this.foundPtr, this.maxBatch);
+  }
+
+  /**
+   * Drops the views onto the module's memory.
+   *
+   * A buffer stays reachable, and so uncollectable, while any view onto it
+   * does, so disposing a table has to let these go along with the exports —
+   * otherwise the staging views alone would pin the whole reservation.
+   */
+  release(): void {
+    this.released = true;
+    this.keys = DISPOSED_STAGING;
+    this.valsLo = DISPOSED_STAGING;
+    this.valsHi = DISPOSED_STAGING;
+    this.found = DISPOSED_FLAGS;
   }
 }
 
@@ -377,11 +417,25 @@ class BulkScratch {
  * ```
  */
 export class SwissU32ToU64 {
-  /** The instantiated module. */
-  private readonly wasm: SwissU64WasmExports;
+  /**
+   * The instantiated module.
+   *
+   * Not `readonly`: {@link SwissU32ToU64.dispose} swaps it, which is both how
+   * the instance is released and how a later call is caught.
+   */
+  private wasm: SwissU64WasmExports;
 
   /** Views over the module's staging buffers, used by the bulk methods. */
   private readonly scratch: BulkScratch;
+
+  /**
+   * Alias for {@link SwissU32ToU64.dispose}, so a table works with `using`.
+   *
+   * Declared rather than defined here: `Symbol.dispose` postdates the oldest
+   * Node the package supports, so it is attached below only where the
+   * runtime has it.
+   */
+  declare [Symbol.dispose]: () => void;
 
   /**
    * View over the module's latched-result lanes.
@@ -390,7 +444,7 @@ export class SwissU32ToU64 {
    * crossing instead of three. The view is built once because the module's
    * memory is fixed and never grows.
    */
-  private readonly lastValue: Uint32Array;
+  private lastValue: Uint32Array;
 
   /** Slots one scan call visits. */
   private readonly scanWindow: number;
@@ -404,8 +458,13 @@ export class SwissU32ToU64 {
    * are the module's own counters, not a cached copy, so there is nothing to
    * invalidate.
    */
-  private readonly sizeView: Uint32Array;
-  private readonly capacityView: Uint32Array;
+  private sizeView: Uint32Array;
+  private capacityView: Uint32Array;
+
+  /** Views over the module's scan buffers, filled by `scan`. */
+  private scanKeys: Uint32Array;
+  private scanValsLo: Uint32Array;
+  private scanValsHi: Uint32Array;
 
   private constructor(wasm: SwissU64WasmExports) {
     this.wasm = wasm;
@@ -418,16 +477,17 @@ export class SwissU32ToU64 {
 
     this.scanWindow = wasm.scan_window() >>> 0;
 
-    // The scan borrows the bulk staging buffers, so its window has to fit
-    // inside them; and every iterator strides by it, so a zero would never
-    // reach capacity.
-    if (this.scanWindow === 0 || this.scanWindow > this.scratch.maxBatch) {
-      throw new TypeError(
-        "swiss_u64.wasm reported a scan window its staging buffers cannot hold",
-      );
+    // Every iterator strides by this; a zero would never reach capacity.
+    if (this.scanWindow === 0) {
+      throw new TypeError("swiss_u64.wasm reported a zero scan window");
     }
 
     const buffer = wasm.memory.buffer;
+    const window = this.scanWindow;
+    this.scanKeys = new Uint32Array(buffer, wasm.scan_keys_ptr(), window);
+    this.scanValsLo = new Uint32Array(buffer, wasm.scan_vals_lo_ptr(), window);
+    this.scanValsHi = new Uint32Array(buffer, wasm.scan_vals_hi_ptr(), window);
+
     this.sizeView = new Uint32Array(buffer, wasm.size_ptr(), 1);
     this.capacityView = new Uint32Array(buffer, wasm.capacity_ptr(), 1);
   }
@@ -538,6 +598,38 @@ export class SwissU32ToU64 {
       "reserve",
       "SwissU32ToU64",
     );
+  }
+
+  /**
+   * Releases the module instance backing this table.
+   *
+   * One table is one instance, and an instance reserves its whole capacity
+   * of linear memory up front — 29 MiB by default — which nothing can
+   * reclaim while the instance is reachable. Dropping the last reference to
+   * the table lets the collector take it eventually; this is how to make
+   * "eventually" now, which is what a process building a table per request
+   * or per document needs.
+   *
+   * Idempotent. Afterwards {@link SwissU32ToU64.size} and
+   * {@link SwissU32ToU64.capacity} read 0, and every method that would touch
+   * the instance throws rather than reading through one that was handed
+   * back. {@link SwissU32ToU64.maxBatch} keeps answering: it describes the
+   * compiled module, not the table.
+   *
+   * An iterator opened before the call is not affected: it holds the exports
+   * and the staging views it started with, so it keeps walking the instance
+   * and keeps it alive until the walk ends. Finish or abandon a walk before
+   * disposing the table it is walking.
+   */
+  dispose(): void {
+    this.wasm = disposedExports(REQUIRED_U64_EXPORTS, "SwissU32ToU64");
+    this.scratch.release();
+    this.scanKeys = DISPOSED_STAGING;
+    this.scanValsLo = DISPOSED_STAGING;
+    this.scanValsHi = DISPOSED_STAGING;
+    this.lastValue = DISPOSED_COUNTER;
+    this.sizeView = DISPOSED_COUNTER;
+    this.capacityView = DISPOSED_COUNTER;
   }
 
   /**
@@ -688,6 +780,8 @@ export class SwissU32ToU64 {
     valsLo: BulkU32Source,
     valsHi: BulkU32Source,
   ): void {
+    this.assertLive();
+
     const total = bulkLength(keys, "keys");
 
     if (
@@ -750,6 +844,8 @@ export class SwissU32ToU64 {
    *   mixture of this batch's results and the last one's.
    */
   getMany(keys: BulkU32Source, out?: BulkGetResult): BulkGetResult {
+    this.assertLive();
+
     const total = bulkLength(keys, "keys");
 
     const valsLo = out?.valsLo ?? new Uint32Array(total);
@@ -811,6 +907,8 @@ export class SwissU32ToU64 {
    *   removed, whatever the element's position.
    */
   deleteMany(keys: BulkU32Source): BulkDeleteResult {
+    this.assertLive();
+
     const total = bulkLength(keys, "keys");
     const deleted = new Uint8Array(total);
     let removedCount = 0;
@@ -846,12 +944,29 @@ export class SwissU32ToU64 {
     return { deleted, removedCount };
   }
 
+  /**
+   * Rejects a bulk call on a disposed table before it stages anything.
+   *
+   * The single-key methods reach the swapped exports object on their first
+   * crossing, so they report dispose by themselves. A bulk call stages into
+   * the module's buffers first, and those views are dropped by dispose — a
+   * typed-array source would fail inside the copy with a message about
+   * buffer offsets, and an empty batch would never cross at all.
+   *
+   * @throws {Error} If {@link SwissU32ToU64.dispose} has been called.
+   */
+  private assertLive(): void {
+    if (this.scratch.released) throw disposedError("SwissU32ToU64");
+  }
+
   /** The scan state an iterator needs, bundled without exposing it. */
   private scanSource(): SwissU64Scan {
     return {
       wasm: this.wasm,
       scanWindow: this.scanWindow,
-      scratch: this.scratch,
+      scanKeys: this.scanKeys,
+      scanValsLo: this.scanValsLo,
+      scanValsHi: this.scanValsHi,
     };
   }
 
@@ -861,9 +976,9 @@ export class SwissU32ToU64 {
    */
   private entryScan(): ColumnScan {
     return scanColumns(this.wasm, this.scanWindow, [
-      this.scratch.keys,
-      this.scratch.valsLo,
-      this.scratch.valsHi,
+      this.scanKeys,
+      this.scanValsLo,
+      this.scanValsHi,
     ]);
   }
 
@@ -1004,4 +1119,13 @@ export class SwissU32ToU64 {
       }
     }
   }
+}
+
+/*
+ * `using` needs Symbol.dispose, which the oldest Node the package supports
+ * predates. Attaching it conditionally keeps the class loadable there while
+ * still giving newer runtimes the block-scoped form.
+ */
+if (typeof Symbol.dispose === "symbol") {
+  SwissU32ToU64.prototype[Symbol.dispose] = SwissU32ToU64.prototype.dispose;
 }

@@ -1,0 +1,181 @@
+import { describe, expect, test } from "bun:test";
+
+import { SwissU32ToU32, SwissU32ToU64 } from "../src/index.ts";
+
+/**
+ * Catastrophic-regression gate, not a benchmark.
+ *
+ * The point of the package is that a table beats `Map` on these workloads.
+ * Nothing else in the suite would notice if a change made it ten times
+ * slower while staying correct — `bun run bench` measures that, but nobody
+ * runs it on a pull request.
+ *
+ * Every assertion is a ratio against `Map` measured in the same process, so
+ * a slow or contended machine moves both contenders together and the ratio
+ * holds. The floors sit far below the measured margins (8.8x, 5.6x and 6.4x
+ * on Bun; 3.5x, 5.0x and 5.4x on the slowest engine measured) precisely so
+ * that ordinary noise cannot reach them. A failure here means something
+ * structural broke — a per-key boundary crossing on a bulk path, a lost
+ * pre-size, an accidental copy — not that the machine was busy.
+ *
+ * The ratio tests still need a machine whose timings mean something. Hosted
+ * macOS and Windows runners are co-tenanted virtual machines whose noise is
+ * not symmetric between contenders, so on CI they run on Linux only; a red
+ * build there is a real regression rather than a busy host. Everywhere else,
+ * including every local run on any platform, they always run.
+ */
+const RATIOS_ARE_MEANINGFUL =
+  process.env.CI === undefined || process.platform === "linux";
+
+const ENTRIES = 50_000;
+
+/** Rounds per contender; the median is compared. */
+const ROUNDS = 5;
+
+/**
+ * Untimed rounds run before the clock starts.
+ *
+ * The table's set path needs several passes over 50,000 keys before the
+ * engine tiers it up, and a single warm-up leaves the first timed rounds
+ * running at roughly twice the steady-state cost — enough to push the
+ * ratio under {@link FLOOR} on a floor the steady state clears fivefold.
+ */
+const WARMUP_ROUNDS = 5;
+
+/** How far below the measured margin a run may fall before it is a bug. */
+const FLOOR = 2.0;
+
+/** Sparse keys, which is the distribution the package is built for. */
+const KEYS = new Uint32Array(ENTRIES);
+for (let i = 0; i < ENTRIES; i += 1) KEYS[i] = (i * 2_654_435_761) >>> 0;
+
+const VALUES = new Uint32Array(ENTRIES);
+for (let i = 0; i < ENTRIES; i += 1) VALUES[i] = i;
+
+/** One contender: `setup` restores the state `run` consumes, untimed. */
+interface Contender {
+  setup?: () => void;
+  run: () => void;
+}
+
+/**
+ * Median nanoseconds per operation over {@link ROUNDS} rounds.
+ *
+ * `setup` runs before each round but outside the clock, so a workload that
+ * consumes its own input — deleting every key — measures the operation
+ * rather than the refill, and both contenders start each round alike.
+ */
+function median({ setup, run }: Contender): number {
+  for (let round = 0; round < WARMUP_ROUNDS; round += 1) {
+    setup?.();
+    run();
+  }
+
+  const timings: number[] = [];
+  for (let round = 0; round < ROUNDS; round += 1) {
+    setup?.();
+    const started = Bun.nanoseconds();
+    run();
+    timings.push((Bun.nanoseconds() - started) / ENTRIES);
+  }
+
+  timings.sort((a, b) => a - b);
+  return timings[timings.length >> 1]!;
+}
+
+/** Asserts the table beats `Map` by at least {@link FLOOR}. */
+function expectFaster(label: string, table: Contender, map: Contender): void {
+  const speedup = median(map) / median(table);
+  expect(`${label} ${speedup >= FLOOR}`).toBe(`${label} true`);
+}
+
+describe("performance guard", () => {
+  test.if(RATIOS_ARE_MEANINGFUL)("fills a pre-sized table faster than Map", async () => {
+    const table = await SwissU32ToU32.create(ENTRIES);
+
+    expectFaster(
+      "fill",
+      {
+        setup: () => table.clear(),
+        run: () => {
+          for (let i = 0; i < ENTRIES; i += 1) table.set(KEYS[i]!, VALUES[i]!);
+        },
+      },
+      {
+        run: () => {
+          const map = new Map<number, number>();
+          for (let i = 0; i < ENTRIES; i += 1) map.set(KEYS[i]!, VALUES[i]!);
+        },
+      },
+    );
+  });
+
+  test.if(RATIOS_ARE_MEANINGFUL)("deletes faster than Map", async () => {
+    const table = await SwissU32ToU32.create(ENTRIES);
+    let reference = new Map<number, number>();
+
+    expectFaster(
+      "delete",
+      {
+        // A fresh table, not a refill: deleting every key leaves the slots
+        // tombstoned, and refilling over them would time a rehash instead.
+        setup: () => {
+          table.clear();
+          for (let i = 0; i < ENTRIES; i += 1) table.set(KEYS[i]!, VALUES[i]!);
+        },
+        run: () => {
+          for (let i = 0; i < ENTRIES; i += 1) table.delete(KEYS[i]!);
+        },
+      },
+      {
+        setup: () => {
+          reference = new Map<number, number>();
+          for (let i = 0; i < ENTRIES; i += 1) {
+            reference.set(KEYS[i]!, VALUES[i]!);
+          }
+        },
+        run: () => {
+          for (let i = 0; i < ENTRIES; i += 1) reference.delete(KEYS[i]!);
+        },
+      },
+    );
+  });
+
+  const widestMargin = "bulk-fills faster than Map, which is the widest margin";
+  test.if(RATIOS_ARE_MEANINGFUL)(widestMargin, async () => {
+    const table = await SwissU32ToU64.create(ENTRIES);
+    const lanes = new Uint32Array(ENTRIES);
+
+    expectFaster(
+      "setMany",
+      {
+        setup: () => table.clear(),
+        run: () => table.setMany(KEYS, VALUES, lanes),
+      },
+      {
+        run: () => {
+          const map = new Map<number, { lo: number; hi: number }>();
+          for (let i = 0; i < ENTRIES; i += 1) {
+            map.set(KEYS[i]!, { lo: VALUES[i]!, hi: 0 });
+          }
+        },
+      },
+    );
+  });
+
+  test("walks the whole table in a bounded number of crossings", async () => {
+    // Deterministic, unlike the ratios above: a walk reads one window of
+    // slots per crossing, so a change that reverted it to one crossing per
+    // entry fails here whatever the machine is doing.
+    const table = await SwissU32ToU32.create(ENTRIES);
+    for (let i = 0; i < ENTRIES; i += 1) table.set(KEYS[i]!, VALUES[i]!);
+
+    let seen = 0;
+    table.forEach(() => {
+      seen += 1;
+    });
+
+    expect(seen).toBe(ENTRIES);
+    expect(table.capacity).toBeLessThanOrEqual(1 << 17);
+  });
+});

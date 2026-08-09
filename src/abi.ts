@@ -48,6 +48,19 @@ export const STATUS_INVALID_ARGUMENT = -3;
 export const DELETE_MANY_FAILED = -1;
 
 /**
+ * What a bulk removal reports back.
+ *
+ * Shared by both tables: a removal rewrites a control byte and touches no
+ * payload, so the result has the same shape whatever the value width.
+ */
+export interface BulkDeleteResult {
+  /** 1 where the key was present and removed, 0 where it was absent. */
+  deleted: Uint8Array;
+  /** Total number of keys actually removed. */
+  removedCount: number;
+}
+
+/**
  * The exports {@link scanWindows} drives. Both modules provide them.
  *
  * @internal

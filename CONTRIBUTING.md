@@ -81,7 +81,7 @@ bun run build      # both steps below
 bun run build:wasm # native/*.c -> dist/wasm/*.wasm + src/generated/*.ts
 bun run build:js   # src/*.ts   -> dist/js/*.js + .d.ts
 
-bun test           # 213 tests across 21 suites
+bun test           # 246 tests across 24 suites
 bun run typecheck  # tsc --noEmit
 bun run check:ubsan  # rebuild with UBSan trapping and exercise every path
 bun run smoke      # the built package under plain Node

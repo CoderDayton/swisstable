@@ -18,8 +18,10 @@ Initial release.
   WebAssembly linear memory. Keys, values, control bytes, and probing never
   cross the JavaScript boundary, so a lookup costs one WASM call.
 - Control bytes matched sixteen at a time with `wasm_simd128`.
-- Bulk `setMany`, `getMany`, and `deleteMany` on `SwissU32ToU64`, crossing
-  once per batch rather than once per key.
+- Bulk `setMany`, `getMany`, and `deleteMany` on both tables, crossing once
+  per batch rather than once per key.
+- `getOrInsert` and `increment` on both tables, doing a read-modify-write in
+  one crossing and one probe.
 - `keys`, `values`, `entries`, `forEach`, and `for…of`. A rehash during a
   walk is detected and throws rather than silently skipping or repeating
   entries.
@@ -28,6 +30,8 @@ Initial release.
   `O(capacity)`.
 - `dispose()`, and `Symbol.dispose` where the runtime has it, so an
   instance's linear memory is released without waiting for the collector.
+- `loadSync` and `loadSyncWithSeed`, building a table from an
+  already-compiled `WebAssembly.Module` without awaiting.
 
 ### String keys
 
@@ -40,8 +44,8 @@ Initial release.
 - Every table seeds its hash from the runtime's CSPRNG, so the set of keys
   sharing a probe group differs between instances and between processes and
   cannot be computed offline.
-- `createWithSeed` and `loadWithSeed` fix the seed for reproducible tests,
-  benchmarks, and builds. Not for untrusted input — see
+- `createWithSeed`, `loadWithSeed`, and `loadSyncWithSeed` fix the seed for
+  reproducible tests, benchmarks, and builds. Not for untrusted input — see
   [SECURITY.md](SECURITY.md).
 
 ### Packaging

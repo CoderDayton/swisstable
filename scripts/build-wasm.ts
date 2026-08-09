@@ -47,7 +47,7 @@ const PAGE = 64 * 1024;
  * whole budget per table.
  *
  * Lower it with SWISS_MAX_CAPACITY_LOG2 to build modules for that case:
- * 2^16 slots costs a little over 1 MiB per u32 instance instead of 20, at
+ * 2^16 slots costs about 4 MiB per u32 instance instead of 21, at
  * the price of a table that cannot exceed 57,344 entries.
  */
 const DEFAULT_MAX_CAPACITY_LOG2 = 20;
@@ -152,8 +152,9 @@ const TARGETS: readonly WasmTarget[] = [
     source: "swiss_u32.c",
     // 2 banks x (1 control byte + an 8-byte Entry) per slot: 18 MiB at 2^20.
     bankBytesPerSlot: 2 * (1 + 8),
-    // 0.5 MiB of scan staging buffers, plus stack and section headroom.
-    overheadBytes: 2 * MIB,
+    // ~1.1 MiB of staging buffers — bulk and scan hold separate arrays —
+    // plus stack and section headroom.
+    overheadBytes: 3 * MIB,
     exports: [
       "set_seed",
       "init",
@@ -164,7 +165,16 @@ const TARGETS: readonly WasmTarget[] = [
       "has_get",
       "last_value_ptr",
       "set",
+      "get_or_insert",
+      "increment",
       "delete_key",
+      "set_many",
+      "get_many",
+      "delete_many",
+      "bulk_capacity",
+      "bulk_keys_ptr",
+      "bulk_values_ptr",
+      "bulk_flags_ptr",
       "scan",
       "scan_window",
       "scan_keys_ptr",
@@ -194,6 +204,8 @@ const TARGETS: readonly WasmTarget[] = [
       "has_get",
       "last_value_ptr",
       "set",
+      "get_or_insert",
+      "increment",
       "delete_key",
       "set_many",
       "get_many",

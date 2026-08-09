@@ -539,12 +539,29 @@ static int32_t ensure_insert_space(void) {
  * whatever the slot last held — the caller stores them next. Any other
  * status means the table is unchanged.
  *
+ * *inserted_out distinguishes those two cases, which is what lets
+ * get_or_insert() and increment() decide whether to keep the stored payload
+ * or write a fresh one without probing a second time. Reporting it here
+ * rather than re-looking-up costs nothing: both paths already know which
+ * branch they took.
+ *
  * The existence check runs first, before any growth decision: overwriting a
  * key already in the table consumes no slot, so it must succeed even on a
  * table sitting at MAX_CAPACITY, and must not trigger a rehash merely
  * because growth ran out.
+ *
+ * always_inline is load bearing, not a hint. Every caller of this is a hot
+ * exported path, and clang stops inlining it once there is more than one —
+ * which set(), get_or_insert(), increment() and set_many() all are. Letting
+ * it become a shared out-of-line call costs 10% on a pre-sized fill on both
+ * JavaScriptCore and V8, measured by adding a second caller to an otherwise
+ * unchanged module. Callers that only need the slot go through upsert_slot
+ * below, whose `inserted` local is dead after inlining and folds away.
  */
-static int32_t upsert_slot(uint32_t key, uint32_t *slot_out) {
+__attribute__((always_inline))
+static inline int32_t upsert_slot_tracked(
+  uint32_t key, uint32_t *slot_out, uint32_t *inserted_out
+) {
   const uint32_t hash = mix_u32(key);
 
   if (g_capacity != 0) {
@@ -552,6 +569,7 @@ static int32_t upsert_slot(uint32_t key, uint32_t *slot_out) {
 
     if (existing != UINT32_MAX) {
       *slot_out = existing;
+      *inserted_out = 0;
       return STATUS_OK;
     }
   }
@@ -578,7 +596,19 @@ static int32_t upsert_slot(uint32_t key, uint32_t *slot_out) {
   g_size++;
 
   *slot_out = slot;
+  *inserted_out = 1;
   return STATUS_OK;
+}
+
+/*
+ * upsert_slot_tracked() for the callers that only store a payload and do
+ * not care which branch ran. The local is dead in the caller after
+ * inlining, so this costs nothing over writing the flag nowhere.
+ */
+__attribute__((always_inline))
+static inline int32_t upsert_slot(uint32_t key, uint32_t *slot_out) {
+  uint32_t inserted;
+  return upsert_slot_tracked(key, slot_out, &inserted);
 }
 
 /* ── Shared exported API ───────────────────────────────────────────── */
@@ -812,3 +842,127 @@ int32_t scan(uint32_t cursor) {
 
   return (int32_t)count;
 }
+
+
+/* ── Bulk API scaffolding ──────────────────────────────────────────── */
+
+#ifdef BULK_CAPACITY
+
+/*
+ * Everything the bulk API needs that does not depend on the payload shape:
+ * the key and flag staging buffers, the argument checks, and delete_many(),
+ * which touches only keys and control bytes and so is identical in both
+ * modules. Each .c supplies its own value buffers, set_many(), get_many(),
+ * and the accessors for the value lanes it happens to have.
+ *
+ * A module opts in by defining BULK_CAPACITY before including this header.
+ */
+
+/*
+ * delete_many() reports how many keys it removed, so it has no room for a
+ * negative status. A removal count can never exceed BULK_CAPACITY, which
+ * makes UINT32_MAX unambiguous as a failure sentinel.
+ */
+#define DELETE_MANY_FAILED 0xffffffffu
+
+/*
+ * Staging buffers for the bulk API.
+ *
+ * Owned by the module so their addresses are assigned by the linker rather
+ * than hardcoded by the caller: the JS side reads bulk_capacity() and the
+ * bulk_*_ptr() accessors and builds its views from those. An earlier
+ * revision picked the offsets caller-side and silently aliased the banks.
+ *
+ * Deliberately separate from the scan buffers. Sharing them would cost
+ * nothing in memory and would be correct for the shipped binding, which
+ * copies each window out before it issues anything else. It would still be
+ * wrong: an exported function is reachable by every holder of the instance,
+ * and a caller that staged a bulk batch, walked the table, then issued the
+ * batch would read the walk's entries back as its own arguments — wrong
+ * values, no trap, nothing in the data to show it. Separate arrays make
+ * that unrepresentable rather than merely documented.
+ */
+static uint32_t g_bulk_keys[BULK_CAPACITY];
+static uint8_t  g_bulk_flags[BULK_CAPACITY];
+
+/*
+ * True when `ptr` is the address of the staging buffer it is meant to be.
+ *
+ * The bulk exports take addresses, which makes every one of them a write
+ * primitive aimed anywhere in linear memory unless it is checked. There is
+ * no range to check against: the only legitimate value for each argument is
+ * the single buffer it names, whose address the caller obtained from this
+ * module in the first place. So the test is equality, not containment.
+ *
+ * This has to live here rather than in the JavaScript binding. The binding
+ * is one caller among however many hold the instance, and an exported
+ * function is reachable by all of them.
+ */
+static inline uint32_t is_bulk_ptr(uint32_t ptr, const void *buffer) {
+  return ptr == (uint32_t)(uintptr_t)buffer;
+}
+
+/* True when a bulk batch fits the staging buffers. */
+static inline uint32_t bulk_count_ok(uint32_t count) {
+  return count <= BULK_CAPACITY;
+}
+
+/*
+ * Removes `count` keys staged at keys_ptr.
+ *
+ * Writes deleted_ptr[i] = 1 if the key was present and removed, else 0.
+ * deleted_ptr addresses a u8[count]. Returns the number removed, which is
+ * the number of 1s written.
+ *
+ * Payload-independent — a removal only rewrites a control byte — so this is
+ * shared rather than duplicated per module.
+ */
+__attribute__((export_name("delete_many")))
+uint32_t delete_many(
+  uint32_t keys_ptr,
+  uint32_t deleted_ptr,
+  uint32_t count
+) {
+  if (
+    !bulk_count_ok(count) ||
+    !is_bulk_ptr(keys_ptr, g_bulk_keys) ||
+    !is_bulk_ptr(deleted_ptr, g_bulk_flags)
+  ) {
+    return DELETE_MANY_FAILED;
+  }
+
+  const uint32_t *keys = (const uint32_t *)(uintptr_t)keys_ptr;
+  uint8_t *deleted = (uint8_t *)(uintptr_t)deleted_ptr;
+  uint32_t removed = 0;
+
+  for (uint32_t i = 0; i < count; i++) {
+    const uint32_t slot = lookup_slot(keys[i]);
+
+    if (slot == UINT32_MAX) {
+      deleted[i] = 0;
+      continue;
+    }
+
+    g_ctrl[g_active_bank][slot] = CTRL_DELETED;
+    g_size--;
+    deleted[i] = 1;
+    removed++;
+  }
+
+  return removed;
+}
+
+/* Maximum keys the staging buffers hold; larger batches must be chunked. */
+__attribute__((export_name("bulk_capacity")))
+uint32_t bulk_capacity(void) { return BULK_CAPACITY; }
+
+/* Addresses of the shared staging buffers. Constant for the module's life. */
+
+__attribute__((export_name("bulk_keys_ptr")))
+uint32_t bulk_keys_ptr(void) { return (uint32_t)(uintptr_t)g_bulk_keys; }
+
+/* Doubles as the delete_many() output buffer; only one is live at a time. */
+__attribute__((export_name("bulk_flags_ptr")))
+uint32_t bulk_flags_ptr(void) { return (uint32_t)(uintptr_t)g_bulk_flags; }
+
+#endif /* BULK_CAPACITY */

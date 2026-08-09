@@ -58,7 +58,7 @@
           {
             "entries": 2000,
             "runtime": "Bun 1.3",
-            "speedup": 0.67
+            "speedup": 0.68
           },
           {
             "entries": 2000,
@@ -68,7 +68,7 @@
           {
             "entries": 2000,
             "runtime": "Deno 2.9",
-            "speedup": 1.1
+            "speedup": 1.12
           },
           {
             "entries": 2000,
@@ -78,92 +78,92 @@
           {
             "entries": 2000,
             "runtime": "Firefox 153",
-            "speedup": 0.32
+            "speedup": 0.33
           },
           {
             "entries": 8000,
             "runtime": "Bun 1.3",
-            "speedup": 0.91
+            "speedup": 0.94
           },
           {
             "entries": 8000,
             "runtime": "Node 24",
+            "speedup": 1.81
+          },
+          {
+            "entries": 8000,
+            "runtime": "Deno 2.9",
+            "speedup": 2.92
+          },
+          {
+            "entries": 8000,
+            "runtime": "Chrome 151",
+            "speedup": 2.4
+          },
+          {
+            "entries": 8000,
+            "runtime": "Firefox 153",
+            "speedup": 1.71
+          },
+          {
+            "entries": 16000,
+            "runtime": "Bun 1.3",
+            "speedup": 1.41
+          },
+          {
+            "entries": 16000,
+            "runtime": "Node 24",
+            "speedup": 3.07
+          },
+          {
+            "entries": 16000,
+            "runtime": "Deno 2.9",
+            "speedup": 3.3
+          },
+          {
+            "entries": 16000,
+            "runtime": "Chrome 151",
+            "speedup": 2.56
+          },
+          {
+            "entries": 16000,
+            "runtime": "Firefox 153",
             "speedup": 1.84
           },
           {
-            "entries": 8000,
-            "runtime": "Deno 2.9",
-            "speedup": 2.93
-          },
-          {
-            "entries": 8000,
-            "runtime": "Chrome 151",
-            "speedup": 2.41
-          },
-          {
-            "entries": 8000,
-            "runtime": "Firefox 153",
-            "speedup": 1.72
-          },
-          {
-            "entries": 16000,
-            "runtime": "Bun 1.3",
-            "speedup": 1.44
-          },
-          {
-            "entries": 16000,
-            "runtime": "Node 24",
-            "speedup": 3.11
-          },
-          {
-            "entries": 16000,
-            "runtime": "Deno 2.9",
-            "speedup": 3.33
-          },
-          {
-            "entries": 16000,
-            "runtime": "Chrome 151",
-            "speedup": 2.72
-          },
-          {
-            "entries": 16000,
-            "runtime": "Firefox 153",
-            "speedup": 1.87
-          },
-          {
             "entries": 32000,
             "runtime": "Bun 1.3",
-            "speedup": 1.29
+            "speedup": 1.27
           },
           {
             "entries": 32000,
             "runtime": "Node 24",
-            "speedup": 3.18
+            "speedup": 3.19
           },
           {
             "entries": 32000,
             "runtime": "Deno 2.9",
-            "speedup": 3.45
+            "speedup": 3.42
           },
           {
             "entries": 32000,
             "runtime": "Chrome 151",
-            "speedup": 2.84
+            "speedup": 2.83
           },
           {
             "entries": 32000,
             "runtime": "Firefox 153",
-            "speedup": 1.91
+            "speedup": 1.94
           },
           {
             "entries": 128000,
             "runtime": "Bun 1.3",
-            "speedup": 1.55
+            "speedup": 1.53
           },
           {
             "entries": 128000,
             "runtime": "Node 24",
-            "speedup": 3.05
+            "speedup": 3.04
           },
           {
             "entries": 128000,
@@ -173,7 +173,7 @@
           {
             "entries": 128000,
             "runtime": "Chrome 151",
-            "speedup": 2.92
+            "speedup": 2.93
           },
           {
             "entries": 128000,
@@ -183,27 +183,27 @@
           {
             "entries": 512000,
             "runtime": "Bun 1.3",
-            "speedup": 1.52
+            "speedup": 1.39
           },
           {
             "entries": 512000,
             "runtime": "Node 24",
-            "speedup": 2.83
+            "speedup": 2.68
           },
           {
             "entries": 512000,
             "runtime": "Deno 2.9",
-            "speedup": 3.31
+            "speedup": 3.14
           },
           {
             "entries": 512000,
             "runtime": "Chrome 151",
-            "speedup": 2.77
+            "speedup": 2.58
           },
           {
             "entries": 512000,
             "runtime": "Firefox 153",
-            "speedup": 1.76
+            "speedup": 1.78
           }
         ]
       },

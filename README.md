@@ -31,13 +31,16 @@ Docs: [API](docs/api.md) · [Design](docs/design.md) ·
 - One byte of metadata per slot, compared sixteen at a time with `wasm_simd128`.
 - 10.3 bytes per entry at full occupancy, 20.6 with the standby bank a rehash
   needs, against a measured 37 for `Map` on V8 and 67 on JavaScriptCore.
-- An instance reserves 20 MiB (u32) or 29 MiB (u64) up front and commits it
+- An instance reserves 21 MiB (u32) or 29 MiB (u64) up front and commits it
   by page: an empty table costs 1.7 MiB RSS, each further one about 50 KiB.
   Lower `SWISS_MAX_CAPACITY_LOG2` for many small tables — see
   [Footprint](docs/design.md#footprint). `dispose()`, or a `using`
   declaration, hands an instance back without waiting for the collector.
-- Bulk `setMany`/`getMany`/`deleteMany` cross once per batch: 7.3–8.7 ns/op
-  against `Map`'s 47–71 on a 100,000-entry u64 fill.
+- Bulk `setMany`/`getMany`/`deleteMany` on both tables cross once per batch:
+  a 100,000-entry u32 fill is 6.2–6.7 ns/op against `Map`'s 44–65, and the
+  matching lookup 4.1–4.7 against 10–22.
+- `getOrInsert` and `increment` do a read-modify-write in one crossing and
+  one probe: counting is 1.25–1.8x faster than `get` plus `set`.
 - No allocator — fixed linear memory, linked `-nostdlib`, never calls
   `memory.grow`, nothing allocated on a hot path.
 - Ships compiled ESM with type declarations, and the modules are compiled in:
@@ -68,7 +71,8 @@ table.get(0xdead_beef); // 42
 sharing it across every table. To control loading yourself — streaming
 compilation, a module shared across workers, a custom asset path — use
 `load(bytes)` instead; the `.wasm` files are also exposed as package
-subpaths.
+subpaths. `loadSync(module)` builds a table from an already-compiled module
+without awaiting, for the places that cannot.
 
 Four exports:
 
@@ -113,18 +117,22 @@ its own, probed in a shuffled order. i9-13900K on x64 Linux.
 
 | Workload | Bun 1.3 | Node 24 | Deno 2.9 | Chrome 151 | Firefox 153 |
 | --- | --- | --- | --- | --- | --- |
-| fill (pre-sized) | 8.5x | 6.4x | 6.0x | 4.3x | 5.2x |
-| lookup hit | 1.57x | 2.9x | 3.2x | 2.6x | 1.78x |
-| lookup miss | 1.41x | 3.3x | 3.5x | 2.6x | 1.76x |
-| `has` | 1.82x | 3.3x | 3.6x | 3.1x | 2.0x |
-| overwrite existing key | 2.3x | 2.7x | 2.9x | 2.8x | 3.3x |
-| delete | 5.5x | 5.5x | 5.5x | 4.1x | 4.3x |
-| churn (delete + reinsert) | 3.2x | 3.6x | 3.7x | 2.9x | 3.2x |
-| u64 bulk fill (`setMany`) | 6.4x | 8.2x | 7.7x | 6.2x | 8.8x |
-| u64 bulk lookup (`getMany`) | 1.65x | 3.8x | 3.6x | 3.3x | 2.4x |
+| fill (pre-sized) | 8.3x | 6.4x | 5.6x | 4.2x | 5.2x |
+| lookup hit | 1.60x | 2.8x | 3.2x | 2.6x | 1.79x |
+| lookup miss | 1.38x | 3.3x | 3.4x | 2.6x | 1.73x |
+| `has` | 1.84x | 3.4x | 3.6x | 3.1x | 1.98x |
+| overwrite existing key | 2.3x | 2.7x | 2.9x | 2.7x | 3.2x |
+| delete | 5.6x | 5.5x | 5.4x | 4.3x | 4.3x |
+| churn (delete + reinsert) | 3.2x | 3.6x | 3.5x | 2.9x | 3.2x |
+| count (`increment`) | 1.41x | 1.39x | 1.47x | 1.49x | 0.96x |
+| u32 bulk fill (`setMany`) | 9.8x | 9.6x | 8.0x | 6.6x | 8.6x |
+| u32 bulk lookup (`getMany`) | 2.4x | 5.4x | 4.8x | 5.0x | 3.8x |
+| u64 bulk fill (`setMany`) | 6.0x | 8.0x | 6.9x | 6.2x | 9.1x |
+| u64 bulk lookup (`getMany`) | 1.56x | 3.8x | 3.7x | 3.2x | 2.3x |
 
 The table costs about the same on every engine. The columns differ because
-`Map` does.
+`Map` does. Counting is the one row a browser engine takes: at 1,000 distinct
+keys `Map` stays in cache, and the crossing is most of the budget.
 
 Reproduce with `bun run build && bun run bench`, or `bun run bench:all` for
 every runtime installed. Absolute figures, the cost model, the crossover by
@@ -142,7 +150,7 @@ same form, and records the engine, CPU, and clock each column was taken on.
 bun install
 bun run hooks      # lefthook pre-commit and pre-push gates
 bun run build      # compile native/*.c to dist/wasm/*.wasm
-bun test           # 213 tests across 21 suites
+bun test           # 246 tests across 24 suites
 bun run typecheck
 bun run smoke      # the built package under plain Node
 bun run smoke:browser  # the built package in Chrome or Firefox

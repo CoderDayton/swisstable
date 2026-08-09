@@ -60,8 +60,8 @@ still a 32-bit integer, so it would pass validation and address the wrong key
 anything beyond is a `RangeError`. Use `Float64Array` for large keys.
 
 A batch longer than `maxBatch` is chunked, but a rejected element still
-applies nothing: `setMany` and `deleteMany` validate a multi-chunk batch
-before the first call. A capacity ceiling is the one failure that is not
+applies nothing: `setMany`, `getMany`, and `deleteMany` validate a multi-chunk
+batch before the first call. A capacity ceiling is the one failure that is not
 atomic — `setMany` keeps the chunks that preceded it, the same way the module
 reports a ceiling hit partway through a single chunk.
 
@@ -81,7 +81,7 @@ move it either way; the build script sizes linear memory from the same
 number.
 
 **Each module instance owns exactly one table, and reserves its whole budget
-up front.** The banks are static arrays, so an instance reserves 20 MiB (u32)
+up front.** The banks are static arrays, so an instance reserves 21 MiB (u32)
 or 29 MiB (u64) of linear memory from instantiation whether it holds one
 entry or its maximum. The reservation is address space and is committed page
 by page as the table touches it, so a small table still resides small — but
@@ -92,8 +92,8 @@ once with `WebAssembly.compile` and pass the module in each time. Several
 instances alongside each other are shown in
 [`examples/04-multiple-tables.ts`](../examples/04-multiple-tables.ts). For
 many small tables, build a second pair of modules with a lower
-`SWISS_MAX_CAPACITY_LOG2`: at `2^16` a u32 instance costs 3.1 MiB instead of
-20, capped at 57,344 entries.
+`SWISS_MAX_CAPACITY_LOG2`: at `2^16` a u32 instance costs 4.1 MiB instead of
+21, capped at 57,344 entries.
 
 **Dropping a table does not release it promptly.** Its memory belongs to the
 `WebAssembly.Instance` behind it and comes back when the garbage collector
@@ -221,12 +221,42 @@ const forward = await SwissU32ToU32.load(module, 1_000);
 const reverse = await SwissU32ToU32.load(module, 1_000);
 ```
 
+### `static loadSync(module, expectedEntries?)`
+
+```ts
+static loadSync(
+  module: WebAssembly.Module,
+  expectedEntries?: number,
+): SwissU32ToU32
+```
+
+The same table without a promise, for a class field, a getter, or anywhere
+else that cannot `await`. It takes a compiled module only: bytes would have
+to be compiled synchronously, which is the cost the asynchronous API exists
+to avoid.
+
+```ts
+const module = await WebAssembly.compile(wasm);   // once, at startup
+
+class Index {
+  private readonly ids = SwissU32ToU32.loadSync(module, 10_000);
+}
+```
+
+The seed comes from the global `crypto`, so this needs Node 19+, or any
+browser, Deno, or Bun. The `node:crypto` fallback the async loaders use sits
+behind a dynamic `import` and cannot be reached synchronously; on Node 16.9
+to 18 use `load`, or `loadSyncWithSeed(module, expectedEntries, seed)`,
+which needs no random source at all and carries the same fixed-seed warning
+as `createWithSeed`.
+
 ### Accessors
 
 | Member | Returns | Notes |
 | --- | --- | --- |
 | `size` | `number` | Live entries, excluding tombstones. Read out of linear memory rather than called, so it is as cheap as a local — safe in a loop condition. |
 | `capacity` | `number` | Allocated slots, always a power of two. The table rehashes at 7/8 of this. Read the same way as `size`. |
+| `maxBatch` | `number` | Keys one bulk call carries. Longer batches chunk automatically; sizing batches to this avoids the extra copy. |
 
 ### Methods
 
@@ -235,7 +265,75 @@ const reverse = await SwissU32ToU32.load(module, 1_000);
 | `has(key)` | `boolean` | Prefer `get` when you also want the value — it costs the same single crossing. |
 | `get(key)` | `number \| undefined` | One boundary crossing; the value is read from a cached view over linear memory. |
 | `set(key, value)` | `this` | Inserts or overwrites. Overwriting works even at the capacity ceiling. |
+| `getOrInsert(key, value)` | `number` | The value now stored: the existing one, or `value` if the key was absent. |
+| `increment(key, delta?)` | `number` | Adds `delta` (default 1) to the stored value, treating an absent key as 0. Returns the new value. Wraps modulo 2³². |
 | `delete(key)` | `boolean` | `true` if the key was present. Leaves a tombstone, reclaimed by the next rehash. |
+| `setMany(keys, values)` | `void` | Throws `RangeError` if the two arrays differ in length. |
+| `getMany(keys, out?)` | `BulkU32GetResult` | Allocates `{values, found}` sized to `keys.length`, or writes into `out` — pass the previous result back in a loop to make the steady state allocation-free. |
+| `deleteMany(keys)` | `BulkDeleteResult` | Per-key flags plus the total removed. |
+
+### Reading and writing in one crossing
+
+`getOrInsert` and `increment` exist because the obvious spelling costs two
+crossings and two probes for one logical operation:
+
+```ts
+table.set(key, (table.get(key) ?? 0) + 1);   // two of each
+table.increment(key);                        // one of each
+```
+
+`increment` always saves a crossing, because the read and the write are one
+operation whichever way the key falls. Counting 100,000 keys costs 6.1 ns
+each on Bun against 10.7 for `get` plus `set`; the gain is **1.25x to 1.8x**
+depending on the engine.
+
+**`getOrInsert` only saves one when the key is absent.** Written out, the
+second crossing is inside the branch:
+
+```ts
+if (table.get(key) === undefined) table.set(key, value);   // hit: 1, miss: 2
+```
+
+So the gain tracks the miss rate: **1.23x to 1.33x** over keys none of which
+are present, and nothing at all over keys that are all present, where the two
+tie on every engine. Reach for it where misses are common, which is what
+memoizing is; on a read-mostly table `get` is still the right call.
+
+`getOrInsert` is the shape TC39 settled on for `Map.prototype.getOrInsert`.
+There is no callback form, because a callback would have to cross back.
+
+The per-engine figures are in
+[performance.md](performance.md#reading-and-writing-in-one-crossing);
+reproduce with `bun run bench --scenario=upsert`.
+
+### Bulk methods
+
+These stage a whole batch into memory the module owns and cross the boundary
+once per chunk instead of once per key — the widest margin over `Map` in the
+suite. Over 100,000 sparse keys on Bun, `setMany` fills at 6.6 ns/key against
+8.1 for a `set` loop and 65.1 for `Map`; `getMany` reads at 4.2 ns/key
+against 6.6 for a `get` loop and 10.0 for `Map`.
+
+That 4.2 is with an `out` buffer passed back in; allocating fresh result
+arrays each call costs 5.6. Reuse them on a hot loop:
+
+```ts
+table.setMany(keys, values);
+
+const out = table.getMany(batches[0]!);   // allocates once
+for (const batch of batches) {
+  table.getMany(batch, out);              // then writes into it
+  // read out.values / out.found before the next call overwrites them
+}
+```
+
+`out` must be at least as long as the batch, so size it for the longest one;
+only the first `batch.length` elements are written.
+
+Misses in `getMany` are reported through `found`, and their values are
+zeroed, so output buffers never carry stale values from a previous batch.
+`setMany` is **not atomic** on a capacity ceiling — see
+[Rules that apply everywhere](#rules-that-apply-everywhere).
 | `reserve(entries)` | `void` | Grows in place, preserving contents. No-op if the capacity already suffices. |
 | `shrinkToFit()` | `void` | Rehashes down to the smallest capacity holding the live entries. No-op if already there. |
 | `clear()` | `void` | Empties the table but **retains capacity**. Follow with `shrinkToFit()` to hand the slots back. |
@@ -325,15 +423,19 @@ The reassembled value is `(hi × 2³²) + lo`.
 
 ### Everything `SwissU32ToU32` has
 
-`create`, `createWithSeed`, `load`, `loadWithSeed`, `size`, `capacity`,
-`has`, `delete`, `reserve`, `shrinkToFit`, and `clear` behave identically,
-with the four constructors instantiating `swiss_u64.wasm` instead. Only the
-value-carrying methods differ:
+`create`, `createWithSeed`, `load`, `loadWithSeed`, `loadSync`,
+`loadSyncWithSeed`, `size`, `capacity`, `maxBatch`, `has`, `delete`,
+`deleteMany`, `reserve`, `shrinkToFit`, and `clear` behave identically, with
+the six constructors instantiating `swiss_u64.wasm` instead. Only the
+value-carrying methods differ, taking and returning two lanes where the u32
+table takes and returns one:
 
 | Method | Returns |
 | --- | --- |
 | `get(key)` | `U64Lanes \| undefined` — allocates one `{lo, hi}` object per hit |
 | `set(key, lo, hi)` | `this` |
+| `getOrInsert(key, lo, hi)` | `U64Lanes` — the lanes now stored |
+| `increment(key, deltaLo?, deltaHi?)` | `U64Lanes` — adds a 64-bit delta, carrying between lanes, wrapping modulo 2⁶⁴ |
 
 Iteration works the same way, with the same order and mutation rules, except
 that `values()` yields `U64Lanes` and `entries()` yields `[key, lanes]`. The
@@ -347,7 +449,7 @@ value argument, so it must box the two lanes into a `U64Lanes` per entry.
 calls `callback(lo, hi, key, table)` and allocates nothing. When the callback
 discards the lanes the two run at the same speed, because escape analysis
 removes the object; when it keeps them it cannot, and `forEachLanes` is
-faster on every engine — by 10% on Bun, by 2x on Firefox. Prefer it on a hot
+faster on every engine — by 29% on Bun, by 2.2x on Firefox. Prefer it on a hot
 path.
 
 ```ts
@@ -368,16 +470,12 @@ entry, a KV-cache block:
 
 ### Bulk methods
 
-These stage a whole batch into memory the module owns and cross the boundary
-once, instead of once per key. This is the widest margin over `Map` in the
-suite.
+As on the u32 table, with a lane pair in place of the single value:
 
 | Member | Returns | Notes |
 | --- | --- | --- |
-| `maxBatch` | `number` | Keys per WASM call. Longer batches chunk automatically; size batches to this to avoid the extra copy. |
 | `setMany(keys, valsLo, valsHi)` | `void` | Throws `RangeError` if the three arrays differ in length. |
 | `getMany(keys, out?)` | `BulkGetResult` | Allocates result arrays sized to `keys.length`, or writes into `out` (arrays at least that long) — pass the previous result back in a loop to make the steady state allocation-free. |
-| `deleteMany(keys)` | `BulkDeleteResult` | Per-key flags plus the total removed. |
 
 Misses in `getMany` are reported through `found`, and their lanes are zeroed,
 so output buffers never carry stale values from a previous batch.
@@ -609,8 +707,9 @@ u32 and defeat the validation `set` performs at the boundary.
 | `WasmSource` | `ArrayBuffer \| Uint8Array<ArrayBufferLike>` |
 | `U64Lanes` | `{ lo: number; hi: number }` |
 | `Span` | `{ offset: number; length: number }` |
-| `BulkGetResult` | `{ valsLo: Uint32Array; valsHi: Uint32Array; found: Uint8Array }` |
-| `BulkDeleteResult` | `{ deleted: Uint8Array; removedCount: number }` |
+| `BulkU32GetResult` | `{ values: Uint32Array; found: Uint8Array }` — what `SwissU32ToU32.getMany` returns |
+| `BulkGetResult` | `{ valsLo: Uint32Array; valsHi: Uint32Array; found: Uint8Array }` — what `SwissU32ToU64.getMany` returns |
+| `BulkDeleteResult` | `{ deleted: Uint8Array; removedCount: number }` — returned by `deleteMany` on both tables |
 | `NumericKeyTable<V>` | `set`/`get`/`has`/`delete`, plus optional `forEach`/`entries` — the contract `InternedSwissMap` needs |
 | `OwnedStringInterner` | `StringInterner` without `claim`/`release`/`forgetLast` — what `InternedSwissMap.interner` returns |
 | `BulkU32Source` | Any integer typed array, `BigInt64Array`/`BigUint64Array`, `readonly number[]`, or `readonly bigint[]` — what the bulk methods accept, with the per-element rules in [Bulk sources](#bulk-sources) |

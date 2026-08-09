@@ -1,18 +1,28 @@
 import {
+  DELETE_MANY_FAILED,
   DISPOSED_COUNTER,
+  DISPOSED_FLAGS,
   DISPOSED_STAGING,
   ScanIterator,
   asCallback,
   asWasmI32,
   assertStatus,
+  bulkLength,
+  disposedError,
   disposedExports,
+  materializeU32,
   scanColumns,
+  stageU32,
 } from "./abi.ts";
-import type { ScanExports } from "./abi.ts";
+import type {
+  BulkDeleteResult,
+  BulkU32Source,
+  ScanExports,
+} from "./abi.ts";
 import { embeddedModule } from "./embedded.ts";
 import { SWISS_U32_WASM_BASE64 } from "./generated/swiss_u32.ts";
-import { randomSeed } from "./seed.ts";
-import { instantiate } from "./wasm.ts";
+import { randomSeed, randomSeedSync } from "./seed.ts";
+import { instantiate, instantiateSync } from "./wasm.ts";
 import type { WasmSource } from "./wasm.ts";
 
 /**
@@ -46,6 +56,30 @@ export interface SwissU32WasmExports extends ScanExports {
   last_value_ptr(): number;
   /** Inserts or overwrites, returning a status code. */
   set(key: number, value: number): number;
+
+  /** Reads, or inserts then reads; latches at `last_value_ptr`. */
+  get_or_insert(key: number, value: number): number;
+
+  /** Adds a u32 delta, treating an absent key as 0. */
+  increment(key: number, delta: number): number;
+
+  set_many(keysPtr: number, valsPtr: number, count: number): number;
+
+  get_many(
+    keysPtr: number,
+    valsPtr: number,
+    foundPtr: number,
+    count: number,
+  ): number;
+
+  delete_many(keysPtr: number, deletedPtr: number, count: number): number;
+
+  /** Keys the staging buffers hold; larger batches are chunked. */
+  bulk_capacity(): number;
+
+  bulk_keys_ptr(): number;
+  bulk_values_ptr(): number;
+  bulk_flags_ptr(): number;
   /** Removes `key`, returning 1 if it was present. Named to avoid the C keyword. */
   delete_key(key: number): number;
 
@@ -152,7 +186,16 @@ const REQUIRED_U32_EXPORTS = [
   "has_get",
   "last_value_ptr",
   "set",
+  "get_or_insert",
+  "increment",
   "delete_key",
+  "set_many",
+  "get_many",
+  "delete_many",
+  "bulk_capacity",
+  "bulk_keys_ptr",
+  "bulk_values_ptr",
+  "bulk_flags_ptr",
   "scan",
   "scan_window",
   "scan_keys_ptr",
@@ -166,6 +209,82 @@ const REQUIRED_U32_EXPORTS = [
 
 /** Compiles the embedded module once, shared by every {@link SwissU32ToU32.create}. */
 const compileEmbedded = embeddedModule(SWISS_U32_WASM_BASE64);
+
+/** What a bulk lookup reports back. */
+export interface BulkU32GetResult {
+  /** Value per key, 0 where the key was absent. */
+  values: Uint32Array;
+  /** 1 where the key was present, 0 where it was absent. */
+  found: Uint8Array;
+}
+
+/**
+ * Views over the module's own bulk staging buffers.
+ *
+ * The addresses and the batch size come from the module itself, so the
+ * buffers can never overlap the table banks. The views are built once: the
+ * modules are linked with initial memory equal to maximum memory and never
+ * call `memory.grow`, so the backing buffer is never detached.
+ */
+class BulkScratch {
+  /** Maximum keys per WASM call; larger batches are chunked. */
+  readonly maxBatch: number;
+
+  /** Address of {@link BulkScratch.keys} in linear memory. */
+  readonly keysPtr: number;
+  /** Address of {@link BulkScratch.values} in linear memory. */
+  readonly valuesPtr: number;
+  /** Address of {@link BulkScratch.found} in linear memory. */
+  readonly foundPtr: number;
+
+  /** Whether {@link BulkScratch.release} has dropped the views. */
+  released = false;
+
+  /*
+   * The three views are not `readonly`: {@link BulkScratch.release} drops
+   * them when the owning table is disposed.
+   */
+
+  /** Staged keys for the current chunk. */
+  keys: Uint32Array;
+  /** Staged or returned values for the current chunk. */
+  values: Uint32Array;
+  /** Returned per-key flags for the current chunk. */
+  found: Uint8Array;
+
+  constructor(wasm: SwissU32WasmExports) {
+    this.maxBatch = wasm.bulk_capacity() >>> 0;
+
+    // Every bulk method strides by this; a zero would loop forever.
+    if (this.maxBatch === 0) {
+      throw new TypeError("swiss_u32.wasm reported a zero bulk capacity");
+    }
+
+    this.keysPtr = wasm.bulk_keys_ptr() >>> 0;
+    this.valuesPtr = wasm.bulk_values_ptr() >>> 0;
+    this.foundPtr = wasm.bulk_flags_ptr() >>> 0;
+
+    const buffer = wasm.memory.buffer;
+
+    this.keys = new Uint32Array(buffer, this.keysPtr, this.maxBatch);
+    this.values = new Uint32Array(buffer, this.valuesPtr, this.maxBatch);
+    this.found = new Uint8Array(buffer, this.foundPtr, this.maxBatch);
+  }
+
+  /**
+   * Drops the views onto the module's memory.
+   *
+   * A buffer stays reachable, and so uncollectable, while any view onto it
+   * does, so disposing a table has to let these go along with the exports —
+   * otherwise the staging views alone would pin the whole reservation.
+   */
+  release(): void {
+    this.released = true;
+    this.keys = DISPOSED_STAGING;
+    this.values = DISPOSED_STAGING;
+    this.found = DISPOSED_FLAGS;
+  }
+}
 
 /**
  * WASM-resident SwissTable mapping `uint32_t` keys to `uint32_t` values.
@@ -233,6 +352,9 @@ export class SwissU32ToU32 {
   private sizeView: Uint32Array;
   private capacityView: Uint32Array;
 
+  /** Views over the module's bulk staging buffers. */
+  private readonly scratch: BulkScratch;
+
   /**
    * Alias for {@link SwissU32ToU32.dispose}, so a table works with `using`.
    *
@@ -271,6 +393,8 @@ export class SwissU32ToU32 {
 
     this.sizeView = new Uint32Array(buffer, wasm.size_ptr(), 1);
     this.capacityView = new Uint32Array(buffer, wasm.capacity_ptr(), 1);
+
+    this.scratch = new BulkScratch(wasm);
   }
 
   /**
@@ -381,10 +505,98 @@ export class SwissU32ToU32 {
     seed: number,
   ): Promise<SwissU32ToU32> {
     // Validated before the module is instantiated, so a bad seed costs a
-    // throw rather than a 20 MiB instance the caller never receives.
+    // throw rather than a 21 MiB instance the caller never receives.
     const checked = asWasmI32(seed, "seed");
 
-    const instance = await instantiate(wasmBytes);
+    return SwissU32ToU32.fromInstance(
+      await instantiate(wasmBytes),
+      expectedEntries,
+      checked,
+    );
+  }
+
+  /**
+   * Instantiates an already-compiled module without awaiting.
+   *
+   * The same table {@link SwissU32ToU32.load} builds, constructed where an
+   * `await` is not available — a class field, a getter, a synchronous
+   * factory. Compile the module once with {@link WebAssembly.compile} and
+   * hand it to as many of these as needed; bytes are not accepted, because
+   * compiling them synchronously is the cost the asynchronous API exists to
+   * avoid.
+   *
+   * Seeding matches {@link SwissU32ToU32.load}, with one restriction: the
+   * seed comes from the global `crypto`, since the `node:crypto` fallback
+   * is reachable only through an asynchronous import. On Node 16.9 to 18
+   * use {@link SwissU32ToU32.load}, or supply the seed with
+   * {@link SwissU32ToU32.loadSyncWithSeed}.
+   *
+   * @param module - A module already compiled with
+   *   {@link WebAssembly.compile}.
+   * @param expectedEntries - Entry count to size the table for up front.
+   * @returns The loaded table.
+   * @throws {TypeError} If the instance does not export the expected symbols.
+   * @throws {RangeError} If `expectedEntries` exceeds the compiled capacity.
+   * @throws {Error} If the runtime exposes no global `crypto`.
+   */
+  static loadSync(
+    module: WebAssembly.Module,
+    expectedEntries = 0,
+  ): SwissU32ToU32 {
+    return SwissU32ToU32.loadSyncWithSeed(
+      module,
+      expectedEntries,
+      randomSeedSync(),
+    );
+  }
+
+  /**
+   * {@link SwissU32ToU32.loadSync} with `seed` instead of a random one.
+   *
+   * Read the warning on {@link SwissU32ToU32.createWithSeed} before fixing a
+   * seed. Unlike {@link SwissU32ToU32.loadSync} this needs no CSPRNG at all,
+   * so it is the synchronous path that works on every supported runtime.
+   *
+   * @param module - A module already compiled with
+   *   {@link WebAssembly.compile}.
+   * @param expectedEntries - Entry count to size the table for up front.
+   * @param seed - Unsigned 32-bit hash seed.
+   * @returns The loaded table.
+   * @throws {TypeError} If the instance does not export the expected symbols.
+   * @throws {RangeError} If `seed` is not an unsigned 32-bit integer, or if
+   *   `expectedEntries` exceeds the compiled capacity.
+   */
+  static loadSyncWithSeed(
+    module: WebAssembly.Module,
+    expectedEntries: number,
+    seed: number,
+  ): SwissU32ToU32 {
+    const checked = asWasmI32(seed, "seed");
+
+    return SwissU32ToU32.fromInstance(
+      instantiateSync(module),
+      expectedEntries,
+      checked,
+    );
+  }
+
+  /**
+   * Validates an instance and brings the table up: seed, then size.
+   *
+   * The only part of construction that differs between the four loaders is
+   * how the instance was obtained, so everything after that lives here and
+   * the sync and async paths cannot drift apart.
+   *
+   * @param instance - A freshly instantiated `swiss_u32.wasm`.
+   * @param expectedEntries - Entry count to size the table for up front.
+   * @param seed - Hash seed, already validated as a u32.
+   * @returns The ready table.
+   */
+  private static fromInstance(
+    instance: WebAssembly.Instance,
+    expectedEntries: number,
+    seed: number,
+  ): SwissU32ToU32 {
     const wasm = instance.exports as unknown as SwissU32WasmExports;
 
     if (
@@ -401,7 +613,7 @@ export class SwissU32ToU32 {
     // Before init(), and so before any insert: the seed picks the
     // permutation every live entry's slot was chosen under, and the module
     // refuses to change it once there is one.
-    assertStatus(wasm.set_seed(checked), "seed", "SwissU32ToU32");
+    assertStatus(wasm.set_seed(seed), "seed", "SwissU32ToU32");
 
     assertStatus(
       wasm.init(asWasmI32(expectedEntries, "expectedEntries")),
@@ -410,6 +622,14 @@ export class SwissU32ToU32 {
     );
 
     return table;
+  }
+
+  /**
+   * Keys one bulk WASM call carries. Longer batches are chunked
+   * automatically; sizing batches to this avoids the extra copy.
+   */
+  get maxBatch(): number {
+    return this.scratch.maxBatch;
   }
 
   /**
@@ -474,7 +694,7 @@ export class SwissU32ToU32 {
    * Releases the module instance backing this table.
    *
    * One table is one instance, and an instance reserves its whole capacity
-   * of linear memory up front — 20 MiB by default — which nothing can
+   * of linear memory up front — 21 MiB by default — which nothing can
    * reclaim while the instance is reachable. Dropping the last reference to
    * the table lets the collector take it eventually; this is how to make
    * "eventually" now, which is what a process building a table per request
@@ -496,6 +716,7 @@ export class SwissU32ToU32 {
     this.scanValues = DISPOSED_STAGING;
     this.sizeView = DISPOSED_COUNTER;
     this.capacityView = DISPOSED_COUNTER;
+    this.scratch.release();
   }
 
   /**
@@ -553,6 +774,54 @@ export class SwissU32ToU32 {
   }
 
   /**
+   * Returns the value stored for `key`, inserting `value` first if it was
+   * absent.
+   *
+   * One crossing and one probe, against the two of each that
+   * {@link SwissU32ToU32.get} followed by {@link SwissU32ToU32.set} costs.
+   * This is the shape TC39 settled on for `Map.prototype.getOrInsert`, and
+   * the equivalent of Rust's `entry(k).or_insert(v)`.
+   *
+   * @param key - Unsigned 32-bit key.
+   * @param value - Value to insert if the key is absent.
+   * @returns The value now stored for `key`.
+   * @throws {RangeError} If either argument is not an unsigned 32-bit
+   *   integer, or if the insert would exceed the compiled capacity.
+   */
+  getOrInsert(key: number, value: number): number {
+    assertStatus(
+      this.wasm.get_or_insert(
+        asWasmI32(key, "key"),
+        asWasmI32(value, "value"),
+      ),
+      "getOrInsert",
+      "SwissU32ToU32",
+    );
+    return this.lastValue[0]!;
+  }
+
+  /**
+   * Adds `delta` to the value stored for `key`, treating an absent key as 0.
+   *
+   * The counter idiom, in one crossing rather than the three a read, an add
+   * and a write would cost. Wraps modulo 2^32.
+   *
+   * @param key - Unsigned 32-bit key.
+   * @param delta - Amount to add.
+   * @returns The value now stored for `key`.
+   * @throws {RangeError} If either argument is not an unsigned 32-bit
+   *   integer, or if the insert would exceed the compiled capacity.
+   */
+  increment(key: number, delta = 1): number {
+    assertStatus(
+      this.wasm.increment(asWasmI32(key, "key"), asWasmI32(delta, "delta")),
+      "increment",
+      "SwissU32ToU32",
+    );
+    return this.lastValue[0]!;
+  }
+
+  /**
    * Removes `key`.
    *
    * @param key - Unsigned 32-bit key.
@@ -561,6 +830,189 @@ export class SwissU32ToU32 {
    */
   delete(key: number): boolean {
     return this.wasm.delete_key(asWasmI32(key, "key")) !== 0;
+  }
+
+  /**
+   * Inserts or overwrites a whole batch of pairs.
+   *
+   * The batch is staged into the module's memory and crossed once per chunk
+   * rather than once per key, which is where the widest margin over `Map`
+   * comes from. Batches longer than {@link SwissU32ToU32.maxBatch} are
+   * chunked; each chunk is still a single WASM call.
+   *
+   * @param keys - Unsigned 32-bit keys.
+   * @param values - Values, parallel to `keys`.
+   * @throws {RangeError} If the two arrays differ in length, if an element
+   *   is not a 32-bit integer, or if the inserts would exceed the compiled
+   *   capacity. A rejected element applies nothing, whatever its position;
+   *   a capacity ceiling is not atomic across chunks, the same way the module
+   *   reports one hit partway through a single chunk.
+   */
+  setMany(keys: BulkU32Source, values: BulkU32Source): void {
+    this.assertLive();
+
+    const total = bulkLength(keys, "keys");
+
+    if (bulkLength(values, "values") !== total) {
+      throw new RangeError("setMany: key/value array length mismatch");
+    }
+
+    const { maxBatch } = this.scratch;
+
+    // One chunk stages every element before the single WASM call, so a bad
+    // element already rejects the whole batch. Past that, the batch has to
+    // be checked up front — otherwise element 69_999 of a 70_000-pair batch
+    // would throw with the first 65_536 pairs already inserted. The check
+    // keeps what it converts, so a non-integer source pays the per-element
+    // cost once here rather than again per chunk.
+    if (total > maxBatch) {
+      keys = materializeU32(keys, total, "keys");
+      values = materializeU32(values, total, "values");
+    }
+
+    for (let offset = 0; offset < total; offset += maxBatch) {
+      const chunk = Math.min(maxBatch, total - offset);
+
+      stageU32(keys, this.scratch.keys, offset, chunk, "keys");
+      stageU32(values, this.scratch.values, offset, chunk, "values");
+
+      assertStatus(
+        this.wasm.set_many(
+          this.scratch.keysPtr,
+          this.scratch.valuesPtr,
+          chunk,
+        ),
+        "setMany",
+        "SwissU32ToU32",
+      );
+    }
+  }
+
+  /**
+   * Looks up a whole batch of keys.
+   *
+   * Batches longer than {@link SwissU32ToU32.maxBatch} are chunked; each
+   * chunk is still a single WASM call.
+   *
+   * @param keys - Unsigned 32-bit keys.
+   * @param out - Result arrays to write into instead of allocating, each at
+   *   least `keys.length` long; only the first `keys.length` elements are
+   *   written. A caller issuing same-sized batches in a loop passes the
+   *   previous result back to make the steady state allocation-free.
+   * @returns Parallel result arrays covering `keys.length` keys — `out` when
+   *   given, else freshly allocated.
+   * @throws {RangeError} If an element is not a 32-bit integer, or an `out`
+   *   array is shorter than `keys`. A rejected element writes nothing,
+   *   whatever its position, so a reused `out` never comes back holding a
+   *   mixture of this batch's results and the last one's.
+   */
+  getMany(keys: BulkU32Source, out?: BulkU32GetResult): BulkU32GetResult {
+    this.assertLive();
+
+    const total = bulkLength(keys, "keys");
+
+    const values = out?.values ?? new Uint32Array(total);
+    const found = out?.found ?? new Uint8Array(total);
+
+    // Checked before the first chunk lands, so a short buffer rejects the
+    // whole call rather than failing after some lookups were copied out.
+    if (values.length < total || found.length < total) {
+      throw new RangeError("getMany: out arrays are shorter than keys");
+    }
+
+    const { maxBatch } = this.scratch;
+
+    // Results land chunk by chunk, so a bad element in a later chunk would
+    // otherwise throw with the earlier chunks already copied into `out` —
+    // and a caller reusing `out` cannot tell those apart from the previous
+    // batch's results. See setMany.
+    if (total > maxBatch) keys = materializeU32(keys, total, "keys");
+
+    for (let offset = 0; offset < total; offset += maxBatch) {
+      const chunk = Math.min(maxBatch, total - offset);
+
+      stageU32(keys, this.scratch.keys, offset, chunk, "keys");
+
+      assertStatus(
+        this.wasm.get_many(
+          this.scratch.keysPtr,
+          this.scratch.valuesPtr,
+          this.scratch.foundPtr,
+          chunk,
+        ),
+        "getMany",
+        "SwissU32ToU32",
+      );
+
+      values.set(this.scratch.values.subarray(0, chunk), offset);
+      found.set(this.scratch.found.subarray(0, chunk), offset);
+    }
+
+    return out ?? { values, found };
+  }
+
+  /**
+   * Removes a whole batch of keys.
+   *
+   * Batches longer than {@link SwissU32ToU32.maxBatch} are chunked; each
+   * chunk is still a single WASM call.
+   *
+   * @param keys - Unsigned 32-bit keys.
+   * @returns Per-key removal flags and the total removed.
+   * @throws {RangeError} If an element is not a 32-bit integer. Nothing is
+   *   removed, whatever the element's position.
+   */
+  deleteMany(keys: BulkU32Source): BulkDeleteResult {
+    this.assertLive();
+
+    const total = bulkLength(keys, "keys");
+    const deleted = new Uint8Array(total);
+    let removedCount = 0;
+
+    const { maxBatch } = this.scratch;
+
+    // Removals land chunk by chunk, so a bad element in a later chunk would
+    // otherwise throw with the earlier chunks already gone. See setMany.
+    if (total > maxBatch) keys = materializeU32(keys, total, "keys");
+
+    for (let offset = 0; offset < total; offset += maxBatch) {
+      const chunk = Math.min(maxBatch, total - offset);
+
+      stageU32(keys, this.scratch.keys, offset, chunk, "keys");
+
+      // The flag buffer carries removal flags here; nothing else reads it
+      // between staging the keys and copying the flags out.
+      const removed = this.wasm.delete_many(
+        this.scratch.keysPtr,
+        this.scratch.foundPtr,
+        chunk,
+      );
+
+      if (removed === DELETE_MANY_FAILED) {
+        throw new Error("delete_many rejected its arguments");
+      }
+
+      removedCount += removed;
+
+      deleted.set(this.scratch.found.subarray(0, chunk), offset);
+    }
+
+    return { deleted, removedCount };
+  }
+
+  /**
+   * Rejects a bulk call on a disposed table before it stages anything.
+   *
+   * The single-key methods reach the swapped exports object on their first
+   * crossing, so they report dispose by themselves. A bulk call stages into
+   * the module's buffers first, and those views are dropped by dispose — a
+   * typed-array source would fail inside the copy with a message about
+   * buffer offsets, and an empty batch would never cross at all.
+   *
+   * @throws {Error} If {@link SwissU32ToU32.dispose} has been called.
+   */
+  private assertLive(): void {
+    if (this.scratch.released) throw disposedError("SwissU32ToU32");
   }
 
   /** The scan state an iterator needs, bundled without exposing it. */

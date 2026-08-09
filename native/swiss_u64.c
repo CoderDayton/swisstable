@@ -56,13 +56,6 @@
 #include "swiss_core.h"
 
 /*
- * delete_many() reports how many keys it removed, so it has no room for a
- * negative status. A removal count can never exceed BULK_CAPACITY, which
- * makes UINT32_MAX unambiguous as a failure sentinel.
- */
-#define DELETE_MANY_FAILED 0xffffffffu
-
-/*
  * Output lanes for the last has_get() call.
  *
  * Adjacent by construction, so the caller reads both with one typed-array
@@ -73,29 +66,14 @@
 static uint32_t g_last_value[2] = {0, 0};
 
 /*
- * Staging buffers for the bulk API.
- *
- * Owned by this module so their addresses are assigned by the linker rather
- * than hardcoded by the caller: the JS side reads bulk_capacity() and the
- * bulk_*_ptr() accessors and builds its views from those. An earlier
- * revision picked the offsets caller-side and silently aliased the banks.
+ * Value lanes of the bulk staging area. The key and flag buffers, and the
+ * checks that guard every address argument, are shared and live in
+ * swiss_core.h.
  */
-static uint32_t g_bulk_keys[BULK_CAPACITY];
 static uint32_t g_bulk_vals_lo[BULK_CAPACITY];
 static uint32_t g_bulk_vals_hi[BULK_CAPACITY];
-static uint8_t  g_bulk_flags[BULK_CAPACITY];
 
-/*
- * Staging buffers for scan(), separate from the bulk ones above.
- *
- * Sharing them would cost nothing in memory and would be correct for the
- * shipped binding, which copies each window out before it issues anything
- * else. It would still be wrong: an exported function is reachable by every
- * holder of the instance, and a caller that staged a bulk batch, walked the
- * table, then issued the batch would read the walk's entries back as its
- * own arguments — wrong values, no trap, nothing in the data to show it.
- * Separate arrays make that unrepresentable rather than merely documented.
- */
+/* Staging buffers for scan(), deliberately separate from the bulk ones. */
 static uint32_t g_scan_keys[SCAN_WINDOW];
 static uint32_t g_scan_vals_lo[SCAN_WINDOW];
 static uint32_t g_scan_vals_hi[SCAN_WINDOW];
@@ -111,28 +89,6 @@ static void stage_entry(uint32_t index, const Entry *entry) {
   g_scan_keys[index] = entry->key;
   g_scan_vals_lo[index] = entry->lo;
   g_scan_vals_hi[index] = entry->hi;
-}
-
-/*
- * True when `ptr` is the address of the staging buffer it is meant to be.
- *
- * The bulk exports take addresses, which makes every one of them a write
- * primitive aimed anywhere in linear memory unless it is checked. There is
- * no range to check against: the only legitimate value for each argument is
- * the single buffer above, whose address the caller obtained from this
- * module in the first place. So the test is equality, not containment.
- *
- * This has to live here rather than in the JavaScript binding. The binding
- * is one caller among however many hold the instance, and an exported
- * function is reachable by all of them.
- */
-static inline uint32_t is_bulk_ptr(uint32_t ptr, const void *buffer) {
-  return ptr == (uint32_t)(uintptr_t)buffer;
-}
-
-/* True when a bulk batch fits the staging buffers. */
-static inline uint32_t bulk_count_ok(uint32_t count) {
-  return count <= BULK_CAPACITY;
 }
 
 /*
@@ -164,6 +120,63 @@ uint32_t last_value_ptr(void) { return (uint32_t)(uintptr_t)g_last_value; }
 __attribute__((export_name("set")))
 int32_t set(uint32_t key, uint32_t lo, uint32_t hi) {
   return set_one(key, lo, hi);
+}
+
+/*
+ * Returns the value stored for `key`, inserting (lo, hi) first if it was
+ * absent. The resulting value is latched at last_value_ptr() either way.
+ *
+ * One probe, one crossing. The alternative the caller would otherwise
+ * write — has_get() then set() — probes twice and crosses twice, and races
+ * nothing only because the table is single-threaded.
+ */
+__attribute__((export_name("get_or_insert")))
+int32_t get_or_insert(uint32_t key, uint32_t lo, uint32_t hi) {
+  uint32_t slot;
+  uint32_t inserted;
+  const int32_t status = upsert_slot_tracked(key, &slot, &inserted);
+  if (status != STATUS_OK) return status;
+
+  Entry *entry = &g_entries[g_active_bank][slot];
+
+  if (inserted) {
+    entry->lo = lo;
+    entry->hi = hi;
+  }
+
+  latch_value(entry);
+
+  return STATUS_OK;
+}
+
+/*
+ * Adds the u64 (delta_hi << 32 | delta_lo) to the value stored for `key`,
+ * treating an absent key as 0 so the first call stores the delta itself.
+ * The new value is latched at last_value_ptr().
+ *
+ * Wraps modulo 2^64, which is what the lanes can represent; a counter that
+ * must saturate has to check before calling.
+ */
+__attribute__((export_name("increment")))
+int32_t increment(uint32_t key, uint32_t delta_lo, uint32_t delta_hi) {
+  uint32_t slot;
+  uint32_t inserted;
+  const int32_t status = upsert_slot_tracked(key, &slot, &inserted);
+  if (status != STATUS_OK) return status;
+
+  Entry *entry = &g_entries[g_active_bank][slot];
+
+  const uint64_t current =
+    inserted ? 0u : ((uint64_t)entry->hi << 32) | (uint64_t)entry->lo;
+  const uint64_t next =
+    current + (((uint64_t)delta_hi << 32) | (uint64_t)delta_lo);
+
+  entry->lo = (uint32_t)next;
+  entry->hi = (uint32_t)(next >> 32);
+
+  latch_value(entry);
+
+  return STATUS_OK;
 }
 
 /* ── Bulk API: one call amortizes N operations ─────────────────────── */
@@ -266,68 +279,15 @@ int32_t get_many(
   return STATUS_OK;
 }
 
-/*
- * Removes `count` keys staged at keys_ptr.
- *
- * Writes deleted_ptr[i] = 1 if the key was present and removed, else 0.
- * deleted_ptr addresses a u8[count]. Returns the number removed, which is
- * the number of 1s written.
- */
-__attribute__((export_name("delete_many")))
-uint32_t delete_many(
-  uint32_t keys_ptr,
-  uint32_t deleted_ptr,
-  uint32_t count
-) {
-  if (
-    !bulk_count_ok(count) ||
-    !is_bulk_ptr(keys_ptr, g_bulk_keys) ||
-    !is_bulk_ptr(deleted_ptr, g_bulk_flags)
-  ) {
-    return DELETE_MANY_FAILED;
-  }
-
-  const uint32_t *keys = (const uint32_t *)(uintptr_t)keys_ptr;
-  uint8_t *deleted = (uint8_t *)(uintptr_t)deleted_ptr;
-  uint32_t removed = 0;
-
-  for (uint32_t i = 0; i < count; i++) {
-    const uint32_t slot = lookup_slot(keys[i]);
-
-    if (slot == UINT32_MAX) {
-      deleted[i] = 0;
-      continue;
-    }
-
-    g_ctrl[g_active_bank][slot] = CTRL_DELETED;
-    g_size--;
-    deleted[i] = 1;
-    removed++;
-  }
-
-  return removed;
-}
-
 /* ── Staging buffer accessors ──────────────────────────────────────── */
 
-/* Maximum keys the staging buffers hold; larger batches must be chunked. */
-__attribute__((export_name("bulk_capacity")))
-uint32_t bulk_capacity(void) { return BULK_CAPACITY; }
-
-/* Addresses of the staging buffers. Constant for the module's lifetime. */
-
-__attribute__((export_name("bulk_keys_ptr")))
-uint32_t bulk_keys_ptr(void) { return (uint32_t)(uintptr_t)g_bulk_keys; }
+/* Addresses of the value lanes. Constant for the module's lifetime. */
 
 __attribute__((export_name("bulk_vals_lo_ptr")))
 uint32_t bulk_vals_lo_ptr(void) { return (uint32_t)(uintptr_t)g_bulk_vals_lo; }
 
 __attribute__((export_name("bulk_vals_hi_ptr")))
 uint32_t bulk_vals_hi_ptr(void) { return (uint32_t)(uintptr_t)g_bulk_vals_hi; }
-
-/* Doubles as the delete_many() output buffer; only one is live at a time. */
-__attribute__((export_name("bulk_flags_ptr")))
-uint32_t bulk_flags_ptr(void) { return (uint32_t)(uintptr_t)g_bulk_flags; }
 
 __attribute__((export_name("scan_keys_ptr")))
 uint32_t scan_keys_ptr(void) { return (uint32_t)(uintptr_t)g_scan_keys; }

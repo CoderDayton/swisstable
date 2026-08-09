@@ -110,3 +110,35 @@ export async function randomSeed(): Promise<number> {
 
   return lane[0]!;
 }
+
+/**
+ * Draws a random 32-bit hash seed without awaiting anything.
+ *
+ * Web Crypto only. The `node:crypto` fallback that {@link randomSeed} uses
+ * is reached through a dynamic `import`, which is asynchronous by
+ * specification and cannot be made otherwise — so on a runtime with no
+ * global `crypto` this throws rather than silently seeding from something
+ * weaker. That is Node 16.9 to 18; every browser, Deno, Bun, and Node 19+
+ * has the global.
+ *
+ * @returns A seed in `[0, 2**32)`.
+ * @throws {Error} If the runtime exposes no global `crypto.getRandomValues`.
+ * @internal
+ */
+export function randomSeedSync(): number {
+  const fill = webRandom();
+
+  if (fill === undefined) {
+    throw new Error(
+      "swisstable needs a cryptographic random source to seed its hash, " +
+        "and this runtime exposes no global crypto.getRandomValues. Use " +
+        "the asynchronous create/load, which can also reach node:crypto, " +
+        "or pass a seed explicitly with loadSyncWithSeed.",
+    );
+  }
+
+  const lane = new Uint32Array(1);
+  fill(lane);
+
+  return lane[0]!;
+}

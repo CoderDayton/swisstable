@@ -51,3 +51,25 @@ async function instantiateBytes(
   const { instance } = await WebAssembly.instantiate(bytes as ArrayBuffer);
   return instance;
 }
+
+/**
+ * Instantiates an already-compiled module without yielding to the event
+ * loop.
+ *
+ * `WebAssembly.instantiate` is asynchronous even when handed a compiled
+ * module, because it is specified to allow compilation. The `Instance`
+ * constructor is the synchronous form, and it is the only one that lets a
+ * caller build a table inside a constructor, a getter, or any other place
+ * that cannot await. It is restricted to a compiled module because bytes
+ * would have to be compiled first, and synchronous compilation of a large
+ * buffer is what the async API exists to avoid.
+ *
+ * @param module - A module already compiled with {@link WebAssembly.compile}.
+ * @returns The instantiated module.
+ * @internal
+ */
+export function instantiateSync(
+  module: WebAssembly.Module,
+): WebAssembly.Instance {
+  return new WebAssembly.Instance(module);
+}

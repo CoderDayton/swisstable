@@ -14,11 +14,16 @@ import {
   scanColumns,
   stageU32,
 } from "./abi.ts";
-import type { BulkU32Source, ColumnScan, ScanExports } from "./abi.ts";
+import type {
+  BulkDeleteResult,
+  BulkU32Source,
+  ColumnScan,
+  ScanExports,
+} from "./abi.ts";
 import { embeddedModule } from "./embedded.ts";
 import { SWISS_U64_WASM_BASE64 } from "./generated/swiss_u64.ts";
-import { randomSeed } from "./seed.ts";
-import { instantiate } from "./wasm.ts";
+import { randomSeed, randomSeedSync } from "./seed.ts";
+import { instantiate, instantiateSync } from "./wasm.ts";
 import type { WasmSource } from "./wasm.ts";
 
 /**
@@ -52,6 +57,12 @@ export interface SwissU64WasmExports extends ScanExports {
   last_value_ptr(): number;
   /** Inserts or overwrites, returning a status code. */
   set(key: number, lo: number, hi: number): number;
+
+  /** Reads, or inserts then reads; latches at `last_value_ptr`. */
+  get_or_insert(key: number, lo: number, hi: number): number;
+
+  /** Adds a u64 delta, treating an absent key as 0. */
+  increment(key: number, deltaLo: number, deltaHi: number): number;
   /** Removes `key`, returning 1 if it was present. Named to avoid the C keyword. */
   delete_key(key: number): number;
 
@@ -242,14 +253,6 @@ class EntryIterator extends ScanIterator<[number, U64Lanes]> {
   }
 }
 
-/** Result of {@link SwissU32ToU64.deleteMany}. */
-export interface BulkDeleteResult {
-  /** 1 where the key was present and removed, 0 where it was absent. */
-  deleted: Uint8Array;
-  /** Total number of keys actually removed. */
-  removedCount: number;
-}
-
 /**
  * Packs a span into value lanes.
  *
@@ -296,6 +299,8 @@ const REQUIRED_U64_EXPORTS = [
   "has_get",
   "last_value_ptr",
   "set",
+  "get_or_insert",
+  "increment",
   "delete_key",
   "set_many",
   "get_many",
@@ -607,7 +612,95 @@ export class SwissU32ToU64 {
     // throw rather than a 29 MiB instance the caller never receives.
     const checked = asWasmI32(seed, "seed");
 
-    const instance = await instantiate(wasmBytes);
+    return SwissU32ToU64.fromInstance(
+      await instantiate(wasmBytes),
+      expectedEntries,
+      checked,
+    );
+  }
+
+  /**
+   * Instantiates an already-compiled module without awaiting.
+   *
+   * The same table {@link SwissU32ToU64.load} builds, constructed where an
+   * `await` is not available — a class field, a getter, a synchronous
+   * factory. Compile the module once with {@link WebAssembly.compile} and
+   * hand it to as many of these as needed; bytes are not accepted, because
+   * compiling them synchronously is the cost the asynchronous API exists to
+   * avoid.
+   *
+   * Seeding matches {@link SwissU32ToU64.load}, with one restriction: the
+   * seed comes from the global `crypto`, since the `node:crypto` fallback
+   * is reachable only through an asynchronous import. On Node 16.9 to 18
+   * use {@link SwissU32ToU64.load}, or supply the seed with
+   * {@link SwissU32ToU64.loadSyncWithSeed}.
+   *
+   * @param module - A module already compiled with
+   *   {@link WebAssembly.compile}.
+   * @param expectedEntries - Entry count to size the table for up front.
+   * @returns The loaded table.
+   * @throws {TypeError} If the instance does not export the expected symbols.
+   * @throws {RangeError} If `expectedEntries` exceeds the compiled capacity.
+   * @throws {Error} If the runtime exposes no global `crypto`.
+   */
+  static loadSync(
+    module: WebAssembly.Module,
+    expectedEntries = 0,
+  ): SwissU32ToU64 {
+    return SwissU32ToU64.loadSyncWithSeed(
+      module,
+      expectedEntries,
+      randomSeedSync(),
+    );
+  }
+
+  /**
+   * {@link SwissU32ToU64.loadSync} with `seed` instead of a random one.
+   *
+   * Read the warning on {@link SwissU32ToU64.createWithSeed} before fixing a
+   * seed. Unlike {@link SwissU32ToU64.loadSync} this needs no CSPRNG at all,
+   * so it is the synchronous path that works on every supported runtime.
+   *
+   * @param module - A module already compiled with
+   *   {@link WebAssembly.compile}.
+   * @param expectedEntries - Entry count to size the table for up front.
+   * @param seed - Unsigned 32-bit hash seed.
+   * @returns The loaded table.
+   * @throws {TypeError} If the instance does not export the expected symbols.
+   * @throws {RangeError} If `seed` is not an unsigned 32-bit integer, or if
+   *   `expectedEntries` exceeds the compiled capacity.
+   */
+  static loadSyncWithSeed(
+    module: WebAssembly.Module,
+    expectedEntries: number,
+    seed: number,
+  ): SwissU32ToU64 {
+    const checked = asWasmI32(seed, "seed");
+
+    return SwissU32ToU64.fromInstance(
+      instantiateSync(module),
+      expectedEntries,
+      checked,
+    );
+  }
+
+  /**
+   * Validates an instance and brings the table up: seed, then size.
+   *
+   * The only part of construction that differs between the four loaders is
+   * how the instance was obtained, so everything after that lives here and
+   * the sync and async paths cannot drift apart.
+   *
+   * @param instance - A freshly instantiated `swiss_u64.wasm`.
+   * @param expectedEntries - Entry count to size the table for up front.
+   * @param seed - Hash seed, already validated as a u32.
+   * @returns The ready table.
+   */
+  private static fromInstance(
+    instance: WebAssembly.Instance,
+    expectedEntries: number,
+    seed: number,
+  ): SwissU32ToU64 {
     const wasm = instance.exports as unknown as SwissU64WasmExports;
 
     if (
@@ -624,7 +717,7 @@ export class SwissU32ToU64 {
     // Before init(), and so before any insert: the seed picks the
     // permutation every live entry's slot was chosen under, and the module
     // refuses to change it once there is one.
-    assertStatus(wasm.set_seed(checked), "seed", "SwissU32ToU64");
+    assertStatus(wasm.set_seed(seed), "seed", "SwissU32ToU64");
 
     assertStatus(
       wasm.init(asWasmI32(expectedEntries, "expectedEntries")),
@@ -828,6 +921,62 @@ export class SwissU32ToU64 {
 
     const lanes = spanToLanes(span);
     return this.set(key, lanes.lo, lanes.hi);
+  }
+
+  /**
+   * Returns the value stored for `key`, inserting `(lo, hi)` first if it
+   * was absent.
+   *
+   * One crossing and one probe, against the two of each that
+   * {@link SwissU32ToU64.get} followed by {@link SwissU32ToU64.set} costs.
+   * This is the shape TC39 settled on for `Map.prototype.getOrInsert`, and
+   * the equivalent of Rust's `entry(k).or_insert(v)`.
+   *
+   * @param key - Unsigned 32-bit key.
+   * @param lo - Low lane to insert if the key is absent.
+   * @param hi - High lane to insert if the key is absent.
+   * @returns The lanes now stored for `key`.
+   * @throws {RangeError} If any argument is not an unsigned 32-bit integer,
+   *   or if the insert would exceed the compiled capacity.
+   */
+  getOrInsert(key: number, lo: number, hi: number): U64Lanes {
+    assertStatus(
+      this.wasm.get_or_insert(
+        asWasmI32(key, "key"),
+        asWasmI32(lo, "lo"),
+        asWasmI32(hi, "hi"),
+      ),
+      "getOrInsert",
+      "SwissU32ToU64",
+    );
+    return { lo: this.lastValue[0]!, hi: this.lastValue[1]! };
+  }
+
+  /**
+   * Adds a 64-bit delta to the value stored for `key`, treating an absent
+   * key as 0.
+   *
+   * The counter idiom, in one crossing rather than the three a read, an add
+   * and a write would cost. Wraps modulo 2^64.
+   *
+   * @param key - Unsigned 32-bit key.
+   * @param deltaLo - Low lane of the amount to add.
+   * @param deltaHi - High lane of the amount to add.
+   * @returns The lanes now stored for `key`.
+   * @throws {RangeError} If any argument is not an unsigned 32-bit integer,
+   *   or if the insert would exceed the compiled capacity.
+   */
+  increment(key: number, deltaLo = 1, deltaHi = 0): U64Lanes {
+    assertStatus(
+      this.wasm.increment(
+        asWasmI32(key, "key"),
+        asWasmI32(deltaLo, "deltaLo"),
+        asWasmI32(deltaHi, "deltaHi"),
+      ),
+      "increment",
+      "SwissU32ToU64",
+    );
+    return { lo: this.lastValue[0]!, hi: this.lastValue[1]! };
   }
 
   /**

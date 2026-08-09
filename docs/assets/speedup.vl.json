@@ -61,7 +61,7 @@
           {
             "workload": "u64 bulk delete (deleteMany)",
             "runtime": "Bun 1.3",
-            "speedup": 6
+            "speedup": 5.4
           },
           {
             "workload": "u64 bulk delete (deleteMany)",
@@ -74,19 +74,94 @@
             "speedup": 8.9
           },
           {
+            "workload": "u32 bulk fill (setMany)",
+            "runtime": "Bun 1.3",
+            "speedup": 9.8
+          },
+          {
+            "workload": "u32 bulk fill (setMany)",
+            "runtime": "Node 24",
+            "speedup": 9.6
+          },
+          {
+            "workload": "u32 bulk fill (setMany)",
+            "runtime": "Deno 2.9",
+            "speedup": 8
+          },
+          {
+            "workload": "u32 bulk fill (setMany)",
+            "runtime": "Chrome 151",
+            "speedup": 6.6
+          },
+          {
+            "workload": "u32 bulk fill (setMany)",
+            "runtime": "Firefox 153",
+            "speedup": 8.6
+          },
+          {
+            "workload": "fill, sparse (pre-sized)",
+            "runtime": "Bun 1.3",
+            "speedup": 8.3
+          },
+          {
+            "workload": "fill, sparse (pre-sized)",
+            "runtime": "Node 24",
+            "speedup": 6.4
+          },
+          {
+            "workload": "fill, sparse (pre-sized)",
+            "runtime": "Deno 2.9",
+            "speedup": 5.6
+          },
+          {
+            "workload": "fill, sparse (pre-sized)",
+            "runtime": "Chrome 151",
+            "speedup": 4.2
+          },
+          {
+            "workload": "fill, sparse (pre-sized)",
+            "runtime": "Firefox 153",
+            "speedup": 5.2
+          },
+          {
+            "workload": "getOrInsert, key absent",
+            "runtime": "Bun 1.3",
+            "speedup": 8
+          },
+          {
+            "workload": "getOrInsert, key absent",
+            "runtime": "Node 24",
+            "speedup": 6.6
+          },
+          {
+            "workload": "getOrInsert, key absent",
+            "runtime": "Deno 2.9",
+            "speedup": 6.4
+          },
+          {
+            "workload": "getOrInsert, key absent",
+            "runtime": "Chrome 151",
+            "speedup": 5.8
+          },
+          {
+            "workload": "getOrInsert, key absent",
+            "runtime": "Firefox 153",
+            "speedup": 5.6
+          },
+          {
             "workload": "u64 bulk fill (setMany)",
             "runtime": "Bun 1.3",
-            "speedup": 6.4
+            "speedup": 6
           },
           {
             "workload": "u64 bulk fill (setMany)",
             "runtime": "Node 24",
-            "speedup": 8.2
+            "speedup": 8
           },
           {
             "workload": "u64 bulk fill (setMany)",
             "runtime": "Deno 2.9",
-            "speedup": 7.7
+            "speedup": 6.9
           },
           {
             "workload": "u64 bulk fill (setMany)",
@@ -96,37 +171,12 @@
           {
             "workload": "u64 bulk fill (setMany)",
             "runtime": "Firefox 153",
-            "speedup": 8.8
-          },
-          {
-            "workload": "fill, sparse (pre-sized)",
-            "runtime": "Bun 1.3",
-            "speedup": 8.5
-          },
-          {
-            "workload": "fill, sparse (pre-sized)",
-            "runtime": "Node 24",
-            "speedup": 6.4
-          },
-          {
-            "workload": "fill, sparse (pre-sized)",
-            "runtime": "Deno 2.9",
-            "speedup": 6
-          },
-          {
-            "workload": "fill, sparse (pre-sized)",
-            "runtime": "Chrome 151",
-            "speedup": 4.3
-          },
-          {
-            "workload": "fill, sparse (pre-sized)",
-            "runtime": "Firefox 153",
-            "speedup": 5.2
+            "speedup": 9.1
           },
           {
             "workload": "delete",
             "runtime": "Bun 1.3",
-            "speedup": 5.5
+            "speedup": 5.6
           },
           {
             "workload": "delete",
@@ -136,12 +186,12 @@
           {
             "workload": "delete",
             "runtime": "Deno 2.9",
-            "speedup": 5.5
+            "speedup": 5.4
           },
           {
             "workload": "delete",
             "runtime": "Chrome 151",
-            "speedup": 4.1
+            "speedup": 4.3
           },
           {
             "workload": "delete",
@@ -151,7 +201,7 @@
           {
             "workload": "fill, dense (pre-sized)",
             "runtime": "Bun 1.3",
-            "speedup": 7.1
+            "speedup": 7.4
           },
           {
             "workload": "fill, dense (pre-sized)",
@@ -161,7 +211,7 @@
           {
             "workload": "fill, dense (pre-sized)",
             "runtime": "Deno 2.9",
-            "speedup": 3.4
+            "speedup": 3.5
           },
           {
             "workload": "fill, dense (pre-sized)",
@@ -171,7 +221,32 @@
           {
             "workload": "fill, dense (pre-sized)",
             "runtime": "Firefox 153",
-            "speedup": 3.6
+            "speedup": 3.9
+          },
+          {
+            "workload": "u32 bulk lookup (getMany)",
+            "runtime": "Bun 1.3",
+            "speedup": 2.4
+          },
+          {
+            "workload": "u32 bulk lookup (getMany)",
+            "runtime": "Node 24",
+            "speedup": 5.4
+          },
+          {
+            "workload": "u32 bulk lookup (getMany)",
+            "runtime": "Deno 2.9",
+            "speedup": 4.8
+          },
+          {
+            "workload": "u32 bulk lookup (getMany)",
+            "runtime": "Chrome 151",
+            "speedup": 5
+          },
+          {
+            "workload": "u32 bulk lookup (getMany)",
+            "runtime": "Firefox 153",
+            "speedup": 3.8
           },
           {
             "workload": "churn (delete + reinsert)",
@@ -186,7 +261,7 @@
           {
             "workload": "churn (delete + reinsert)",
             "runtime": "Deno 2.9",
-            "speedup": 3.7
+            "speedup": 3.5
           },
           {
             "workload": "churn (delete + reinsert)",
@@ -201,12 +276,12 @@
           {
             "workload": "has, sparse",
             "runtime": "Bun 1.3",
-            "speedup": 1.82
+            "speedup": 1.84
           },
           {
             "workload": "has, sparse",
             "runtime": "Node 24",
-            "speedup": 3.3
+            "speedup": 3.4
           },
           {
             "workload": "has, sparse",
@@ -221,7 +296,7 @@
           {
             "workload": "has, sparse",
             "runtime": "Firefox 153",
-            "speedup": 2
+            "speedup": 1.98
           },
           {
             "workload": "overwrite an existing key",
@@ -241,17 +316,17 @@
           {
             "workload": "overwrite an existing key",
             "runtime": "Chrome 151",
-            "speedup": 2.8
+            "speedup": 2.7
           },
           {
             "workload": "overwrite an existing key",
             "runtime": "Firefox 153",
-            "speedup": 3.3
+            "speedup": 3.2
           },
           {
             "workload": "lookup miss, sparse",
             "runtime": "Bun 1.3",
-            "speedup": 1.41
+            "speedup": 1.38
           },
           {
             "workload": "lookup miss, sparse",
@@ -261,7 +336,7 @@
           {
             "workload": "lookup miss, sparse",
             "runtime": "Deno 2.9",
-            "speedup": 3.5
+            "speedup": 3.4
           },
           {
             "workload": "lookup miss, sparse",
@@ -271,17 +346,17 @@
           {
             "workload": "lookup miss, sparse",
             "runtime": "Firefox 153",
-            "speedup": 1.76
+            "speedup": 1.73
           },
           {
             "workload": "lookup hit, sparse",
             "runtime": "Bun 1.3",
-            "speedup": 1.57
+            "speedup": 1.6
           },
           {
             "workload": "lookup hit, sparse",
             "runtime": "Node 24",
-            "speedup": 2.9
+            "speedup": 2.8
           },
           {
             "workload": "lookup hit, sparse",
@@ -296,12 +371,12 @@
           {
             "workload": "lookup hit, sparse",
             "runtime": "Firefox 153",
-            "speedup": 1.78
+            "speedup": 1.79
           },
           {
             "workload": "u64 bulk lookup (getMany)",
             "runtime": "Bun 1.3",
-            "speedup": 1.65
+            "speedup": 1.56
           },
           {
             "workload": "u64 bulk lookup (getMany)",
@@ -311,17 +386,17 @@
           {
             "workload": "u64 bulk lookup (getMany)",
             "runtime": "Deno 2.9",
-            "speedup": 3.6
+            "speedup": 3.7
           },
           {
             "workload": "u64 bulk lookup (getMany)",
             "runtime": "Chrome 151",
-            "speedup": 3.3
+            "speedup": 3.2
           },
           {
             "workload": "u64 bulk lookup (getMany)",
             "runtime": "Firefox 153",
-            "speedup": 2.4
+            "speedup": 2.3
           },
           {
             "workload": "fill, sparse (grown from empty)",
@@ -336,57 +411,57 @@
           {
             "workload": "fill, sparse (grown from empty)",
             "runtime": "Deno 2.9",
-            "speedup": 2.2
+            "speedup": 2.1
           },
           {
             "workload": "fill, sparse (grown from empty)",
             "runtime": "Chrome 151",
-            "speedup": 1.51
+            "speedup": 1.5
           },
           {
             "workload": "fill, sparse (grown from empty)",
             "runtime": "Firefox 153",
-            "speedup": 2.3
+            "speedup": 2.2
           },
           {
             "workload": "lookup miss, dense",
             "runtime": "Bun 1.3",
-            "speedup": 0.86
+            "speedup": 0.85
           },
           {
             "workload": "lookup miss, dense",
             "runtime": "Node 24",
-            "speedup": 1.94
-          },
-          {
-            "workload": "lookup miss, dense",
-            "runtime": "Deno 2.9",
             "speedup": 1.89
           },
           {
             "workload": "lookup miss, dense",
+            "runtime": "Deno 2.9",
+            "speedup": 1.88
+          },
+          {
+            "workload": "lookup miss, dense",
             "runtime": "Chrome 151",
-            "speedup": 2
+            "speedup": 1.99
           },
           {
             "workload": "lookup miss, dense",
             "runtime": "Firefox 153",
-            "speedup": 1.43
+            "speedup": 1.42
           },
           {
             "workload": "lookup hit, dense",
             "runtime": "Bun 1.3",
-            "speedup": 1.11
+            "speedup": 1.12
           },
           {
             "workload": "lookup hit, dense",
             "runtime": "Node 24",
-            "speedup": 1.75
+            "speedup": 1.76
           },
           {
             "workload": "lookup hit, dense",
             "runtime": "Deno 2.9",
-            "speedup": 1.99
+            "speedup": 1.98
           },
           {
             "workload": "lookup hit, dense",
@@ -399,6 +474,31 @@
             "speedup": 1.36
           },
           {
+            "workload": "count (increment)",
+            "runtime": "Bun 1.3",
+            "speedup": 1.41
+          },
+          {
+            "workload": "count (increment)",
+            "runtime": "Node 24",
+            "speedup": 1.39
+          },
+          {
+            "workload": "count (increment)",
+            "runtime": "Deno 2.9",
+            "speedup": 1.47
+          },
+          {
+            "workload": "count (increment)",
+            "runtime": "Chrome 151",
+            "speedup": 1.49
+          },
+          {
+            "workload": "count (increment)",
+            "runtime": "Firefox 153",
+            "speedup": 0.96
+          },
+          {
             "workload": "iterate (forEach)",
             "runtime": "Bun 1.3",
             "speedup": 2.3
@@ -406,17 +506,17 @@
           {
             "workload": "iterate (forEach)",
             "runtime": "Node 24",
-            "speedup": 0.78
+            "speedup": 0.79
           },
           {
             "workload": "iterate (forEach)",
             "runtime": "Deno 2.9",
-            "speedup": 0.78
+            "speedup": 0.75
           },
           {
             "workload": "iterate (forEach)",
             "runtime": "Chrome 151",
-            "speedup": 0.73
+            "speedup": 0.74
           },
           {
             "workload": "iterate (forEach)",
@@ -426,7 +526,7 @@
           {
             "workload": "string keys, repeated lookup",
             "runtime": "Bun 1.3",
-            "speedup": 0.36
+            "speedup": 0.35
           },
           {
             "workload": "string keys, repeated lookup",
@@ -436,17 +536,17 @@
           {
             "workload": "string keys, repeated lookup",
             "runtime": "Deno 2.9",
-            "speedup": 0.47
+            "speedup": 0.49
           },
           {
             "workload": "string keys, repeated lookup",
             "runtime": "Chrome 151",
-            "speedup": 0.45
+            "speedup": 0.46
           },
           {
             "workload": "string keys, repeated lookup",
             "runtime": "Firefox 153",
-            "speedup": 0.73
+            "speedup": 0.76
           }
         ]
       },
@@ -462,10 +562,13 @@
           "type": "nominal",
           "sort": [
             "u64 bulk delete (deleteMany)",
-            "u64 bulk fill (setMany)",
+            "u32 bulk fill (setMany)",
             "fill, sparse (pre-sized)",
+            "getOrInsert, key absent",
+            "u64 bulk fill (setMany)",
             "delete",
             "fill, dense (pre-sized)",
+            "u32 bulk lookup (getMany)",
             "churn (delete + reinsert)",
             "has, sparse",
             "overwrite an existing key",
@@ -475,6 +578,7 @@
             "fill, sparse (grown from empty)",
             "lookup miss, dense",
             "lookup hit, dense",
+            "count (increment)",
             "iterate (forEach)",
             "string keys, repeated lookup"
           ],

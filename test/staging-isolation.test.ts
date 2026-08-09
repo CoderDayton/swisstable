@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import { SwissU32ToU64 } from "../src/index.ts";
 import { decodeBase64 } from "../src/embedded.ts";
+import { SWISS_U32_WASM_BASE64 } from "../src/generated/swiss_u32.ts";
 import { SWISS_U64_WASM_BASE64 } from "../src/generated/swiss_u64.ts";
 
 /**
@@ -38,6 +39,40 @@ describe("scan and bulk staging buffers", () => {
       ["bulk_keys", Number(wasm.bulk_keys_ptr!()), batch * 4],
       ["bulk_vals_lo", Number(wasm.bulk_vals_lo_ptr!()), batch * 4],
       ["bulk_vals_hi", Number(wasm.bulk_vals_hi_ptr!()), batch * 4],
+      ["bulk_flags", Number(wasm.bulk_flags_ptr!()), batch],
+    ] as const;
+
+    for (const [scanName, scanStart, scanBytes] of scan) {
+      for (const [bulkName, bulkStart, bulkBytes] of bulk) {
+        const overlaps =
+          scanStart < bulkStart + bulkBytes && bulkStart < scanStart + scanBytes;
+        expect(`${scanName} vs ${bulkName}: ${overlaps}`).toBe(
+          `${scanName} vs ${bulkName}: false`,
+        );
+      }
+    }
+  });
+
+  test("occupy disjoint ranges in the u32 module too", async () => {
+    const { instance } = await WebAssembly.instantiate(
+      decodeBase64(SWISS_U32_WASM_BASE64),
+    );
+    const wasm = instance.exports as unknown as Record<
+      string,
+      CallableFunction
+    >;
+
+    const window = Number(wasm.scan_window!());
+    const batch = Number(wasm.bulk_capacity!());
+
+    const scan = [
+      ["scan_keys", Number(wasm.scan_keys_ptr!()), window * 4],
+      ["scan_values", Number(wasm.scan_values_ptr!()), window * 4],
+    ] as const;
+
+    const bulk = [
+      ["bulk_keys", Number(wasm.bulk_keys_ptr!()), batch * 4],
+      ["bulk_values", Number(wasm.bulk_values_ptr!()), batch * 4],
       ["bulk_flags", Number(wasm.bulk_flags_ptr!()), batch],
     ] as const;
 

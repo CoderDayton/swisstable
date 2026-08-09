@@ -41,6 +41,9 @@ const SCAN_INTERVAL = 100_000;
 /** Keys per bulk batch, clamped to what the module reports it can stage. */
 const BATCH = 4_096;
 
+/** Bulk batches issued per module, each staged with fresh random keys. */
+const BULK_ROUNDS = 16;
+
 const SET_SHARE = 0.55;
 const GET_SHARE = 0.85;
 
@@ -96,6 +99,20 @@ interface TableExports {
 
 interface U32Exports extends TableExports {
   set(key: number, value: number): number;
+  get_or_insert(key: number, value: number): number;
+  increment(key: number, delta: number): number;
+  set_many(keys: number, values: number, count: number): number;
+  get_many(
+    keys: number,
+    values: number,
+    found: number,
+    count: number,
+  ): number;
+  delete_many(keys: number, deleted: number, count: number): number;
+  bulk_capacity(): number;
+  bulk_keys_ptr(): number;
+  bulk_values_ptr(): number;
+  bulk_flags_ptr(): number;
   scan_values_ptr(): number;
 }
 
@@ -223,10 +240,132 @@ async function exerciseU32(): Promise<number> {
   assert(wasm.shrink_to_fit() === STATUS_OK, module, "shrink_to_fit failed");
   checkScan(module, wasm, expected, readStaged);
 
+  exerciseU32Upserts(wasm, memory, next, expected);
+  checkScan(module, wasm, expected, readStaged);
+
+  exerciseU32Bulk(wasm, memory, next, expected);
+  checkScan(module, wasm, expected, readStaged);
+
   wasm.clear();
   assert(wasm.size() === 0, module, "clear left entries behind");
 
   return OPERATIONS;
+}
+
+/**
+ * Drives get_or_insert and increment.
+ *
+ * Both take the same probe and growth path as set, but reach it through
+ * upsert_slot_tracked and write the latch slot, so neither is covered by the
+ * random set/get/delete loop.
+ */
+function exerciseU32Upserts(
+  wasm: U32Exports,
+  memory: DataView,
+  next: () => number,
+  expected: Map<number, number>,
+): void {
+  const module = "swiss_u32";
+  const lastValue = wasm.last_value_ptr();
+
+  for (let op = 0; op < OPERATIONS / 4; op++) {
+    const key = next() % KEY_SPACE;
+
+    if (next() % 2 === 0) {
+      const seeded = next();
+      assert(
+        wasm.get_or_insert(key, seeded) === STATUS_OK,
+        module,
+        `get_or_insert(${key}) failed`,
+      );
+      const stored = expected.has(key) ? expected.get(key)! : seeded;
+      expected.set(key, stored);
+      assert(
+        memory.getUint32(lastValue, true) === stored,
+        module,
+        `get_or_insert(${key}) latched the wrong value`,
+      );
+    } else {
+      const delta = next();
+      assert(
+        wasm.increment(key, delta) === STATUS_OK,
+        module,
+        `increment(${key}) failed`,
+      );
+      const stored = ((expected.get(key) ?? 0) + delta) >>> 0;
+      expected.set(key, stored);
+      assert(
+        memory.getUint32(lastValue, true) === stored,
+        module,
+        `increment(${key}) latched the wrong value`,
+      );
+    }
+  }
+}
+
+/**
+ * Drives the bulk exports, whose staging-buffer indexing by a
+ * caller-supplied count is the arithmetic most worth running under the
+ * checks.
+ */
+function exerciseU32Bulk(
+  wasm: U32Exports,
+  memory: DataView,
+  next: () => number,
+  expected: Map<number, number>,
+): void {
+  const module = "swiss_u32";
+  const batch = Math.min(BATCH, wasm.bulk_capacity());
+  const bulkKeys = wasm.bulk_keys_ptr();
+  const bulkValues = wasm.bulk_values_ptr();
+  const bulkFlags = wasm.bulk_flags_ptr();
+
+  for (let round = 0; round < BULK_ROUNDS; round++) {
+    const staged = new Map<number, number>();
+
+    for (let i = 0; i < batch; i++) {
+      const key = next() % KEY_SPACE;
+      const value = next();
+      memory.setUint32(bulkKeys + i * 4, key, true);
+      memory.setUint32(bulkValues + i * 4, value, true);
+      staged.set(key, value);
+    }
+
+    assert(
+      wasm.set_many(bulkKeys, bulkValues, batch) === STATUS_OK,
+      module,
+      "set_many failed",
+    );
+    for (const [key, value] of staged) expected.set(key, value);
+
+    assert(
+      wasm.get_many(bulkKeys, bulkValues, bulkFlags, batch) === STATUS_OK,
+      module,
+      "get_many failed",
+    );
+
+    for (let i = 0; i < batch; i++) {
+      const key = memory.getUint32(bulkKeys + i * 4, true);
+      assert(
+        memory.getUint8(bulkFlags + i) === 1,
+        module,
+        `get_many missed ${key} it had just written`,
+      );
+      assert(
+        memory.getUint32(bulkValues + i * 4, true) === expected.get(key),
+        module,
+        `get_many gave the wrong value for ${key}`,
+      );
+    }
+
+    const removed = wasm.delete_many(bulkKeys, bulkFlags, batch);
+    assert(
+      removed !== DELETE_MANY_FAILED,
+      module,
+      "delete_many rejected its arguments",
+    );
+    for (const key of staged.keys()) expected.delete(key);
+  }
 }
 
 async function exerciseU64(): Promise<number> {

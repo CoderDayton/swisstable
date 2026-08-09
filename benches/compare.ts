@@ -102,8 +102,12 @@ interface Workload {
   readonly row: string;
   /** Every token must appear in the scenario title. */
   readonly tokens: readonly string[];
-  /** A token that must not appear, to separate the u32 and u64 scenarios. */
-  readonly excludes?: string;
+  /**
+   * Tokens that must not appear, separating scenarios whose titles are
+   * otherwise subsets of each other — `fill … sparse keys` is a substring
+   * match for the u64 and u32 bulk fills as well as for the plain one.
+   */
+  readonly excludes?: readonly string[];
   readonly swiss: string;
   readonly baseline: string;
   /** Whether the README's short table carries this row. */
@@ -114,7 +118,7 @@ const WORKLOADS: readonly Workload[] = [
   {
     row: "fill, sparse (pre-sized)",
     tokens: ["fill", "sparse"],
-    excludes: "u64",
+    excludes: ["u64", "u32 values"],
     swiss: "SwissU32ToU32 (wasm, pre-sized)",
     baseline: "Map",
     headline: true,
@@ -122,7 +126,7 @@ const WORKLOADS: readonly Workload[] = [
   {
     row: "fill, sparse (grown from empty)",
     tokens: ["fill", "sparse"],
-    excludes: "u64",
+    excludes: ["u64", "u32 values"],
     swiss: "SwissU32ToU32 (wasm, grown)",
     baseline: "Map",
   },
@@ -175,7 +179,7 @@ const WORKLOADS: readonly Workload[] = [
   {
     row: "delete",
     tokens: ["delete"],
-    excludes: "u64",
+    excludes: ["u64"],
     swiss: "SwissU32ToU32.delete (wasm)",
     baseline: "Map.delete",
     headline: true,
@@ -185,6 +189,33 @@ const WORKLOADS: readonly Workload[] = [
     tokens: ["churn"],
     swiss: "SwissU32ToU32 delete + set (wasm)",
     baseline: "Map delete + set",
+    headline: true,
+  },
+  {
+    row: "count (`increment`)",
+    tokens: ["increments over"],
+    swiss: "SwissU32ToU32.increment (wasm)",
+    baseline: "Map",
+    headline: true,
+  },
+  {
+    row: "`getOrInsert`, key absent",
+    tokens: ["none present"],
+    swiss: "SwissU32ToU32.getOrInsert (wasm)",
+    baseline: "Map.get, then set if absent",
+  },
+  {
+    row: "u32 bulk fill (`setMany`)",
+    tokens: ["u32 values: fill"],
+    swiss: "SwissU32ToU32.setMany (wasm)",
+    baseline: "Map",
+    headline: true,
+  },
+  {
+    row: "u32 bulk lookup (`getMany`)",
+    tokens: ["u32 values: lookup"],
+    swiss: "SwissU32ToU32.getMany (wasm, reused out)",
+    baseline: "Map",
     headline: true,
   },
   {
@@ -239,9 +270,7 @@ function findScenario(
     );
 
     if (!matches) continue;
-    if (workload.excludes !== undefined && title.includes(workload.excludes)) {
-      continue;
-    }
+    if (workload.excludes?.some((token) => title.includes(token))) continue;
 
     return report;
   }

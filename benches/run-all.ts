@@ -31,7 +31,8 @@ import { fileURLToPath } from "node:url";
  * rather than about how it compares to `Map`.
  */
 const BROWSER_SCENARIOS =
-  "fill,lookup,has,overwrite,delete,churn,bulk,string-keys,iteration,scale-sweep";
+  "fill,lookup,has,overwrite,delete,churn,upsert,bulk,bulk-u32,string-keys," +
+  "iteration,scale-sweep";
 
 /** Passes over the whole field, reduced by median in `compare.ts`. */
 const DEFAULT_REPEATS = 3;

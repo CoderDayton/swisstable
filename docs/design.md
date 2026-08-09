@@ -150,14 +150,14 @@ Interleaving removes one from the critical path — worth ~3 ns per lookup at
 
 The banks are fixed static arrays and the module links with
 `--initial-memory == --max-memory`, so an instance reserves its whole linear
-memory — 20 MiB for u32, 29 MiB for u64 — the moment it is instantiated,
+memory — 21 MiB for u32, 29 MiB for u64 — the moment it is instantiated,
 whether it holds one entry or its maximum.
 
 Both figures are derived from `MAX_CAPACITY`, not written down beside it:
 `scripts/build-wasm.ts` computes them from bytes-per-slot times the slot
 count plus fixed overhead, so lowering `SWISS_MAX_CAPACITY_LOG2` shrinks the
 reservation instead of leaving it stranded at the default. At `2^16` a u32
-instance costs 3.1 MiB and a u64 instance 3.6 MiB, which is the build to
+instance costs 4.1 MiB and a u64 instance 4.6 MiB, which is the build to
 reach for when the workload is many small tables rather than one large one.
 
 Reserved is not resident. The host commits pages as they are touched, and an

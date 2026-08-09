@@ -799,6 +799,303 @@ async function bulkScenario(keys: Uint32Array): Promise<void> {
   );
 }
 
+/**
+ * The u32 table's bulk API, measured the same way as the u64 one above so
+ * the two are comparable. The value lane is half as wide, so the staging
+ * copy is smaller and the crossing is amortized over the same batch.
+ */
+async function bulkU32Scenario(keys: Uint32Array): Promise<void> {
+  const count = keys.length;
+  const values = Uint32Array.from({ length: count }, (_, i) => i);
+
+  const contenders: Contender[] = [
+    {
+      // No grown counterpart: set_many reserves for the whole batch in one
+      // shot before inserting, so it sizes itself regardless of where it
+      // starts. Pre-sizing is not a factor here the way it is for set().
+      name: "SwissU32ToU32.setMany (wasm)",
+      prepare: () => {
+        swiss.clear();
+        return () => {
+          swiss.setMany(keys, values);
+          return swiss.size;
+        };
+      },
+    },
+    {
+      name: "SwissU32ToU32.set (per key, pre-sized)",
+      prepare: () => {
+        swiss.clear();
+        return () => {
+          for (let i = 0; i < count; i++) swiss.set(keys[i]!, values[i]!);
+          return swiss.size;
+        };
+      },
+    },
+    {
+      name: "SwissU32ToU32.set (per key, grown)",
+      prepare: async () => {
+        const table = await loadU32();
+        return () => {
+          for (let i = 0; i < count; i++) table.set(keys[i]!, values[i]!);
+          return table.size;
+        };
+      },
+    },
+    {
+      name: "Map",
+      prepare: () => {
+        const map = new Map<number, number>();
+        return () => {
+          for (let i = 0; i < count; i++) map.set(keys[i]!, values[i]!);
+          return map.size;
+        };
+      },
+    },
+  ];
+
+  report(
+    `u32 values: fill ${count.toLocaleString()} entries — sparse keys`,
+    await measureAll(contenders, count),
+  );
+
+  swiss.clear();
+  swiss.setMany(keys, values);
+
+  const map = new Map<number, number>();
+  for (let i = 0; i < count; i++) map.set(keys[i]!, values[i]!);
+
+  // Allocated once, outside the timed region, so the reused-buffer contender
+  // measures the steady state a caller reaches by passing its last result
+  // back rather than the first call that has to allocate.
+  const out = swiss.getMany(keys);
+
+  report(
+    `u32 values: lookup ${count.toLocaleString()} keys — sparse keys`,
+    await measureAll(
+      [
+        {
+          name: "SwissU32ToU32.getMany (wasm, reused out)",
+          prepare: () => () => swiss.getMany(keys, out).found.length,
+        },
+        {
+          name: "SwissU32ToU32.getMany (wasm, allocating)",
+          prepare: () => () => swiss.getMany(keys).found.length,
+        },
+        lookupContender(
+          "SwissU32ToU32.get (per key)",
+          count,
+          (i) => swiss.get(keys[i]!) !== undefined,
+        ),
+        lookupContender("Map", count, (i) => map.get(keys[i]!) !== undefined),
+      ],
+      count,
+      true,
+    ),
+  );
+}
+
+/** Distinct keys the counter workload spreads its increments over. */
+const COUNTER_KEYS = 1_000;
+
+/**
+ * Counting, which is what getOrInsert and increment exist for.
+ *
+ * A read-modify-write spelled as get-then-set crosses the boundary twice and
+ * probes twice for one logical operation. The saving is the crossing, so it
+ * shows up largest on the operations that do the least work per key — which
+ * is why it is measured here rather than inferred from the lookup rows.
+ */
+async function upsertScenario(keys: Uint32Array): Promise<void> {
+  const probes = Uint32Array.from(
+    { length: keys.length },
+    (_, i) => keys[i % COUNTER_KEYS]!,
+  );
+
+  await counterScenario(probes);
+  await getOrInsertScenario(keys, probes);
+}
+
+/** Increment against the two-crossing spelling and the JavaScript containers. */
+async function counterScenario(probes: Uint32Array): Promise<void> {
+  const count = probes.length;
+
+  const contenders: Contender[] = [
+    {
+      name: "SwissU32ToU32.increment (wasm)",
+      prepare: () => {
+        swiss.clear();
+        return () => {
+          for (let i = 0; i < count; i++) swiss.increment(probes[i]!);
+          return swiss.size;
+        };
+      },
+    },
+    {
+      name: "SwissU32ToU32.get + set (wasm)",
+      prepare: () => {
+        swiss.clear();
+        return () => {
+          for (let i = 0; i < count; i++) {
+            const key = probes[i]!;
+            swiss.set(key, (swiss.get(key) ?? 0) + 1);
+          }
+          return swiss.size;
+        };
+      },
+    },
+    {
+      name: "Map",
+      prepare: () => {
+        const map = new Map<number, number>();
+        return () => {
+          for (let i = 0; i < count; i++) {
+            const key = probes[i]!;
+            map.set(key, (map.get(key) ?? 0) + 1);
+          }
+          return map.size;
+        };
+      },
+    },
+    {
+      name: "Object (numeric keys)",
+      prepare: () => {
+        const object: Record<number, number> = Object.create(null);
+        return () => {
+          for (let i = 0; i < count; i++) {
+            const key = probes[i]!;
+            object[key] = (object[key] ?? 0) + 1;
+          }
+          // Cheap, and enough to keep the writes live; counting the keys
+          // here would time a walk rather than the increments.
+          return object[probes[0]!]!;
+        };
+      },
+    },
+  ];
+
+  report(
+    `count ${count.toLocaleString()} increments over ` +
+      `${COUNTER_KEYS.toLocaleString()} keys`,
+    await measureAll(contenders, count),
+  );
+}
+
+/**
+ * getOrInsert against get-then-set, measured on both sides of the branch
+ * that separates them.
+ *
+ * get-then-set crosses twice only when the key is absent — on a hit it
+ * returns after the first call and never issues the second. So the two are
+ * expected to tie on an all-hit workload and to diverge in proportion to the
+ * miss rate, and both ends are reported rather than one being generalized.
+ */
+async function getOrInsertScenario(
+  keys: Uint32Array,
+  probes: Uint32Array,
+): Promise<void> {
+  const count = keys.length;
+
+  report(
+    `getOrInsert ${count.toLocaleString()} keys, none present`,
+    await measureAll(
+      [
+        {
+          name: "SwissU32ToU32.getOrInsert (wasm)",
+          prepare: () => {
+            swiss.clear();
+            return () => {
+              for (let i = 0; i < count; i++) swiss.getOrInsert(keys[i]!, i);
+              return swiss.size;
+            };
+          },
+        },
+        {
+          name: "SwissU32ToU32.get, then set if absent (wasm)",
+          prepare: () => {
+            swiss.clear();
+            return () => {
+              for (let i = 0; i < count; i++) {
+                const key = keys[i]!;
+                if (swiss.get(key) === undefined) swiss.set(key, i);
+              }
+              return swiss.size;
+            };
+          },
+        },
+        {
+          name: "Map.get, then set if absent",
+          prepare: () => {
+            const fresh = new Map<number, number>();
+            return () => {
+              for (let i = 0; i < count; i++) {
+                const key = keys[i]!;
+                if (fresh.get(key) === undefined) fresh.set(key, i);
+              }
+              return fresh.size;
+            };
+          },
+        },
+      ],
+      count,
+    ),
+  );
+
+  swiss.clear();
+  const map = new Map<number, number>();
+  for (let i = 0; i < COUNTER_KEYS; i++) {
+    swiss.set(keys[i]!, i);
+    map.set(keys[i]!, i);
+  }
+
+  // Every probe hits, so nothing is inserted and the workload is read-only —
+  // which is what makes it replayable, and what isolates the crossing from
+  // the growth an insert would also pay for.
+  report(
+    `getOrInsert ${count.toLocaleString()} keys already present`,
+    await measureAll(
+      [
+        {
+          name: "SwissU32ToU32.getOrInsert (wasm)",
+          prepare: () => () => {
+            let sum = 0;
+            for (let i = 0; i < count; i++) sum += swiss.getOrInsert(probes[i]!, 0);
+            return sum;
+          },
+        },
+        {
+          name: "SwissU32ToU32.get, then set if absent (wasm)",
+          prepare: () => () => {
+            let sum = 0;
+            for (let i = 0; i < count; i++) {
+              const key = probes[i]!;
+              const value = swiss.get(key);
+              if (value === undefined) swiss.set(key, 0);
+              else sum += value;
+            }
+            return sum;
+          },
+        },
+        {
+          name: "Map.get, then set if absent",
+          prepare: () => () => {
+            let sum = 0;
+            for (let i = 0; i < count; i++) {
+              const key = probes[i]!;
+              const value = map.get(key);
+              if (value === undefined) map.set(key, 0);
+              else sum += value;
+            }
+            return sum;
+          },
+        },
+      ],
+      count,
+      true,
+    ),
+  );
+}
+
 async function stringKeyScenario(count: number): Promise<void> {
   const strings = Array.from({ length: count }, (_, i) => `token:${i}:${i * 7}`);
 
@@ -1884,7 +2181,9 @@ const SCENARIO_NAMES = [
   "overwrite",
   "delete",
   "churn",
+  "upsert",
   "bulk",
+  "bulk-u32",
   "batch-sweep",
   "delete-many",
   "load-factor",
@@ -2000,7 +2299,9 @@ const scenarios: Record<ScenarioName, () => Promise<void>> = {
   overwrite: () => overwriteScenario(sparseKeys),
   delete: () => deleteScenario(sparseKeys),
   churn: () => churnScenario(sparseKeys),
+  upsert: () => upsertScenario(sparseKeys),
   bulk: () => bulkScenario(sparseKeys),
+  "bulk-u32": () => bulkU32Scenario(sparseKeys),
   "batch-sweep": () => batchSweepScenario(sparseKeys),
   "delete-many": () => deleteManyScenario(sparseKeys),
   "load-factor": () => loadFactorScenario(50_000),

@@ -1,6 +1,6 @@
 {
   "name": "swisstable",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "WASM-resident SwissTable hash maps (u32 keys) with zero-callback hot paths and bulk transfer APIs",
   "type": "module",
   "license": "MIT",

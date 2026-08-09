@@ -1,3 +1,5 @@
+import { fileURLToPath } from "node:url";
+
 import { describe, expect, test } from "bun:test";
 
 /**
@@ -15,7 +17,11 @@ import { describe, expect, test } from "bun:test";
  * diagnose.
  */
 describe("probe termination", () => {
-  const fixture = new URL("./fixtures/probe-bound.ts", import.meta.url).pathname;
+  // fileURLToPath, not `.pathname`: on Windows the latter keeps the URL's
+  // leading slash, and `/D:/...` is not a path any process can open.
+  const fixture = fileURLToPath(
+    new URL("./fixtures/probe-bound.ts", import.meta.url),
+  );
 
   /**
    * Runs the probe in a subprocess.

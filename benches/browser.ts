@@ -19,6 +19,7 @@
 import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 /** Where the page is served from. Port 0 lets the OS pick a free one. */
 const HOST = "127.0.0.1";
@@ -210,7 +211,9 @@ function pageHtml(): string {
  */
 async function buildBundle(): Promise<string> {
   const built = await Bun.build({
-    entrypoints: [new URL("./bench.ts", import.meta.url).pathname],
+    // fileURLToPath, not `.pathname`: on Windows the latter keeps the URL's
+    // leading slash, and `/D:/...` is not a path any process can open.
+    entrypoints: [fileURLToPath(new URL("./bench.ts", import.meta.url))],
     target: "browser",
     format: "esm",
     // The page and its workers load the same file; a minified bundle would

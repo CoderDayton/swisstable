@@ -20,6 +20,7 @@
  */
 
 import { mkdir, writeFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 
 /**
  * What the browsers run.
@@ -43,9 +44,11 @@ interface RuntimeRun {
   readonly writesOwnOutput: boolean;
 }
 
-const benchEntry = new URL("./bench.ts", import.meta.url).pathname;
-const browserEntry = new URL("./browser.ts", import.meta.url).pathname;
-const resultsDirectory = new URL("./results/", import.meta.url).pathname;
+// fileURLToPath, not `.pathname`: on Windows the latter keeps the URL's
+// leading slash, and `/D:/...` is not a path any process can open.
+const benchEntry = fileURLToPath(new URL("./bench.ts", import.meta.url));
+const browserEntry = fileURLToPath(new URL("./browser.ts", import.meta.url));
+const resultsDirectory = fileURLToPath(new URL("./results/", import.meta.url));
 
 function scenarioFlag(scenarios: string | null): string[] {
   return scenarios === null ? [] : [`--scenario=${scenarios}`];

@@ -246,9 +246,18 @@ async function createBrowserRuntime(): Promise<Runtime> {
   };
 }
 
-/** The absolute path of the benchmark entry point, for re-execution. */
-function entryPath(): string {
-  return new URL("./bench.ts", import.meta.url).pathname;
+/**
+ * The absolute path of the benchmark entry point, for re-execution.
+ *
+ * Async because it resolves `fileURLToPath` the way everything else here
+ * reaches a node builtin — through {@link importNodeBuiltin}, so the browser
+ * bundle never carries a specifier its target cannot resolve. `.pathname`
+ * would need no import, but on Windows it keeps the URL's leading slash and
+ * `/D:/...` is not a path any process can open.
+ */
+async function entryPath(): Promise<string> {
+  const { fileURLToPath } = await importNodeBuiltin("url");
+  return fileURLToPath(new URL("./bench.ts", import.meta.url)) as string;
 }
 
 /**
@@ -339,8 +348,8 @@ async function createBunRuntime(): Promise<Runtime> {
     argv: () => Bun.argv.slice(2),
     readWasm: (fileName) =>
       Bun.file(new URL(WASM_DIRECTORY + fileName, import.meta.url)).arrayBuffer(),
-    isolate: (args) =>
-      childResult([process.execPath, entryPath(), ...args]),
+    isolate: async (args) =>
+      childResult([process.execPath, await entryPath(), ...args]),
     emit: (line) => console.log(line),
     publish: (text) => console.log(text),
     finish: () => process.exit(0),
@@ -385,12 +394,12 @@ async function createNodeRuntime(): Promise<Runtime> {
     // The child needs the same flags this process was given, or it would
     // measure with a collector it cannot trigger and strip types with a
     // warning on stdout.
-    isolate: (args) =>
+    isolate: async (args) =>
       childResult([
         execPath,
         "--expose-gc",
         "--disable-warning=ExperimentalWarning",
-        entryPath(),
+        await entryPath(),
         ...args,
       ]),
     emit: (line) => console.log(line),
@@ -431,7 +440,7 @@ async function createDenoRuntime(): Promise<Runtime> {
         bytes.byteOffset + bytes.byteLength,
       );
     },
-    isolate: (args) =>
+    isolate: async (args) =>
       childResult([
         Deno.execPath(),
         "run",
@@ -439,7 +448,7 @@ async function createDenoRuntime(): Promise<Runtime> {
         "--allow-read",
         "--allow-run",
         "--v8-flags=--expose-gc",
-        entryPath(),
+        await entryPath(),
         ...args,
       ]),
     emit: (line) => console.log(line),

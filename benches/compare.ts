@@ -11,6 +11,7 @@
  */
 
 import { readdir, readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 
 interface Result {
   readonly name: string;
@@ -310,7 +311,9 @@ interface Options {
 }
 
 function parseArgs(argv: readonly string[]): Options {
-  let results = new URL("./results/", import.meta.url).pathname;
+  // fileURLToPath, not `.pathname`: on Windows the latter keeps the URL's
+  // leading slash, and `/D:/...` is not a path any process can open.
+  let results = fileURLToPath(new URL("./results/", import.meta.url));
   let section: Options["section"] = "all";
 
   for (const arg of argv) {

@@ -31,6 +31,8 @@
     "./package.json": "./package.json"
   },
   "files": [
+    "CHANGELOG.md",
+    "SECURITY.md",
     "dist/js",
     "dist/wasm",
     "src",

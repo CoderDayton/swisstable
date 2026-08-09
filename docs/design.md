@@ -49,8 +49,8 @@ compare and one key comparison.
 
 ## Hash splitting
 
-Keys go through the Murmur3 finalizer, then split into two independent
-pieces:
+Keys are xored with the instance's seed, go through the Murmur3 finalizer,
+then split into two independent pieces:
 
 ```c
 static inline uint32_t h1(uint32_t hash) { return hash >> 7; }   // probe position
@@ -65,6 +65,13 @@ into a near-constant candidate set.
 The finalizer matters too. Keys are frequently dense or strided — indices,
 IDs, pointers shifted right — which a bare identity hash would pile onto a
 handful of groups.
+
+The seed goes in ahead of the finalizer, not onto its result. The finalizer
+is what spreads a one-bit difference across the word, so a seed applied
+afterwards would leave keys differing only in their low bits landing in the
+same group whatever the seed was. `set_seed` is refused once the table holds
+entries: their slots were chosen under the current permutation and nothing
+rehashes them.
 
 ## Probing
 
@@ -330,8 +337,8 @@ in `src/generated/<name>.ts`. `create()` decodes the latter, which is why it
 needs no loader and behaves the same on every runtime — no `fs`, no `fetch`,
 no bundler asset handling.
 
-The stripped modules are 4.4 KiB and 5.7 KiB, and base64 costs 33% over the
-raw bytes — about 3.4 KiB across both.
+The stripped modules are 4.6 KiB and 6.0 KiB, and base64 costs 33% over the
+raw bytes — about 3.5 KiB across both.
 Decoding runs once per process and takes a few microseconds against a
 compile that is orders of magnitude more, so the payload size is the only
 real cost and it is small.

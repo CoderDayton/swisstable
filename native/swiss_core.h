@@ -170,6 +170,22 @@ static uint32_t g_size = 0;
 static uint32_t g_growth_left = 0;
 
 /*
+ * Per-instance hash seed, mixed into every key before the finalizer.
+ *
+ * Zero until set_seed() runs, which the bindings do once at construction,
+ * before the first insert. An unseeded table is still correct — it is the
+ * fixed-permutation table this module shipped before — but its slot layout
+ * is identical in every process, so a chosen key set that collides in one
+ * collides in all of them. The seed is what makes that set unknowable
+ * without first learning the seed.
+ *
+ * It cannot change while entries exist: every live key was placed by the
+ * old permutation, and reseeding without a rehash would leave all of them
+ * unfindable. set_seed() enforces that rather than documenting it.
+ */
+static uint32_t g_seed = 0;
+
+/*
  * Counter of every event that re-permutes the slots: a rehash, a clear, or
  * an init.
  *
@@ -210,13 +226,19 @@ static inline uint32_t ctz32(uint32_t value) {
 }
 
 /*
- * Murmur3 finalizer.
+ * Murmur3 finalizer, keyed by g_seed.
  *
  * Keys are frequently dense or strided (indices, IDs, pointers >> 3), which
  * a bare identity hash would map onto a handful of groups. The finalizer
  * spreads every input bit across the whole word, which both h1 and h2 need.
+ *
+ * The seed is mixed in ahead of the finalizer rather than xored onto its
+ * result: the finalizer is what spreads a one-bit difference across the
+ * word, so a seed applied afterwards would leave keys differing in their
+ * low bits landing in the same group whatever the seed was.
  */
 static inline uint32_t mix_u32(uint32_t value) {
+  value ^= g_seed;
   value ^= value >> 16;
   value *= 0x85ebca6bu;
   value ^= value >> 13;
@@ -562,9 +584,24 @@ static int32_t upsert_slot(uint32_t key, uint32_t *slot_out) {
 /* ── Shared exported API ───────────────────────────────────────────── */
 
 /*
+ * Sets the hash seed. See g_seed.
+ *
+ * Rejected once the table holds entries, because their slots were chosen
+ * under the current seed and nothing here rehashes them.
+ */
+__attribute__((export_name("set_seed")))
+int32_t set_seed(uint32_t seed) {
+  if (g_size != 0) return STATUS_INVALID_ARGUMENT;
+
+  g_seed = seed;
+  return STATUS_OK;
+}
+
+/*
  * Sizes the table for `expected_entries` and empties it.
  *
- * Safe to call again to reset the table to a different size.
+ * Safe to call again to reset the table to a different size. Leaves the
+ * seed alone: it belongs to the instance, not to a sizing.
  */
 __attribute__((export_name("init")))
 int32_t init(uint32_t expected_entries) {

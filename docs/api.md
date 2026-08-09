@@ -109,8 +109,9 @@ the table for the next round rather than shrink the process.
 **A stored `0` is never confused with an absent key.** Presence is reported
 separately from the value, so no sentinel is overloaded anywhere in the API.
 
-**Loading is async, everything else is synchronous** — `load` is the only
-method that returns a promise.
+**Construction is async, everything else is synchronous** — `create`,
+`createWithSeed`, `load`, and `loadWithSeed` return promises, and no other
+method does.
 
 ## `SwissU32ToU32`
 
@@ -133,13 +134,45 @@ recompiling bytes on every call.
 
 `expectedEntries` behaves as it does for `load`.
 
-Throws `RangeError` if `expectedEntries` exceeds the compiled capacity.
+The hash is seeded from the runtime's CSPRNG, so the slot a key lands in
+differs between instances and between processes — see [Untrusted
+keys](#untrusted-keys-and-threading). Use `createWithSeed` when a run has to
+be reproducible.
+
+Throws `RangeError` if `expectedEntries` exceeds the compiled capacity, and
+`Error` if the runtime exposes neither `crypto.getRandomValues` nor
+`node:crypto`.
 
 Requires WebAssembly SIMD (v128): Node 16.9+, Chrome 91+, Firefox 89+, or
 Safari 16.4+. Call `supportsSimd()` first to branch on an unknown runtime;
 without it, this rejects with an `Error` naming the requirement.
 
 Prefer this unless you need control over loading, in which case use `load`.
+
+### `static createWithSeed(expectedEntries, seed)`
+
+```ts
+static createWithSeed(
+  expectedEntries: number,
+  seed: number,
+): Promise<SwissU32ToU32>
+```
+
+`create`, with `seed` in place of a random one. Two tables built with the
+same seed lay their entries out identically, which is what makes a benchmark
+comparable between runs and a layout-dependent bug reproducible.
+
+```ts
+const table = await SwissU32ToU32.createWithSeed(100_000, 0x5175_7ab1);
+```
+
+Throws `RangeError` if `seed` is not a `u32`.
+
+> **Do not fix a seed for data an attacker can choose.** The seed is the only
+> thing standing between a caller and a key set computed offline to collide,
+> and hardcoding one puts every process running that code back on the same
+> layout. Use it in tests, benchmarks, and reproducible builds; use `create`
+> everywhere else.
 
 ### `static load(wasmBytes, expectedEntries?)`
 
@@ -157,6 +190,10 @@ creating several tables, to skip validation and codegen each time.
 `expectedEntries` sizes the table up front. It is the cheapest optimization
 available here — filling a pre-sized table is ~3.2x faster than growing one
 from empty, because growth rehashes through every doubling.
+
+Seeding matches `create`: random per instance, with `loadWithSeed(wasmBytes,
+expectedEntries, seed)` as the reproducible form and the same warning
+attached.
 
 Throws `TypeError` if the instance does not export the expected symbols, and
 `RangeError` if `expectedEntries` exceeds the compiled capacity.
@@ -288,10 +325,10 @@ The reassembled value is `(hi × 2³²) + lo`.
 
 ### Everything `SwissU32ToU32` has
 
-`create`, `load`, `size`, `capacity`, `has`, `delete`, `reserve`,
-`shrinkToFit`, and `clear` behave identically, with `create` and `load`
-instantiating `swiss_u64.wasm` instead. Only the value-carrying methods
-differ:
+`create`, `createWithSeed`, `load`, `loadWithSeed`, `size`, `capacity`,
+`has`, `delete`, `reserve`, `shrinkToFit`, and `clear` behave identically,
+with the four constructors instantiating `swiss_u64.wasm` instead. Only the
+value-carrying methods differ:
 
 | Method | Returns |
 | --- | --- |
@@ -521,17 +558,29 @@ the lifetime of the interner. In a long-lived map with churning keys,
 
 ## Untrusted keys and threading
 
-**The hash is not seeded.** Keys go through a fixed Murmur3 finalizer, which
-is a public, invertible permutation, so an attacker who chooses key values
-can compute keys that share a probe group.
+**The hash is seeded per instance.** Every table draws a 32-bit seed from the
+runtime's CSPRNG — `crypto.getRandomValues`, or `node:crypto` on the Node
+versions predating the global — and mixes it into each key ahead of the
+Murmur3 finalizer. The finalizer alone is a public, invertible permutation:
+unseeded, the set of keys sharing a probe group is a property of the build,
+the same in every process, and computable offline by anyone holding the
+package. The seed makes it a property of the instance, so a key set that
+collides in one process does not collide in the next.
 
-The cost is bounded rather than unbounded, and the `u32` key space is what
-bounds it. The group index takes 20 bits of the hash at the default
-capacity, leaving 12 free — so **at most 4,096 distinct keys can share a
-group**, and the worst case measures about 5x slower lookups, not a stall.
-That is a budgeting question for a service whose keys come from user input,
-not a denial-of-service hole. If keys are fully attacker-chosen and the
-margin matters, hash them yourself before interning.
+What that does not buy: a 32-bit seed is not a keyed MAC. An attacker who can
+observe which keys collide — through timing, most plausibly — can search the
+seed space offline and then craft keys for the seed they recovered. What
+remains is the bound: the group index takes 20 bits of the hash at the
+default capacity, leaving 12 free, so **at most 4,096 distinct keys can share
+a group**, and the worst case measures about 5x slower lookups, not a stall.
+
+So the exposure is a recovered-seed attacker paying for a 5x slowdown, not a
+precomputed key set that stalls every process running this package. If keys
+are fully attacker-chosen and even that margin matters, hash them yourself
+before interning.
+
+`createWithSeed` and `loadWithSeed` opt out of the random seed. They exist
+for reproducible runs and should not be used for untrusted input.
 
 **A table is single-threaded.** One module instance is one table, and its
 state is plain memory with no atomics. Do not share an instance across
@@ -564,6 +613,8 @@ u32 and defeat the validation `set` performs at the boundary.
 | `BulkDeleteResult` | `{ deleted: Uint8Array; removedCount: number }` |
 | `NumericKeyTable<V>` | `set`/`get`/`has`/`delete`, plus optional `forEach`/`entries` — the contract `InternedSwissMap` needs |
 | `OwnedStringInterner` | `StringInterner` without `claim`/`release`/`forgetLast` — what `InternedSwissMap.interner` returns |
+| `BulkU32Source` | Any integer typed array, `BigInt64Array`/`BigUint64Array`, `readonly number[]`, or `readonly bigint[]` — what the bulk methods accept, with the per-element rules in [Bulk sources](#bulk-sources) |
+| `StringInternerOptions` | `{ recycleIds?: boolean; maxSize?: number }` — what the `StringInterner` constructor takes |
 
 `SwissU32ToU32` satisfies `NumericKeyTable<number>` directly, optional members
 included. `SwissU32ToU64` takes its value as two lanes, so wrap its

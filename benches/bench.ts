@@ -523,8 +523,30 @@ function report(scenario: string, results: readonly Result[]): void {
 const u32Bytes = await runtime.readWasm(U32_WASM);
 const u64Bytes = await runtime.readWasm(U64_WASM);
 
-const swiss = await SwissU32ToU32.load(u32Bytes, ENTRY_COUNT);
-const swiss64 = await SwissU32ToU64.load(u64Bytes, ENTRY_COUNT);
+/**
+ * Hash seed every table here is built with.
+ *
+ * A random seed permutes the slots, which moves entries between cache lines
+ * and shifts probe lengths a little in either direction. That is noise
+ * against a change being measured, and it does not average out within a run
+ * — one seed serves the whole process. Fixing it makes two runs comparable
+ * and a suspicious column reproducible. Nothing about a benchmark is
+ * untrusted input.
+ */
+const BENCH_SEED = 0x5175_7ab1;
+
+/** A `u32` table on the fixed seed, sized for `expectedEntries`. */
+function loadU32(expectedEntries = 0) {
+  return SwissU32ToU32.loadWithSeed(u32Bytes, expectedEntries, BENCH_SEED);
+}
+
+/** A `u64` table on the fixed seed, sized for `expectedEntries`. */
+function loadU64(expectedEntries = 0) {
+  return SwissU32ToU64.loadWithSeed(u64Bytes, expectedEntries, BENCH_SEED);
+}
+
+const swiss = await loadU32(ENTRY_COUNT);
+const swiss64 = await loadU64(ENTRY_COUNT);
 
 /**
  * The SwissTable appears twice on purpose.
@@ -557,7 +579,7 @@ async function fillScenario(label: string, keys: Uint32Array): Promise<void> {
     {
       name: "SwissU32ToU32 (wasm, grown)",
       prepare: async () => {
-        const table = await SwissU32ToU32.load(u32Bytes);
+        const table = await loadU32();
         return () => {
           for (let i = 0; i < count; i++) table.set(keys[i]!, i);
           return table.size;
@@ -704,7 +726,7 @@ async function bulkScenario(keys: Uint32Array): Promise<void> {
     {
       name: "SwissU32ToU64.set (per key, grown)",
       prepare: async () => {
-        const table = await SwissU32ToU64.load(u64Bytes);
+        const table = await loadU64();
         return () => {
           for (let i = 0; i < count; i++) {
             table.set(keys[i]!, valsLo[i]!, valsHi[i]!);
@@ -859,7 +881,7 @@ async function scaleSweep(sizes: readonly number[]): Promise<void> {
 
     // A fresh instance per size: clear() retains the capacity of the
     // previous, larger run, which would inflate the smaller sizes.
-    const table = await SwissU32ToU32.load(u32Bytes, count);
+    const table = await loadU32(count);
 
     for (let i = 0; i < count; i++) {
       table.set(keys[i]!, i);
@@ -929,8 +951,8 @@ async function iterationScenario(keys: Uint32Array): Promise<void> {
   const count = keys.length;
 
   const map = new Map<number, number>();
-  const table = await SwissU32ToU32.load(u32Bytes, count);
-  const table64 = await SwissU32ToU64.load(u64Bytes, count);
+  const table = await loadU32(count);
+  const table64 = await loadU64(count);
 
   for (let i = 0; i < count; i++) {
     map.set(keys[i]!, i);
@@ -1055,7 +1077,7 @@ async function iterationScenario(keys: Uint32Array): Promise<void> {
  */
 async function shrinkScenario(peak: number, remaining: number): Promise<void> {
   const keys = makeSparseKeys(peak);
-  const table = await SwissU32ToU32.load(u32Bytes, peak);
+  const table = await loadU32(peak);
 
   for (let i = 0; i < peak; i++) table.set(keys[i]!, i);
   for (let i = remaining; i < peak; i++) table.delete(keys[i]!);
@@ -1221,7 +1243,7 @@ async function memoryScenario(keys: Uint32Array): Promise<void> {
     [
       "SwissU32ToU32",
       async () => {
-        const table = await SwissU32ToU32.load(u32Bytes, count);
+        const table = await loadU32(count);
         for (let i = 0; i < count; i++) table.set(keys[i]!, i);
         return table;
       },
@@ -1229,7 +1251,7 @@ async function memoryScenario(keys: Uint32Array): Promise<void> {
     [
       "SwissU32ToU64",
       async () => {
-        const table = await SwissU32ToU64.load(u64Bytes, count);
+        const table = await loadU64(count);
         for (let i = 0; i < count; i++) {
           table.set(keys[i]!, valsLo[i]!, valsHi[i]!);
         }
@@ -1321,7 +1343,7 @@ async function memoryScenario(keys: Uint32Array): Promise<void> {
   // reports, and the per-slot layout is what the modules are linked with.
   // This is the figure that scales, and the one a reader should compare
   // against a container's measured bytes per entry.
-  const sized = await SwissU32ToU32.load(u32Bytes, count);
+  const sized = await loadU32(count);
   const slots = sized.capacity;
   const ceilingEntries = (slots * 7) / 8;
 
@@ -1574,7 +1596,7 @@ async function loadFactorScenario(entries: number): Promise<void> {
   const contenders: Contender[] = [];
 
   for (const reserved of [entries, entries * 2, entries * 4, entries * 8]) {
-    const table = await SwissU32ToU32.load(u32Bytes, reserved);
+    const table = await loadU32(reserved);
     for (let i = 0; i < entries; i++) table.set(keys[i]!, i);
 
     const load = ((entries / table.capacity) * 100).toFixed(0);
@@ -1724,8 +1746,8 @@ async function taggingScenario(count: number): Promise<void> {
   const high = Uint32Array.from(low, (key) => (key | 0x8000_0000) >>> 0);
   const boxed = Array.from(high);
 
-  const lowTable = await SwissU32ToU32.load(u32Bytes, count);
-  const highTable = await SwissU32ToU32.load(u32Bytes, count);
+  const lowTable = await loadU32(count);
+  const highTable = await loadU32(count);
 
   for (let i = 0; i < count; i++) {
     lowTable.set(low[i]!, i);
@@ -1763,7 +1785,7 @@ async function maintenanceScenario(count: number): Promise<void> {
   const keys = makeSparseKeys(count);
 
   const filled = async (reserved: number): Promise<SwissU32ToU32> => {
-    const table = await SwissU32ToU32.load(u32Bytes, reserved);
+    const table = await loadU32(reserved);
     for (let i = 0; i < count; i++) table.set(keys[i]!, i);
     return table;
   };
@@ -1819,7 +1841,7 @@ async function internScenario(count: number): Promise<void> {
     {
       name: "InternedSwissMap.set (per key)",
       prepare: async () => {
-        const table = await SwissU32ToU32.load(u32Bytes, count);
+        const table = await loadU32(count);
         const interned = new InternedSwissMap<number>(table);
         return () => {
           for (let i = 0; i < count; i++) interned.set(strings[i]!, i);

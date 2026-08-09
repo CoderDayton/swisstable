@@ -155,6 +155,7 @@ const TARGETS: readonly WasmTarget[] = [
     // 0.5 MiB of scan staging buffers, plus stack and section headroom.
     overheadBytes: 2 * MIB,
     exports: [
+      "set_seed",
       "init",
       "reserve",
       "shrink_to_fit",
@@ -184,6 +185,7 @@ const TARGETS: readonly WasmTarget[] = [
     // plus stack and section headroom.
     overheadBytes: 3 * MIB,
     exports: [
+      "set_seed",
       "init",
       "reserve",
       "shrink_to_fit",

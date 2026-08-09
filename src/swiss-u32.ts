@@ -11,6 +11,7 @@ import {
 import type { ScanExports } from "./abi.ts";
 import { embeddedModule } from "./embedded.ts";
 import { SWISS_U32_WASM_BASE64 } from "./generated/swiss_u32.ts";
+import { randomSeed } from "./seed.ts";
 import { instantiate } from "./wasm.ts";
 import type { WasmSource } from "./wasm.ts";
 
@@ -26,6 +27,8 @@ export interface SwissU32WasmExports extends ScanExports {
   /** The module's linear memory. Fixed size; never grown. */
   memory: WebAssembly.Memory;
 
+  /** Sets the hash seed. Rejected once the table holds entries. */
+  set_seed(seed: number): number;
   /** Sizes the table for `expectedEntries` and empties it. */
   init(expectedEntries: number): number;
   /** Grows the table so `entries` fit without a further rehash. */
@@ -140,6 +143,7 @@ class EntryIterator extends ScanIterator<[number, number]> {
  * bare "is not a function" at the first call site that reaches it.
  */
 const REQUIRED_U32_EXPORTS = [
+  "set_seed",
   "init",
   "reserve",
   "shrink_to_fit",
@@ -277,13 +281,48 @@ export class SwissU32ToU32 {
    * on every runtime, and the module is compiled once and shared by every
    * table created this way.
    *
+   * The hash is seeded from the runtime's CSPRNG, so the slot a key lands in
+   * differs between instances and between processes. Use
+   * {@link SwissU32ToU32.createWithSeed} when a run has to be reproducible.
+   *
    * @param expectedEntries - Entry count to size the table for up front,
    *   avoiding rehashes during the initial fill.
    * @returns The new table.
    * @throws {RangeError} If `expectedEntries` exceeds the compiled capacity.
+   * @throws {Error} If the runtime exposes no cryptographic random source.
    */
   static async create(expectedEntries = 0): Promise<SwissU32ToU32> {
-    return SwissU32ToU32.load(await compileEmbedded(), expectedEntries);
+    return SwissU32ToU32.createWithSeed(expectedEntries, await randomSeed());
+  }
+
+  /**
+   * Creates a table whose hash uses `seed` instead of a random one.
+   *
+   * Two tables built with the same seed lay their entries out identically,
+   * which is what makes a benchmark comparable between runs and a
+   * layout-dependent bug reproducible.
+   *
+   * **Do not use a fixed seed for data an attacker can choose.** The seed is
+   * the only thing standing between a caller and a key set computed offline
+   * to collide; hardcoding one puts every process running that code back on
+   * the same layout. Reach for this in tests, benchmarks, and reproducible
+   * builds, and for nothing that reaches untrusted input.
+   *
+   * @param expectedEntries - Entry count to size the table for up front.
+   * @param seed - Unsigned 32-bit hash seed.
+   * @returns The new table.
+   * @throws {RangeError} If `seed` is not an unsigned 32-bit integer, or if
+   *   `expectedEntries` exceeds the compiled capacity.
+   */
+  static async createWithSeed(
+    expectedEntries: number,
+    seed: number,
+  ): Promise<SwissU32ToU32> {
+    return SwissU32ToU32.loadWithSeed(
+      await compileEmbedded(),
+      expectedEntries,
+      seed,
+    );
   }
 
   /**
@@ -294,6 +333,11 @@ export class SwissU32ToU32 {
    * across workers, a custom asset path. {@link create} covers the common
    * case without a loader.
    *
+   * Seeding matches {@link create}: the hash is seeded from the runtime's
+   * CSPRNG, so the slot a key lands in differs between instances and between
+   * processes. Use {@link SwissU32ToU32.loadWithSeed} when a run has to be
+   * reproducible.
+   *
    * @param wasmBytes - Module bytes, or a module already compiled with
    *   {@link WebAssembly.compile}. Compile once and pass the module when
    *   creating several tables.
@@ -302,11 +346,44 @@ export class SwissU32ToU32 {
    * @returns The loaded table.
    * @throws {TypeError} If the instance does not export the expected symbols.
    * @throws {RangeError} If `expectedEntries` exceeds the compiled capacity.
+   * @throws {Error} If the runtime exposes no cryptographic random source.
    */
   static async load(
     wasmBytes: WasmSource | WebAssembly.Module,
     expectedEntries = 0,
   ): Promise<SwissU32ToU32> {
+    return SwissU32ToU32.loadWithSeed(
+      wasmBytes,
+      expectedEntries,
+      await randomSeed(),
+    );
+  }
+
+  /**
+   * Instantiates a caller-supplied module with `seed` instead of a random
+   * one.
+   *
+   * {@link SwissU32ToU32.load} with the seeding rules of
+   * {@link SwissU32ToU32.createWithSeed} — read the warning there before
+   * fixing a seed.
+   *
+   * @param wasmBytes - Module bytes, or an already-compiled module.
+   * @param expectedEntries - Entry count to size the table for up front.
+   * @param seed - Unsigned 32-bit hash seed.
+   * @returns The loaded table.
+   * @throws {TypeError} If the instance does not export the expected symbols.
+   * @throws {RangeError} If `seed` is not an unsigned 32-bit integer, or if
+   *   `expectedEntries` exceeds the compiled capacity.
+   */
+  static async loadWithSeed(
+    wasmBytes: WasmSource | WebAssembly.Module,
+    expectedEntries: number,
+    seed: number,
+  ): Promise<SwissU32ToU32> {
+    // Validated before the module is instantiated, so a bad seed costs a
+    // throw rather than a 20 MiB instance the caller never receives.
+    const checked = asWasmI32(seed, "seed");
+
     const instance = await instantiate(wasmBytes);
     const wasm = instance.exports as unknown as SwissU32WasmExports;
 
@@ -320,6 +397,11 @@ export class SwissU32ToU32 {
     }
 
     const table = new SwissU32ToU32(wasm);
+
+    // Before init(), and so before any insert: the seed picks the
+    // permutation every live entry's slot was chosen under, and the module
+    // refuses to change it once there is one.
+    assertStatus(wasm.set_seed(checked), "seed", "SwissU32ToU32");
 
     assertStatus(
       wasm.init(asWasmI32(expectedEntries, "expectedEntries")),

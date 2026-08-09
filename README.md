@@ -85,11 +85,12 @@ distinguishable from an absent key. See [docs/api.md](docs/api.md) for every
 method and thrown error, and [`examples/`](examples/README.md) for five
 runnable programs.
 
-Two operational notes. Keys are hashed with an unseeded finalizer, so keys
-chosen by an attacker can be made to collide; the cost is bounded rather
-than unbounded, but budget for it when keys come from untrusted input. And a
-table is single-threaded — one instance is one table, and no instance may be
-shared across workers. Both are covered in
+Two operational notes. Each table seeds its hash from the runtime's CSPRNG,
+so a colliding key set cannot be computed offline and reused across
+processes; `createWithSeed` fixes the seed for reproducible runs and should
+not be pointed at untrusted input. And a table is single-threaded — one
+instance is one table, and no instance may be shared across workers. Both
+are covered in
 [Untrusted keys and threading](docs/api.md#untrusted-keys-and-threading).
 
 ## When not to use this
@@ -141,7 +142,7 @@ same form, and records the engine, CPU, and clock each column was taken on.
 bun install
 bun run hooks      # lefthook pre-commit and pre-push gates
 bun run build      # compile native/*.c to dist/wasm/*.wasm
-bun test           # 201 tests across 20 suites
+bun test           # 213 tests across 21 suites
 bun run typecheck
 bun run smoke      # the built package under plain Node
 bun run smoke:browser  # the built package in Chrome or Firefox

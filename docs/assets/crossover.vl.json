@@ -1,0 +1,326 @@
+{
+  "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+  "title": {
+    "text": "Where the WASM crossing pays for itself",
+    "subtitle": "Sparse u32 lookup hit. Above the 1x line the table beats Map. Log scale on entries."
+  },
+  "width": 520,
+  "height": 300,
+  "encoding": {
+    "y": {
+      "field": "speedup",
+      "type": "quantitative",
+      "scale": {
+        "domain": [
+          0,
+          3.8
+        ],
+        "nice": false
+      },
+      "axis": {
+        "title": "speedup against Map",
+        "values": [
+          0,
+          1,
+          2,
+          3
+        ],
+        "labelExpr": "datum.value + 'x'",
+        "grid": true,
+        "gridDash": [
+          2,
+          3
+        ]
+      }
+    }
+  },
+  "layer": [
+    {
+      "data": {
+        "values": [
+          {
+            "speedup": 1
+          }
+        ]
+      },
+      "mark": {
+        "type": "rule",
+        "color": "#9a9a9a",
+        "strokeDash": [
+          4,
+          3
+        ]
+      }
+    },
+    {
+      "data": {
+        "values": [
+          {
+            "entries": 2000,
+            "runtime": "Bun 1.3",
+            "speedup": 0.67
+          },
+          {
+            "entries": 2000,
+            "runtime": "Node 24",
+            "speedup": 0.75
+          },
+          {
+            "entries": 2000,
+            "runtime": "Deno 2.9",
+            "speedup": 1.1
+          },
+          {
+            "entries": 2000,
+            "runtime": "Chrome 151",
+            "speedup": 0.79
+          },
+          {
+            "entries": 2000,
+            "runtime": "Firefox 153",
+            "speedup": 0.32
+          },
+          {
+            "entries": 8000,
+            "runtime": "Bun 1.3",
+            "speedup": 0.91
+          },
+          {
+            "entries": 8000,
+            "runtime": "Node 24",
+            "speedup": 1.84
+          },
+          {
+            "entries": 8000,
+            "runtime": "Deno 2.9",
+            "speedup": 2.93
+          },
+          {
+            "entries": 8000,
+            "runtime": "Chrome 151",
+            "speedup": 2.41
+          },
+          {
+            "entries": 8000,
+            "runtime": "Firefox 153",
+            "speedup": 1.72
+          },
+          {
+            "entries": 16000,
+            "runtime": "Bun 1.3",
+            "speedup": 1.44
+          },
+          {
+            "entries": 16000,
+            "runtime": "Node 24",
+            "speedup": 3.11
+          },
+          {
+            "entries": 16000,
+            "runtime": "Deno 2.9",
+            "speedup": 3.33
+          },
+          {
+            "entries": 16000,
+            "runtime": "Chrome 151",
+            "speedup": 2.72
+          },
+          {
+            "entries": 16000,
+            "runtime": "Firefox 153",
+            "speedup": 1.87
+          },
+          {
+            "entries": 32000,
+            "runtime": "Bun 1.3",
+            "speedup": 1.29
+          },
+          {
+            "entries": 32000,
+            "runtime": "Node 24",
+            "speedup": 3.18
+          },
+          {
+            "entries": 32000,
+            "runtime": "Deno 2.9",
+            "speedup": 3.45
+          },
+          {
+            "entries": 32000,
+            "runtime": "Chrome 151",
+            "speedup": 2.84
+          },
+          {
+            "entries": 32000,
+            "runtime": "Firefox 153",
+            "speedup": 1.91
+          },
+          {
+            "entries": 128000,
+            "runtime": "Bun 1.3",
+            "speedup": 1.55
+          },
+          {
+            "entries": 128000,
+            "runtime": "Node 24",
+            "speedup": 3.05
+          },
+          {
+            "entries": 128000,
+            "runtime": "Deno 2.9",
+            "speedup": 3.49
+          },
+          {
+            "entries": 128000,
+            "runtime": "Chrome 151",
+            "speedup": 2.92
+          },
+          {
+            "entries": 128000,
+            "runtime": "Firefox 153",
+            "speedup": 1.96
+          },
+          {
+            "entries": 512000,
+            "runtime": "Bun 1.3",
+            "speedup": 1.52
+          },
+          {
+            "entries": 512000,
+            "runtime": "Node 24",
+            "speedup": 2.83
+          },
+          {
+            "entries": 512000,
+            "runtime": "Deno 2.9",
+            "speedup": 3.31
+          },
+          {
+            "entries": 512000,
+            "runtime": "Chrome 151",
+            "speedup": 2.77
+          },
+          {
+            "entries": 512000,
+            "runtime": "Firefox 153",
+            "speedup": 1.76
+          }
+        ]
+      },
+      "mark": {
+        "type": "line",
+        "strokeWidth": 2,
+        "point": {
+          "filled": true,
+          "size": 55
+        }
+      },
+      "encoding": {
+        "x": {
+          "field": "entries",
+          "type": "quantitative",
+          "scale": {
+            "type": "log",
+            "domain": [
+              1800,
+              600000
+            ],
+            "nice": false
+          },
+          "axis": {
+            "title": "entries",
+            "values": [
+              2000,
+              8000,
+              16000,
+              32000,
+              128000,
+              512000
+            ],
+            "labelExpr": "datum.value >= 1000 ? datum.value / 1000 + 'k' : datum.value",
+            "grid": true,
+            "gridDash": [
+              2,
+              3
+            ]
+          }
+        },
+        "color": {
+          "field": "runtime",
+          "type": "nominal",
+          "sort": [
+            "Bun 1.3",
+            "Node 24",
+            "Deno 2.9",
+            "Chrome 151",
+            "Firefox 153"
+          ],
+          "title": "runtime",
+          "legend": {
+            "orient": "bottom",
+            "direction": "horizontal",
+            "columns": 5,
+            "symbolType": "circle"
+          }
+        },
+        "tooltip": [
+          {
+            "field": "runtime"
+          },
+          {
+            "field": "entries",
+            "format": ","
+          },
+          {
+            "field": "speedup",
+            "format": ".2f"
+          }
+        ]
+      }
+    }
+  ],
+  "config": {
+    "background": "#ffffff",
+    "view": {
+      "stroke": null
+    },
+    "axis": {
+      "labelFont": "Helvetica, Arial, sans-serif",
+      "titleFont": "Helvetica, Arial, sans-serif",
+      "labelFontSize": 11,
+      "titleFontSize": 12,
+      "labelColor": "#333",
+      "titleColor": "#333",
+      "domainColor": "#999",
+      "tickColor": "#999",
+      "gridColor": "#e6e6e6"
+    },
+    "legend": {
+      "labelFont": "Helvetica, Arial, sans-serif",
+      "titleFont": "Helvetica, Arial, sans-serif",
+      "labelFontSize": 11,
+      "titleFontSize": 12,
+      "labelColor": "#333",
+      "titleColor": "#333"
+    },
+    "title": {
+      "font": "Helvetica, Arial, sans-serif",
+      "fontSize": 14,
+      "subtitleFont": "Helvetica, Arial, sans-serif",
+      "subtitleFontSize": 11,
+      "subtitleColor": "#666",
+      "color": "#222",
+      "anchor": "start",
+      "offset": 12
+    },
+    "range": {
+      "category": [
+        "#e5a13a",
+        "#4a9e5c",
+        "#3b7dd8",
+        "#c0504d",
+        "#8a63c9"
+      ]
+    }
+  }
+}

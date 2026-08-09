@@ -36,8 +36,8 @@ Docs: [API](docs/api.md) · [Design](docs/design.md) ·
   Lower `SWISS_MAX_CAPACITY_LOG2` for many small tables — see
   [Footprint](docs/design.md#footprint). `dispose()`, or a `using`
   declaration, hands an instance back without waiting for the collector.
-- Bulk `setMany`/`getMany`/`deleteMany` cross once per batch: 7.1–8.8 ns/op
-  against `Map`'s 47–78 on a 100,000-entry u64 fill.
+- Bulk `setMany`/`getMany`/`deleteMany` cross once per batch: 7.3–8.7 ns/op
+  against `Map`'s 47–71 on a 100,000-entry u64 fill.
 - No allocator — fixed linear memory, linked `-nostdlib`, never calls
   `memory.grow`, nothing allocated on a hot path.
 - Ships compiled ESM with type declarations, and the modules are compiled in:
@@ -111,17 +111,17 @@ Speedup against `Map` at 100,000 sparse `u32` keys — above 1.00x the table is
 faster. Median of 21 rounds and of 3 passes, each contender in an isolate of
 its own, probed in a shuffled order. i9-13900K on x64 Linux.
 
-| Workload | Bun 1.3 | Node 24 | Deno 2.9 | Chrome 151 | Firefox 152 |
+| Workload | Bun 1.3 | Node 24 | Deno 2.9 | Chrome 151 | Firefox 153 |
 | --- | --- | --- | --- | --- | --- |
-| fill (pre-sized) | 8.8x | 7.2x | 6.6x | 3.5x | 5.1x |
-| lookup hit | 1.55x | 3.2x | 3.6x | 3.0x | 1.76x |
-| lookup miss | 1.40x | 3.7x | 3.8x | 2.8x | 1.72x |
-| `has` | 1.89x | 3.7x | 4.2x | 3.6x | 2.1x |
-| overwrite existing key | 2.4x | 3.1x | 3.3x | 2.9x | 3.4x |
-| delete | 5.6x | 6.2x | 6.3x | 5.0x | 4.4x |
-| churn (delete + reinsert) | 3.3x | 3.9x | 4.0x | 3.1x | 2.8x |
-| u64 bulk fill (`setMany`) | 6.4x | 11x | 8.3x | 5.4x | 9.3x |
-| u64 bulk lookup (`getMany`) | 1.72x | 4.2x | 3.8x | 3.4x | 2.5x |
+| fill (pre-sized) | 8.5x | 6.4x | 6.0x | 4.3x | 5.2x |
+| lookup hit | 1.57x | 2.9x | 3.2x | 2.6x | 1.78x |
+| lookup miss | 1.41x | 3.3x | 3.5x | 2.6x | 1.76x |
+| `has` | 1.82x | 3.3x | 3.6x | 3.1x | 2.0x |
+| overwrite existing key | 2.3x | 2.7x | 2.9x | 2.8x | 3.3x |
+| delete | 5.5x | 5.5x | 5.5x | 4.1x | 4.3x |
+| churn (delete + reinsert) | 3.2x | 3.6x | 3.7x | 2.9x | 3.2x |
+| u64 bulk fill (`setMany`) | 6.4x | 8.2x | 7.7x | 6.2x | 8.8x |
+| u64 bulk lookup (`getMany`) | 1.65x | 3.8x | 3.6x | 3.3x | 2.4x |
 
 The table costs about the same on every engine. The columns differ because
 `Map` does.

@@ -19,7 +19,7 @@
  *                                   [--repeat=n]
  */
 
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readdir, rename, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
 /**
@@ -147,8 +147,48 @@ function parseArgs(argv: readonly string[]): Options {
   return { runtimes, scenarios, repeats };
 }
 
+/**
+ * Moves the previous sweep's files into a dated folder beside them.
+ *
+ * A sweep this one does not repeat — a runtime that was uninstalled since,
+ * or a `--runtime` subset — leaves its files behind, and mixing two sweeps
+ * in one directory publishes numbers from two different builds under one
+ * heading. Archiving rather than deleting keeps the comparison available:
+ * `compare.ts --results=<folder>` reads any of them.
+ *
+ * `compare.ts` lists the directory without recursing, so an archive sitting
+ * inside it is invisible to the next run.
+ *
+ * @returns The folder the previous sweep was moved to, or null if there was
+ *   nothing to move.
+ */
+async function archivePreviousSweep(): Promise<string | null> {
+  const stale = (await readdir(resultsDirectory)).filter((name) =>
+    name.endsWith(".json"),
+  );
+
+  if (stale.length === 0) return null;
+
+  // Sorts lexicographically into chronological order, and carries no colon,
+  // which is not a filename character on Windows.
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const archive = `${resultsDirectory}${stamp}/`;
+  await mkdir(archive, { recursive: true });
+
+  for (const name of stale) {
+    await rename(`${resultsDirectory}${name}`, `${archive}${name}`);
+  }
+
+  return archive;
+}
+
 const options = parseArgs(Bun.argv.slice(2));
 await mkdir(resultsDirectory, { recursive: true });
+
+const archived = await archivePreviousSweep();
+if (archived !== null) {
+  console.log(`moved the previous sweep to ${archived}`);
+}
 
 const failures: string[] = [];
 

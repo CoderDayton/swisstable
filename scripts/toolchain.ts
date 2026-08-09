@@ -16,7 +16,7 @@
  */
 
 import { chmod, mkdir, rename, rm, stat } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 
 const ROOT = resolve(import.meta.dir, "..");
 
@@ -202,22 +202,42 @@ async function verify(target: Release, archive: string): Promise<void> {
 }
 
 /**
+ * The `tar` that can read the archive for this host.
+ *
+ * Every host but Windows gets a `tar` that detects xz, and PATH is the right
+ * way to find it. Windows is the exception twice over: the download there is
+ * a zip, which only bsdtar reads, and the first `tar` on PATH under the
+ * git-bash shell CI runs is GNU tar, which reads no zip at all. Windows
+ * ships bsdtar at a fixed location under System32, so naming it outright is
+ * what makes the format work.
+ */
+function tarBinary(): string {
+  if (process.platform !== "win32") return "tar";
+
+  return join(Bun.env.SystemRoot ?? "C:\\Windows", "System32", "tar.exe");
+}
+
+/**
  * Unpacks into a scratch directory and moves the result into place, so an
  * interrupted extraction never leaves a half-populated toolchain that the
  * next build would pick up and use.
- *
- * `tar` reads both formats on every supported host: GNU tar detects xz, and
- * the bsdtar that Windows ships handles zip.
  */
 async function extract(archive: string, into: string): Promise<void> {
   const staging = `${into}.incoming`;
   await rm(staging, { recursive: true, force: true });
   await mkdir(staging, { recursive: true });
 
-  const result = Bun.spawnSync(["tar", "-xf", archive, "-C", staging], {
-    stdout: "inherit",
-    stderr: "inherit",
-  });
+  // Named without its directory, from that directory. An absolute Windows
+  // path opens with a drive letter, which tar reads as the `host:path` of a
+  // remote archive and refuses to resolve before it ever opens the file.
+  const result = Bun.spawnSync(
+    [tarBinary(), "-xf", basename(archive), "-C", staging],
+    {
+      cwd: dirname(archive),
+      stdout: "inherit",
+      stderr: "inherit",
+    },
+  );
 
   if (result.exitCode !== 0) {
     await rm(staging, { recursive: true, force: true });

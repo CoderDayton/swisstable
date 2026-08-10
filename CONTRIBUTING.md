@@ -71,6 +71,8 @@ examples/       runnable examples, start at 01-basic.ts
 test/           bun test suites
 docs/           api.md, design.md, performance.md, and plans/
 dist/wasm/      build output (generated, not committed)
+                also holds two test-only modules, swiss_u32_capped and
+                swiss_u32_starved, which are never embedded or published
 ```
 
 ## The loop
@@ -81,7 +83,7 @@ bun run build      # both steps below
 bun run build:wasm # native/*.c -> dist/wasm/*.wasm + src/generated/*.ts
 bun run build:js   # src/*.ts   -> dist/js/*.js + .d.ts
 
-bun test           # 246 tests across 24 suites
+bun test           # 252 tests across 24 suites
 bun run typecheck  # tsc --noEmit
 bun run check:ubsan  # rebuild with UBSan trapping and exercise the arithmetic
 bun run smoke      # the built package under plain Node
@@ -132,17 +134,22 @@ If you add or rename an export, update the `exports` list in
 The linker does not fail on a missing `--export=` symbol — the error surfaces
 at `load()` as a `TypeError`, so tests are what catch it.
 
-`MAX_CAPACITY` is set by `MAX_CAPACITY_LOG2`, a power-of-two exponent
-defaulting to 20 via `#ifndef` and overridable with the
-`SWISS_MAX_CAPACITY_LOG2` environment variable at build time. It is accepted
-in `[4, 25]`, enforced identically in `native/swiss_core.h` and
-`scripts/build-wasm.ts`: below 4 a bank holds less than one SIMD group, and
-above 25 `h1()` has no bits left to address the extra slots with. Linear memory is
-derived from it in `scripts/build-wasm.ts` (bytes-per-slot times slots, plus
-fixed overhead), so there is no second figure to keep in step — but if you add
-a static array, raise that target's `overheadBytes`. The statics have to fit
-in the linked linear memory, and the link fails with "initial memory too
-small" if they do not, so the arithmetic is checked by every build.
+`MAX_CAPACITY` is set by `MAX_CAPACITY_LOG2`, a power-of-two exponent. Each
+source sets its own via `#ifndef` (27 for `swiss_u32.c`, 26 for
+`swiss_u64.c`), and `SWISS_MAX_CAPACITY_LOG2` overrides both at build time.
+The accepted range is `[4, 29]`, checked in `native/swiss_core.h` and
+`scripts/build-wasm.ts`. Below 4 a bank holds less than one SIMD group;
+above 29 the 32-bit product in `MAX_LIVE()` wraps.
+
+What binds first is narrower and depends on the entry width: three banks
+have to address inside wasm32. A `_Static_assert` in `swiss_core.h` checks
+that against `sizeof(Entry)`, so an exponent a module cannot address fails
+the build. That is why the two modules differ by one.
+
+If you add a static array, raise that target's `staticBytes` in
+`scripts/build-wasm.ts`. Statics have to fit below the initial memory, and
+the link fails with "initial memory too small" if they do not, so every
+build checks it.
 
 ## Changing the benchmarks
 

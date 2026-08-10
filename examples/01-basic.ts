@@ -3,7 +3,7 @@
  *
  * Covers creating a table, the read/write methods, and the two behaviours
  * that differ from `Map`: keys and values are strictly unsigned 32-bit, and
- * capacity is fixed at build time rather than grown on demand.
+ * capacity is bounded at build time rather than unbounded.
  *
  * Run with `bun run examples/01-basic.ts`.
  */

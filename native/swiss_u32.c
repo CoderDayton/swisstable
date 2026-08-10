@@ -40,6 +40,22 @@
  */
 #define SCAN_WINDOW BULK_CAPACITY
 
+/*
+ * Slots this module's table can reach, as a power-of-two exponent.
+ *
+ * Set by the widest bank three of these entries can address inside wasm32 —
+ * see the _Static_assert in swiss_core.h — which is what the ceiling is now
+ * bounded by. At 7/8 that is 117,440,512 live entries.
+ *
+ * It costs address space, not memory: an instance reserves its static data
+ * and grows into a bank only as the table reaches it.
+ *
+ * Guarded so scripts/build-wasm.ts can override it with -D.
+ */
+#ifndef MAX_CAPACITY_LOG2
+#define MAX_CAPACITY_LOG2 27
+#endif
+
 #include "swiss_core.h"
 
 /*
@@ -95,7 +111,7 @@ int32_t set(uint32_t key, uint32_t value) {
   const int32_t status = upsert_slot(key, &slot);
   if (status != STATUS_OK) return status;
 
-  g_entries[g_active_bank][slot].value = value;
+  g_entries[slot].value = value;
 
   return STATUS_OK;
 }
@@ -114,7 +130,7 @@ int32_t get_or_insert(uint32_t key, uint32_t value) {
   const int32_t status = upsert_slot_tracked(key, &slot, &inserted);
   if (status != STATUS_OK) return status;
 
-  Entry *entry = &g_entries[g_active_bank][slot];
+  Entry *entry = &g_entries[slot];
 
   if (inserted) entry->value = value;
 
@@ -138,7 +154,7 @@ int32_t increment(uint32_t key, uint32_t delta) {
   const int32_t status = upsert_slot_tracked(key, &slot, &inserted);
   if (status != STATUS_OK) return status;
 
-  Entry *entry = &g_entries[g_active_bank][slot];
+  Entry *entry = &g_entries[slot];
 
   entry->value = inserted ? delta : entry->value + delta;
 
@@ -191,7 +207,7 @@ int32_t set_many(uint32_t keys_ptr, uint32_t vals_ptr, uint32_t count) {
     const int32_t status = upsert_slot(keys[i], &slot);
     if (status != STATUS_OK) return status;
 
-    g_entries[g_active_bank][slot].value = values[i];
+    g_entries[slot].value = values[i];
   }
 
   return STATUS_OK;
@@ -231,7 +247,7 @@ int32_t get_many(
       values[i] = 0;
       found[i] = 0;
     } else {
-      values[i] = g_entries[g_active_bank][slot].value;
+      values[i] = g_entries[slot].value;
       found[i] = 1;
     }
   }

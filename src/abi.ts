@@ -16,11 +16,12 @@
 export const STATUS_OK = 0;
 
 /**
- * Status returned when a request would exceed the capacity the module was
- * compiled with (`MAX_CAPACITY` in the native sources).
+ * Status returned when a request cannot be satisfied: either it would
+ * exceed the capacity the module was compiled with (`MAX_CAPACITY` in the
+ * native sources), or the host refused to grow linear memory far enough to
+ * reach the bank it would need.
  *
- * The modules are freestanding and have no allocator, so this ceiling is
- * fixed at build time and cannot be raised at runtime.
+ * Both leave the table exactly as it was.
  *
  * @internal
  */
@@ -142,11 +143,10 @@ export interface ColumnScan {
  * walk pinned, so there is no mixture left to guard against. Callers should
  * read the error as "may throw".
  *
- * `sources` are views over the module's linear memory, built once and held
- * for the table's lifetime. That is only sound because the modules are
- * linked with initial memory equal to maximum memory and never call
- * `memory.grow`, so the backing buffer is never detached or reallocated —
- * any future change to grow memory would have to rebuild these views.
+ * `sources` are views over the module's linear memory, pinned for the walk.
+ * A grow would detach them, but a grow only happens inside a rehash, and a
+ * rehash bumps the generation this checks before each window — so the walk
+ * is abandoned rather than allowed to read through a detached view.
  *
  * @param wasm - The module being iterated.
  * @param window - Slots per call, from `scan_window()`.

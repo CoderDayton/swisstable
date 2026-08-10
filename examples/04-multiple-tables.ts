@@ -29,12 +29,12 @@ console.log("reverse has 2:", reverse.has(2)); // false — separate tables
 
 // ── Capacity ───────────────────────────────────────────────────────────
 
-// Capacity is bounded at build time by MAX_CAPACITY in the native source,
-// so a request past it fails loudly instead of degrading. Raising it means
-// rebuilding, since the linear memory reserved by scripts/build-wasm.ts has
-// to cover the larger banks.
+// Capacity is bounded at build time by MAX_CAPACITY in the native source:
+// 117,440,512 entries here, and a request past it fails loudly instead of
+// degrading. The table grows into its memory on demand up to that point, so
+// the bound is on the table, not on what an instance reserves.
 try {
-  await SwissU32ToU32.create(2_000_000);
+  await SwissU32ToU32.create(200_000_000);
 } catch (error) {
   console.log("oversized create:", (error as RangeError).message);
 }

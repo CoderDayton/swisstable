@@ -20,9 +20,11 @@
  * scanned 16 at a time with SIMD, and a parallel array of entries. See
  * https://abseil.io/about/design/swisstables and google/cwisstable.
  *
- * The module holds exactly one table in static storage. There is no
- * allocator (it links -nostdlib), so capacity is bounded at build time by
- * MAX_CAPACITY and instances are created by instantiating the module again.
+ * The module holds exactly one table, and instances are created by
+ * instantiating the module again. There is no allocator (it links
+ * -nostdlib): the banks are laid out at computed offsets above the static
+ * data and reached by growing linear memory, so an instance costs what its
+ * table costs rather than what MAX_CAPACITY would.
  */
 
 #ifndef SWISS_ENTRY_FIELDS
@@ -70,16 +72,15 @@
 #define CTRL_DELETED 0x80u
 
 /*
- * Slots per bank. Two banks of this size are reserved statically.
+ * Slots per bank, as a power-of-two exponent, which is what keeps the mask
+ * arithmetic valid.
  *
- * This is the module's whole memory budget: the banks are reserved in .bss
- * at instantiation whether the table holds one entry or a million. One
- * instance is one table, so a workload with many small tables pays it per
- * table — build a second module with a lower exponent for that case.
- *
- * Overridable at build time as a power-of-two exponent, which is what keeps
- * the mask arithmetic valid; scripts/build-wasm.ts sizes linear memory from
- * the same number. See SWISS_MAX_CAPACITY_LOG2 there.
+ * This bounds the table, not the memory an instance reserves: the banks are
+ * laid out on the heap and linear memory is grown to reach them, so raising
+ * it costs address space rather than pages. The module that includes this
+ * header sets it — see swiss_u32.c and swiss_u64.c, whose ceilings differ
+ * because their entries do. scripts/build-wasm.ts can override it with
+ * SWISS_MAX_CAPACITY_LOG2.
  */
 #ifndef MAX_CAPACITY_LOG2
 #define MAX_CAPACITY_LOG2 20
@@ -91,17 +92,15 @@
  * scripts/build-wasm.ts applies the same bounds, but the sources compile
  * standalone with -DMAX_CAPACITY_LOG2 and would otherwise miscompute in
  * silence. Below 4 a bank holds less than one SIMD group, so a group load
- * would run past it. Above 25 h1() runs out of bits: it discards the 7 the
- * fingerprint consumes, so it yields 25, and a wider mask would leave the
- * upper half of the slot space unreachable as a probe start — still correct,
- * since probing enumerates every group regardless, but with probe lengths
- * roughly doubled and the load factor no longer describing the table.
- * Further out the two banks and the staging buffers stop addressing inside
- * wasm32's 4 GiB at 27, MAX_LIVE()'s 32-bit product wraps at 30, and at 32
+ * would run past it. Above 29 MAX_LIVE()'s 32-bit product wraps, and at 32
  * the shift below is undefined.
+ *
+ * What actually binds first is the address space the three-bank high-water
+ * mark needs, which depends on sizeof(Entry) and so cannot be tested here.
+ * The _Static_assert below the Entry definition does that.
  */
-#if MAX_CAPACITY_LOG2 < 4 || MAX_CAPACITY_LOG2 > 25
-#error "MAX_CAPACITY_LOG2 must be in [4, 25]"
+#if MAX_CAPACITY_LOG2 < 4 || MAX_CAPACITY_LOG2 > 29
+#error "MAX_CAPACITY_LOG2 must be in [4, 29]"
 #endif
 
 #define MAX_CAPACITY (1u << MAX_CAPACITY_LOG2)
@@ -145,15 +144,55 @@ typedef struct {
 } Entry;
 
 /*
+ * Three banks' worth of address space is the high-water mark of the
+ * placement below, and it has to address inside wasm32 with room left for
+ * the static data underneath it.
+ *
+ * This is what sets each module's ceiling, and why the two modules differ:
+ * a u64 entry is half again as wide as a u32 one, so it runs out an
+ * exponent earlier.
+ */
+_Static_assert(
+  3ull * (uint64_t)MAX_CAPACITY * (1u + sizeof(Entry)) <= 0xf0000000ull,
+  "MAX_CAPACITY_LOG2 leaves three banks unable to address inside wasm32"
+);
+
+/* First address above the module's static data, defined by wasm-ld. */
+extern uint8_t __heap_base;
+
+/* WebAssembly reserves and grows linear memory in units of this. */
+#define WASM_PAGE 65536u
+
+/*
  * Two banks, so a rehash can copy from the old table into the new one
  * without allocating. Only one is live at a time; the other is scratch.
- * This trades double the memory for needing no allocator at all.
+ * This trades address space for needing no allocator at all.
+ *
+ * Neither is a static array. Sizing them at MAX_CAPACITY would make wasm-ld
+ * reserve the whole ceiling at instantiation, which is what tied the largest
+ * table the module can hold to the memory every instance pays for. They are
+ * laid out on the heap instead, and linear memory is grown to reach them.
+ *
+ * Placement alternates with the bank index: bank 0 sits at the base of the
+ * heap, bank 1 two of its own lengths above it. Consecutive banks are then
+ * always disjoint — which is all a rehash needs, since only the old and new
+ * banks are ever live together — while banks of the same parity overlap and
+ * reuse pages already committed. Repeated compaction at one capacity
+ * therefore ping-pongs between two fixed regions rather than walking up a
+ * heap that can never shrink.
+ *
+ * The cost is the 3x in the assertion above: a bank 1 of S bytes puts the
+ * high-water mark at 3S. Growth that ends on bank 0 peaks at 1.5x its final
+ * bank instead, because the bank it grew out of is half the size and sits
+ * directly above it.
  */
-static uint8_t g_ctrl[2][MAX_CAPACITY];
-static Entry   g_entries[2][MAX_CAPACITY];
 
 /* Index of the live bank, 0 or 1. */
 static uint32_t g_active_bank = 0;
+
+/* The live bank's arrays. Rebuilt by bind_bank() on every bank switch. */
+static uint8_t *g_ctrl = 0;
+static Entry   *g_entries = 0;
 
 /* Slots in the live bank; always a power of two, or 0 before init(). */
 static uint32_t g_capacity = 0;
@@ -221,6 +260,80 @@ void *memset(void *destination, int byte, size_t count) {
   return destination;
 }
 
+/* Bytes one bank of `capacity` slots occupies: control array, then entries. */
+static inline uint64_t bank_bytes(uint32_t capacity) {
+  return (uint64_t)capacity * (1u + sizeof(Entry));
+}
+
+/*
+ * Grows linear memory until `end` is addressable, reporting refusal rather
+ * than trapping.
+ *
+ * memory.grow answers -1 when the engine declines, which is the only way a
+ * module linked with a maximum far above its initial size learns the host
+ * will go no further. Callers must not have mutated any table state before
+ * this returns, so that a refusal leaves the table exactly as it was.
+ */
+static int32_t ensure_memory(uint64_t end) {
+  const uint64_t needed = (end + (WASM_PAGE - 1u)) / WASM_PAGE;
+  const uint64_t have = (uint64_t)__builtin_wasm_memory_size(0);
+
+  if (needed <= have) return STATUS_OK;
+
+  /* wasm32 addresses 65536 pages; asking for more is refused, not attempted. */
+  if (needed > 65536u) return STATUS_CAPACITY_EXCEEDED;
+
+  const size_t previous =
+    __builtin_wasm_memory_grow(0, (size_t)(needed - have));
+
+  if (previous == (size_t)-1) return STATUS_CAPACITY_EXCEEDED;
+
+  return STATUS_OK;
+}
+
+/*
+ * Points `control` and `entries` at bank `bank` sized for `capacity`,
+ * growing linear memory to cover it. See the placement note above.
+ *
+ * Growing extends linear memory without moving what is already in it, so
+ * pointers held across this call stay valid — only views built on the
+ * JavaScript side are detached.
+ */
+static int32_t bind_bank(
+  uint32_t bank,
+  uint32_t capacity,
+  uint32_t live_capacity,
+  uint8_t **control,
+  Entry **entries
+) {
+  const uint64_t bytes = bank_bytes(capacity);
+
+  uint64_t base =
+    (uint64_t)(uintptr_t)&__heap_base + (bank != 0u ? 2u * bytes : 0u);
+
+  if (live_capacity != 0u) {
+    const uint64_t live = (uint64_t)(uintptr_t)g_ctrl;
+    const uint64_t live_end = live + bank_bytes(live_capacity);
+
+    /*
+     * The parity anchor separates consecutive banks whenever the capacity
+     * doubles, which is every growth the insert path takes. reserve() can
+     * cross several doublings at once, and a bank that much larger no
+     * longer clears the live one — so it goes directly above it instead,
+     * giving up the page reuse to stay disjoint.
+     */
+    if (base < live_end && live < base + bytes) base = live_end;
+  }
+
+  const int32_t status = ensure_memory(base + bytes);
+  if (status != STATUS_OK) return status;
+
+  *control = (uint8_t *)(uintptr_t)base;
+  *entries = (Entry *)(uintptr_t)(base + capacity);
+
+  return STATUS_OK;
+}
+
 /* True for a slot holding an entry: fingerprints have their high bit clear. */
 static inline uint32_t is_full(uint8_t control) { return control < 0x80u; }
 
@@ -230,24 +343,33 @@ static inline uint32_t ctz32(uint32_t value) {
 }
 
 /*
- * Murmur3 finalizer, keyed by g_seed.
+ * Murmur3's 64-bit finalizer, keyed by g_seed.
  *
  * Keys are frequently dense or strided (indices, IDs, pointers >> 3), which
  * a bare identity hash would map onto a handful of groups. The finalizer
  * spreads every input bit across the whole word, which both h1 and h2 need.
  *
- * The seed is mixed in ahead of the finalizer rather than xored onto its
- * result: the finalizer is what spreads a one-bit difference across the
- * word, so a seed applied afterwards would leave keys differing in their
- * low bits landing in the same group whatever the seed was.
+ * 64 bits rather than 32 because h1 discards the 7 the fingerprint consumes:
+ * a 32-bit hash leaves 25, which caps the addressable slot space at 2^25 and
+ * bound the table long before wasm32's address space did. This leaves 57.
+ *
+ * The seed is spread across the whole word before the key is folded in, and
+ * mixed ahead of the finalizer rather than xored onto its result: the
+ * finalizer is what spreads a one-bit difference across the word, so a seed
+ * applied afterwards would leave keys differing in their low bits landing in
+ * the same group whatever the seed was.
+ *
+ * wasm32 has no native 64-bit multiply, so each of the two below lowers to
+ * several 32-bit ones. It costs nothing measurable: a pre-sized fill of
+ * 500,000 keys is within noise of the 32-bit finalizer this replaced.
  */
-static inline uint32_t mix_u32(uint32_t value) {
-  value ^= g_seed;
-  value ^= value >> 16;
-  value *= 0x85ebca6bu;
-  value ^= value >> 13;
-  value *= 0xc2b2ae35u;
-  value ^= value >> 16;
+static inline uint64_t swiss_hash(uint32_t key) {
+  uint64_t value = (uint64_t)key ^ ((uint64_t)g_seed * 0x9e3779b97f4a7c15ull);
+  value ^= value >> 33;
+  value *= 0xff51afd7ed558ccdull;
+  value ^= value >> 33;
+  value *= 0xc4ceb9fe1a85ec53ull;
+  value ^= value >> 33;
   return value;
 }
 
@@ -259,8 +381,8 @@ static inline uint32_t mix_u32(uint32_t value) {
  * every slot in a group shares part of its fingerprint and the SIMD match
  * degenerates into a near-constant candidate set.
  */
-static inline uint32_t h1(uint32_t hash) { return hash >> 7; }
-static inline uint32_t h2(uint32_t hash) { return hash & 0x7fu; }
+static inline uint64_t h1(uint64_t hash) { return hash >> 7; }
+static inline uint32_t h2(uint64_t hash) { return (uint32_t)(hash & 0x7fu); }
 
 /*
  * Bitmask of the lanes in the group at `position` equal to `needle`.
@@ -322,8 +444,8 @@ static uint32_t capacity_for_entries(uint32_t entries) {
  * that would otherwise cost this path a megabyte of scalar stores per
  * clear, reserve, and rehash.
  */
-static void initialize_bank(uint32_t bank, uint32_t capacity) {
-  __builtin_memset(g_ctrl[bank], CTRL_EMPTY, capacity);
+static void initialize_bank(uint8_t *control, uint32_t capacity) {
+  __builtin_memset(control, CTRL_EMPTY, capacity);
 }
 
 /*
@@ -352,13 +474,12 @@ static void initialize_bank(uint32_t bank, uint32_t capacity) {
  * deletion writes DELETED rather than EMPTY.
  */
 static uint32_t find_slot(
-  uint32_t bank, uint32_t mask, uint32_t key, uint32_t hash
+  const uint8_t *control, const Entry *entries,
+  uint32_t mask, uint32_t key, uint64_t hash
 ) {
   const uint8_t fingerprint = (uint8_t)h2(hash);
-  const uint8_t *control = g_ctrl[bank];
-  const Entry *entries = g_entries[bank];
 
-  uint32_t position = (h1(hash) & mask) & ~(GROUP_WIDTH - 1u);
+  uint32_t position = (uint32_t)(h1(hash) & mask) & ~(GROUP_WIDTH - 1u);
   uint32_t step = GROUP_WIDTH;
 
   for (;;) {
@@ -390,7 +511,7 @@ static uint32_t find_slot(
  */
 static uint32_t lookup_slot(uint32_t key) {
   if (g_capacity == 0) return UINT32_MAX;
-  return find_slot(g_active_bank, g_mask, key, mix_u32(key));
+  return find_slot(g_ctrl, g_entries, g_mask, key, swiss_hash(key));
 }
 
 /*
@@ -407,9 +528,10 @@ static uint32_t lookup_slot(uint32_t key) {
  * slot left to take, and taking it is sound: the caller has already
  * established that the key is absent.
  */
-static uint32_t find_insert_slot(uint32_t bank, uint32_t mask, uint32_t hash) {
-  const uint8_t *control = g_ctrl[bank];
-  uint32_t position = (h1(hash) & mask) & ~(GROUP_WIDTH - 1u);
+static uint32_t find_insert_slot(
+  const uint8_t *control, uint32_t mask, uint64_t hash
+) {
+  uint32_t position = (uint32_t)(h1(hash) & mask) & ~(GROUP_WIDTH - 1u);
   uint32_t step = GROUP_WIDTH;
   uint32_t first_deleted = UINT32_MAX;
 
@@ -442,10 +564,10 @@ static uint32_t find_insert_slot(uint32_t bank, uint32_t mask, uint32_t hash) {
  * shape.
  */
 static void insert_known_absent(
-  uint32_t bank, uint32_t mask, const Entry *entry
+  uint8_t *control, Entry *entries, uint32_t mask, const Entry *entry
 ) {
-  const uint32_t hash = mix_u32(entry->key);
-  const uint32_t slot = find_insert_slot(bank, mask, hash);
+  const uint64_t hash = swiss_hash(entry->key);
+  const uint32_t slot = find_insert_slot(control, mask, hash);
 
   /*
    * find_insert_slot() reports UINT32_MAX for a bank with neither an empty
@@ -457,8 +579,8 @@ static void insert_known_absent(
    */
   if (slot == UINT32_MAX) __builtin_trap();
 
-  g_ctrl[bank][slot] = (uint8_t)h2(hash);
-  g_entries[bank][slot] = *entry;
+  control[slot] = (uint8_t)h2(hash);
+  entries[slot] = *entry;
 }
 
 /*
@@ -471,22 +593,35 @@ static void insert_known_absent(
 static int32_t rehash(uint32_t next_capacity) {
   if (next_capacity > MAX_CAPACITY) return STATUS_CAPACITY_EXCEEDED;
 
-  const uint32_t old_bank = g_active_bank;
-  const uint32_t new_bank = old_bank ^ 1u;
+  const uint32_t new_bank = g_active_bank ^ 1u;
   const uint32_t old_capacity = g_capacity;
+  const uint8_t *old_ctrl = g_ctrl;
+  const Entry *old_entries = g_entries;
 
-  initialize_bank(new_bank, next_capacity);
+  /*
+   * Before anything is mutated, so a host that refuses the growth leaves
+   * the table exactly as it was rather than half rebuilt.
+   */
+  uint8_t *new_ctrl;
+  Entry *new_entries;
+  const int32_t status =
+    bind_bank(new_bank, next_capacity, g_capacity, &new_ctrl, &new_entries);
+  if (status != STATUS_OK) return status;
+
+  initialize_bank(new_ctrl, next_capacity);
   const uint32_t new_mask = next_capacity - 1u;
   uint32_t new_size = 0;
 
   for (uint32_t i = 0; i < old_capacity; i++) {
-    if (!is_full(g_ctrl[old_bank][i])) continue;
+    if (!is_full(old_ctrl[i])) continue;
 
-    insert_known_absent(new_bank, new_mask, &g_entries[old_bank][i]);
+    insert_known_absent(new_ctrl, new_entries, new_mask, &old_entries[i]);
     new_size++;
   }
 
   g_active_bank = new_bank;
+  g_ctrl = new_ctrl;
+  g_entries = new_entries;
   g_capacity = next_capacity;
   g_mask = new_mask;
   g_size = new_size;
@@ -507,7 +642,15 @@ static int32_t rehash(uint32_t next_capacity) {
 static int32_t ensure_insert_space(void) {
   if (g_capacity == 0) {
     const uint32_t initial_capacity = GROUP_WIDTH;
-    initialize_bank(g_active_bank, initial_capacity);
+    uint8_t *control;
+    Entry *entries;
+    const int32_t status =
+      bind_bank(g_active_bank, initial_capacity, 0, &control, &entries);
+    if (status != STATUS_OK) return status;
+
+    initialize_bank(control, initial_capacity);
+    g_ctrl = control;
+    g_entries = entries;
     g_capacity = initial_capacity;
     g_mask = initial_capacity - 1u;
     g_size = 0;
@@ -575,10 +718,10 @@ __attribute__((always_inline))
 static inline int32_t upsert_slot_tracked(
   uint32_t key, uint32_t *slot_out, uint32_t *inserted_out
 ) {
-  const uint32_t hash = mix_u32(key);
+  const uint64_t hash = swiss_hash(key);
 
   if (g_capacity != 0) {
-    const uint32_t existing = find_slot(g_active_bank, g_mask, key, hash);
+    const uint32_t existing = find_slot(g_ctrl, g_entries, g_mask, key, hash);
 
     if (existing != UINT32_MAX) {
       *slot_out = existing;
@@ -591,7 +734,7 @@ static inline int32_t upsert_slot_tracked(
   const int32_t space_status = ensure_insert_space();
   if (space_status != STATUS_OK) return space_status;
 
-  const uint32_t slot = find_insert_slot(g_active_bank, g_mask, hash);
+  const uint32_t slot = find_insert_slot(g_ctrl, g_mask, hash);
 
   /*
    * find_insert_slot() reports UINT32_MAX only if it walked the whole probe
@@ -602,10 +745,10 @@ static inline int32_t upsert_slot_tracked(
   if (slot == UINT32_MAX) return STATUS_CAPACITY_EXCEEDED;
 
   /* Reusing a tombstone consumes no growth: the slot was already spent. */
-  if (g_ctrl[g_active_bank][slot] == CTRL_EMPTY) g_growth_left--;
+  if (g_ctrl[slot] == CTRL_EMPTY) g_growth_left--;
 
-  g_ctrl[g_active_bank][slot] = (uint8_t)h2(hash);
-  g_entries[g_active_bank][slot].key = key;
+  g_ctrl[slot] = (uint8_t)h2(hash);
+  g_entries[slot].key = key;
   g_size++;
 
   *slot_out = slot;
@@ -653,13 +796,22 @@ int32_t init(uint32_t expected_entries) {
     return STATUS_CAPACITY_EXCEEDED;
   }
 
+  uint8_t *control;
+  Entry *entries;
+  /* init() discards whatever the table held, so nothing has to be kept
+   * clear of and the bank goes straight to its anchor. */
+  const int32_t status = bind_bank(0, next_capacity, 0, &control, &entries);
+  if (status != STATUS_OK) return status;
+
   g_active_bank = 0;
+  g_ctrl = control;
+  g_entries = entries;
   g_capacity = next_capacity;
   g_mask = next_capacity - 1u;
   g_size = 0;
   g_growth_left = MAX_LIVE(next_capacity);
   g_generation++;
-  initialize_bank(g_active_bank, g_capacity);
+  initialize_bank(g_ctrl, g_capacity);
 
   return STATUS_OK;
 }
@@ -727,7 +879,7 @@ int32_t shrink_to_fit(void) {
 __attribute__((export_name("clear")))
 void clear(void) {
   if (g_capacity == 0) return;
-  initialize_bank(g_active_bank, g_capacity);
+  initialize_bank(g_ctrl, g_capacity);
   g_size = 0;
   g_growth_left = MAX_LIVE(g_capacity);
   g_generation++;
@@ -748,7 +900,7 @@ int32_t has_get(uint32_t key) {
 
   if (slot == UINT32_MAX) return 0;
 
-  latch_value(&g_entries[g_active_bank][slot]);
+  latch_value(&g_entries[slot]);
 
   return 1;
 }
@@ -772,7 +924,7 @@ int32_t delete_key(uint32_t key) {
 
   if (slot == UINT32_MAX) return 0;
 
-  g_ctrl[g_active_bank][slot] = CTRL_DELETED;
+  g_ctrl[slot] = CTRL_DELETED;
   g_size--;
 
   return 1;
@@ -790,6 +942,11 @@ uint32_t capacity(void) { return g_capacity; }
  * Addresses of the two counters above, so the binding can read them as
  * memory rather than as calls.
  *
+ * A grow replaces the buffer these are viewed through on the JavaScript
+ * side, so the binding rebuilds its views after any call that can rehash.
+ * The addresses themselves never move: both counters are static data,
+ * below the heap the banks are laid out on.
+ *
  * `size` and `capacity` are properties on the JavaScript side, and a
  * property that costs a boundary crossing sets the wrong expectation: a
  * caller writing `for (i = 0; i < table.size; i++)` pays per iteration for
@@ -798,10 +955,8 @@ uint32_t capacity(void) { return g_capacity; }
  * 0.95 ns for the export call.
  *
  * This is the same trick last_value_ptr() uses, and it is sound for the
- * same two reasons: the counters are ordinary statics in linear memory, so
- * exposing an address costs the hot path nothing, and the module links with
- * initial memory equal to maximum memory and never calls memory.grow, so a
- * view built once is never detached.
+ * same reason: the counters are ordinary statics in linear memory, so
+ * exposing an address costs the hot path nothing.
  *
  * The exports above stay: they are the module's ABI, they are what the
  * binding validates on load, and they are the definition these addresses
@@ -852,8 +1007,8 @@ int32_t scan(uint32_t cursor) {
   if ((cursor & (GROUP_WIDTH - 1u)) != 0) return STATUS_INVALID_ARGUMENT;
   if (g_capacity == 0 || cursor >= g_capacity) return 0;
 
-  const uint8_t *control = g_ctrl[g_active_bank];
-  const Entry *entries = g_entries[g_active_bank];
+  const uint8_t *control = g_ctrl;
+  const Entry *entries = g_entries;
 
   uint32_t end = cursor + SCAN_WINDOW;
   if (end > g_capacity) end = g_capacity;
@@ -975,7 +1130,7 @@ uint32_t delete_many(
       continue;
     }
 
-    g_ctrl[g_active_bank][slot] = CTRL_DELETED;
+    g_ctrl[slot] = CTRL_DELETED;
     g_size--;
     deleted[i] = 1;
     removed++;

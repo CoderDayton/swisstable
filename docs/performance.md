@@ -1,19 +1,19 @@
 # Performance
 
 **On sparse `u32` keys at 100,000 entries these tables beat `Map` on every
-runtime measured — by 1.4x to 12x, with the widest margins on bulk transfer
+runtime measured, by 1.3x to 12x, with the widest margins on bulk transfer
 and mutation rather than on lookup. Below ~2,000 entries `Map` wins nearly
-everywhere; by 8,000 the tables are ahead on every engine except
+everywhere. By 8,000 the tables are ahead on every engine except
 JavaScriptCore, which crosses over near 10,000. For string keys `Map` wins
 everywhere, and for dense keys a typed array beats both.**
 
 Four things explain the whole picture:
 
 1. A crossing into WASM costs a few nanoseconds before any work happens, so
-   the tables need a working-set advantage large enough to repay it — which
+   the tables need a working-set advantage large enough to repay it. That
    only exists once a table outgrows cache.
 2. **`Map` is not one container.** JavaScriptCore's `Map` looks up a sparse
-   `u32` key in 10.7 ns; V8's takes 24–25 ns for the same work. The tables
+   `u32` key in 11.1 ns; V8's takes 26–27 ns for the same work. The tables
    cost about the same everywhere, so most of the spread between columns
    below is `Map` moving, not the table.
 3. The largest single cost on the JavaScriptCore path is not in the table at
@@ -27,21 +27,21 @@ Four things explain the whole picture:
 | --- | --- | --- | --- |
 | Bun 1.3.14 | JavaScriptCore | yes | 0.03 µs |
 | Node 24.15.0 | V8 | yes | 0.06 µs |
-| Deno 2.9.4 | V8 | yes | 0.15 µs |
+| Deno 2.9.4 | V8 | yes | 0.17 µs |
 | Chrome 151 | V8 | yes | 5 µs |
 | Firefox 153 | SpiderMonkey | no | 20 µs |
 
 13th Gen Intel Core i9-13900K, Linux x64. 100,000 entries, median of 21
 rounds, median of 3 passes, one isolate per contender. Treat the ratios
 within a column as the portable part and the absolute figures as specific to
-this machine — but not the ratios *across* columns, which is the point of
-publishing five.
+this machine. The ratios *across* columns are portable too, and are the point
+of publishing five.
 
 Five properties of the harness are load-bearing:
 
 - **Every runtime executes the same scenario code.** `benches/runtime.ts`
-  supplies the four things that differ between hosts — a nanosecond clock,
-  module loading, isolation, and where results go — and the scenarios import
+  supplies the four things that differ between hosts (a nanosecond clock,
+  module loading, isolation, and where results go) and the scenarios import
   nothing else, so a column difference is an engine difference.
 - **Each contender runs in an isolate of its own**: a child process on the
   server runtimes, a `Worker` in a browser. Contenders sharing one isolate
@@ -61,7 +61,7 @@ Five properties of the harness are load-bearing:
 
 ## Results at 100,000 entries
 
-Speedup against `Map` — above 1.00x the table is faster:
+Speedup against `Map`. Above 1.00x the table is faster:
 
 ![Speedup against Map by workload, one point per runtime, on a log
 scale](assets/speedup.svg)
@@ -71,78 +71,78 @@ same library on five engines, so their spread is `Map` varying, not the table.
 
 | workload | Bun 1.3.14 | Node 24.15.0 | Deno 2.9.4 | Chrome 151 | Firefox 153 |
 | --- | --- | --- | --- | --- | --- |
-| fill, sparse (pre-sized) | 8.3x | 6.4x | 5.6x | 4.2x | 5.2x |
-| fill, sparse (grown from empty) | 2.7x | 2.3x | 2.1x | 1.50x | 2.2x |
-| fill, dense (pre-sized) | 7.4x | 4.4x | 3.5x | 2.7x | 3.9x |
-| lookup hit, sparse | 1.60x | 2.8x | 3.2x | 2.6x | 1.79x |
-| lookup miss, sparse | 1.38x | 3.3x | 3.4x | 2.6x | 1.73x |
-| lookup hit, dense | 1.12x | 1.76x | 1.98x | 1.39x | 1.36x |
-| lookup miss, dense | 0.85x | 1.89x | 1.88x | 1.99x | 1.42x |
-| `has`, sparse | 1.84x | 3.4x | 3.6x | 3.1x | 1.98x |
-| overwrite an existing key | 2.3x | 2.7x | 2.9x | 2.7x | 3.2x |
-| delete | 5.6x | 5.5x | 5.4x | 4.3x | 4.3x |
-| churn (delete + reinsert) | 3.2x | 3.6x | 3.5x | 2.9x | 3.2x |
-| count (`increment`) | 1.41x | 1.39x | 1.47x | 1.49x | 0.96x |
-| `getOrInsert`, key absent | 8.0x | 6.6x | 6.4x | 5.8x | 5.6x |
-| u32 bulk fill (`setMany`) | 9.8x | 9.6x | 8.0x | 6.6x | 8.6x |
-| u32 bulk lookup (`getMany`) | 2.4x | 5.4x | 4.8x | 5.0x | 3.8x |
-| u64 bulk fill (`setMany`) | 6.0x | 8.0x | 6.9x | 6.2x | 9.1x |
-| u64 bulk lookup (`getMany`) | 1.56x | 3.8x | 3.7x | 3.2x | 2.3x |
-| u64 bulk delete (`deleteMany`) | 5.4x | 12x | 8.9x | — | — |
-| iterate (`forEach`) | 2.3x | 0.79x | 0.75x | 0.74x | 1.37x |
-| string keys, repeated lookup | 0.35x | 0.49x | 0.49x | 0.46x | 0.76x |
+| fill, sparse (pre-sized) | 5.2x | 6.2x | 5.0x | 3.6x | 4.7x |
+| fill, sparse (grown from empty) | 1.59x | 2.3x | 1.93x | 1.37x | 2.1x |
+| fill, dense (pre-sized) | 4.0x | 4.1x | 3.2x | 2.4x | 3.6x |
+| lookup hit, sparse | 1.50x | 2.7x | 2.8x | 2.3x | 1.60x |
+| lookup miss, sparse | 1.29x | 3.2x | 3.4x | 2.5x | 1.70x |
+| lookup hit, dense | 1.08x | 1.67x | 1.77x | 1.33x | 1.25x |
+| lookup miss, dense | 0.89x | 1.79x | 1.89x | 1.94x | 1.38x |
+| `has`, sparse | 1.77x | 3.2x | 3.5x | 2.9x | 1.86x |
+| overwrite an existing key | 2.2x | 2.5x | 2.5x | 2.2x | 2.8x |
+| delete | 6.1x | 5.5x | 5.8x | 4.1x | 4.7x |
+| churn (delete + reinsert) | 3.3x | 3.6x | 3.5x | 2.6x | 3.2x |
+| count (`increment`) | 1.26x | 1.33x | 1.35x | 1.28x | 0.89x |
+| `getOrInsert`, key absent | 5.3x | 6.3x | 5.4x | 5.0x | 5.1x |
+| u32 bulk fill (`setMany`) | 8.4x | 11x | 8.3x | 7.6x | 9.2x |
+| u32 bulk lookup (`getMany`) | 2.7x | 5.6x | 4.9x | 5.4x | 3.6x |
+| u64 bulk fill (`setMany`) | 10x | 9.7x | 8.6x | 6.4x | 8.5x |
+| u64 bulk lookup (`getMany`) | 2.1x | 4.1x | 3.8x | 3.6x | 2.3x |
+| u64 bulk delete (`deleteMany`) | 7.1x | 12x | 9.1x | — | — |
+| iterate (`forEach`) | 2.6x | 0.78x | 0.75x | 0.73x | 1.38x |
+| string keys, repeated lookup | 0.34x | 0.49x | 0.44x | 0.42x | 0.72x |
 
 The same rows as nanoseconds per operation, SwissTable / `Map`:
 
 | workload | Bun 1.3.14 | Node 24.15.0 | Deno 2.9.4 | Chrome 151 | Firefox 153 |
 | --- | --- | --- | --- | --- | --- |
-| fill, sparse (pre-sized) | 8.1 / 67.5 | 9.9 / 63.5 | 9.7 / 54.4 | 10.6 / 45.0 | 10.6 / 54.6 |
-| fill, sparse (grown from empty) | 25.3 / 67.5 | 27.1 / 63.5 | 26.5 / 54.4 | 30.0 / 45.0 | 24.4 / 54.6 |
-| fill, dense (pre-sized) | 8.6 / 64.2 | 9.7 / 43.1 | 9.7 / 34.0 | 10.2 / 27.9 | 9.6 / 37.4 |
-| lookup hit, sparse | 6.7 / 10.7 | 8.9 / 25.3 | 7.7 / 24.6 | 9.3 / 24.1 | 10.6 / 19.0 |
-| lookup miss, sparse | 7.9 / 10.9 | 9.3 / 30.8 | 9.1 / 31.1 | 10.1 / 25.7 | 11.4 / 19.7 |
-| lookup hit, dense | 6.7 / 7.5 | 8.9 / 15.7 | 7.7 / 15.4 | 9.3 / 13.0 | 9.5 / 12.9 |
-| lookup miss, dense | 7.8 / 6.7 | 9.0 / 17.1 | 8.8 / 16.4 | 9.8 / 19.4 | 10.1 / 14.4 |
-| `has`, sparse | 5.8 / 10.7 | 7.4 / 24.8 | 6.7 / 24.2 | 7.7 / 23.6 | 9.2 / 18.3 |
-| overwrite an existing key | 6.0 / 14.0 | 9.1 / 24.7 | 8.4 / 24.3 | 8.8 / 23.7 | 9.0 / 28.9 |
-| delete | 5.6 / 31.1 | 8.7 / 47.5 | 7.4 / 39.9 | 8.7 / 37.7 | 7.8 / 33.4 |
-| churn (delete + reinsert) | 9.7 / 30.7 | 12.2 / 44.5 | 11.8 / 41.9 | 12.7 / 36.5 | 12.2 / 39.2 |
-| count (`increment`) | 6.1 / 8.5 | 8.3 / 11.6 | 7.9 / 11.6 | 8.5 / 12.7 | 11.0 / 10.6 |
-| `getOrInsert`, key absent | 8.3 / 66.5 | 10.3 / 67.6 | 9.8 / 62.6 | 10.7 / 61.7 | 10.6 / 59.8 |
-| u32 bulk fill (`setMany`) | 6.6 / 65.1 | 6.7 / 64.7 | 6.6 / 52.6 | 6.7 / 44.3 | 6.2 / 53.4 |
-| u32 bulk lookup (`getMany`) | 4.2 / 10.0 | 4.1 / 21.9 | 4.7 / 22.2 | 4.2 / 20.8 | 4.1 / 15.6 |
-| u64 bulk fill (`setMany`) | 7.4 / 44.3 | 8.8 / 70.8 | 9.0 / 61.9 | 7.5 / 46.6 | 7.2 / 65.4 |
-| u64 bulk lookup (`getMany`) | 6.5 / 10.2 | 6.0 / 22.8 | 6.3 / 23.0 | 6.8 / 22.1 | 6.8 / 15.7 |
-| u64 bulk delete (`deleteMany`) | 4.8 / 25.6 | 4.1 / 47.9 | 4.6 / 40.9 | — | — |
-| iterate (`forEach`) | 7.2 / 16.4 | 12.6 / 10.0 | 13.1 / 9.9 | 12.2 / 9.0 | 5.8 / 8.0 |
-| string keys, repeated lookup | 23.4 / 8.2 | 34.2 / 16.7 | 25.6 / 12.4 | 24.3 / 11.2 | 85.3 / 64.9 |
+| fill, sparse (pre-sized) | 8.5 / 43.9 | 11.4 / 70.6 | 11.5 / 57.7 | 13.3 / 47.6 | 12.4 / 58.0 |
+| fill, sparse (grown from empty) | 27.5 / 43.9 | 30.5 / 70.6 | 30.0 / 57.7 | 34.7 / 47.6 | 28.2 / 58.0 |
+| fill, dense (pre-sized) | 8.8 / 35.7 | 11.4 / 46.2 | 11.1 / 35.1 | 12.6 / 29.8 | 11.4 / 40.6 |
+| lookup hit, sparse | 7.4 / 11.1 | 9.9 / 26.4 | 9.4 / 26.8 | 11.1 / 26.0 | 12.2 / 19.5 |
+| lookup miss, sparse | 8.7 / 11.2 | 10.2 / 32.3 | 10.1 / 34.0 | 11.4 / 28.3 | 12.2 / 20.8 |
+| lookup hit, dense | 7.3 / 7.8 | 9.9 / 16.5 | 9.5 / 16.8 | 10.9 / 14.5 | 10.7 / 13.5 |
+| lookup miss, dense | 8.0 / 7.2 | 10.0 / 18.0 | 9.7 / 18.4 | 10.8 / 21.0 | 10.6 / 14.7 |
+| `has`, sparse | 6.3 / 11.2 | 8.2 / 26.6 | 7.8 / 27.2 | 9.0 / 25.8 | 10.2 / 18.9 |
+| overwrite an existing key | 6.8 / 14.8 | 10.4 / 25.8 | 10.1 / 25.6 | 11.4 / 25.5 | 10.8 / 30.8 |
+| delete | 5.7 / 35.0 | 9.4 / 52.4 | 7.9 / 45.5 | 10.2 / 41.3 | 8.4 / 39.8 |
+| churn (delete + reinsert) | 10.4 / 34.5 | 13.4 / 47.5 | 13.1 / 46.1 | 15.3 / 40.2 | 13.7 / 44.4 |
+| count (`increment`) | 6.7 / 8.4 | 9.4 / 12.5 | 9.2 / 12.4 | 10.9 / 13.8 | 13.0 / 11.6 |
+| `getOrInsert`, key absent | 8.8 / 46.5 | 12.0 / 75.9 | 12.0 / 64.2 | 13.7 / 68.9 | 12.6 / 64.2 |
+| u32 bulk fill (`setMany`) | 6.1 / 51.2 | 6.4 / 70.3 | 6.9 / 56.7 | 6.3 / 47.7 | 6.6 / 60.8 |
+| u32 bulk lookup (`getMany`) | 3.9 / 10.5 | 4.0 / 22.5 | 4.9 / 24.0 | 4.2 / 22.6 | 4.4 / 16.1 |
+| u64 bulk fill (`setMany`) | 7.3 / 73.5 | 8.0 / 77.5 | 8.3 / 71.7 | 7.8 / 50.5 | 7.8 / 66.4 |
+| u64 bulk lookup (`getMany`) | 5.1 / 10.6 | 5.7 / 23.6 | 6.5 / 24.9 | 7.0 / 24.9 | 7.0 / 16.1 |
+| u64 bulk delete (`deleteMany`) | 4.2 / 30.0 | 4.2 / 49.0 | 4.7 / 42.6 | — | — |
+| iterate (`forEach`) | 6.6 / 17.0 | 13.2 / 10.3 | 13.8 / 10.4 | 12.9 / 9.4 | 6.0 / 8.3 |
+| string keys, repeated lookup | 26.5 / 9.1 | 37.6 / 18.5 | 29.0 / 12.7 | 27.3 / 11.4 | 98.0 / 70.5 |
 
 `Map` columns are `Map<number, number>`, or `Map<number, {lo,hi}>` for the
-u64 rows. A `Map<number, bigint>` is worse again — 58 to 100 ns to fill,
+u64 rows. A `Map<number, bigint>` is worse again, 61 to 106 ns to fill,
 because every value is boxed.
 
 One row does not share the others' working set. **`count (increment)` is
 100,000 increments over 1,000 distinct keys**, because a counter that never
 sees a key twice is not a counter. Those 1,000 entries fit in cache, which is
-why `Map` costs 8.5–12.7 ns there against the 24–31 it costs at 100,000
+why `Map` costs 8.4–13.8 ns there against the 26–34 it costs at 100,000
 keys, and why it is the only row a browser engine takes.
 
 Read the table column by column, not row by row. The SwissTable numbers move
-little between engines: a sparse lookup hit costs 6.7–10.6 ns everywhere,
+little between engines: a sparse lookup hit costs 7.4–12.2 ns everywhere,
 because the work is a WASM call and two memory accesses no engine is involved
-in. `Map` moves a lot — 10.7 ns on JavaScriptCore against 24–25 ns on V8 —
-and that is what makes the same library look 1.60x faster on Bun and 3.2x
-faster on Deno.
+in. `Map` moves a lot, 11.1 ns on JavaScriptCore against 26–27 ns on V8, and
+that is what makes the same library look 1.50x faster on Bun and 2.8x faster
+on Deno.
 
 ## Mutation, not lookup, is where the margin is
 
 Lookup is the workload most often benchmarked and the one these tables win
 least. The spread opens on everything that writes.
 
-`delete` is 4.3x to 5.6x. `Map` unlinks an entry from its insertion-ordered
+`delete` is 4.1x to 6.1x. `Map` unlinks an entry from its insertion-ordered
 chain and eventually compacts it; a control byte here goes from its
-fingerprint to `DELETED` and nothing else moves. Churn — delete a key and put
-it straight back — is 2.9x to 3.6x, and holds capacity while doing it,
+fingerprint to `DELETED` and nothing else moves. Churn, meaning delete a key
+and put it straight back, is 2.6x to 3.6x, and holds capacity while doing it,
 because a re-insert reclaims the tombstone without consuming growth.
 
 `has` is cheaper than `get` on the same table on every runtime: both cross
@@ -151,16 +151,15 @@ that `get` reads back out of linear memory.
 
 Key distribution costs the table nothing: dense, sparse and
 scattered-but-small keys all look up at the same speed, because the Murmur3
-finalizer spreads every input bit before the hash is split — see
+finalizer spreads every input bit before the hash is split. See
 [design.md](design.md#hash-splitting). The dense rows are closer because
-`Map` is faster there, not because the table is slower — and on
-JavaScriptCore a dense miss is the one row `Map` wins outright, at 6.7 ns
-against 7.8.
+`Map` is faster there, not because the table is slower. On JavaScriptCore a
+dense miss is the one row `Map` wins outright, at 7.2 ns against 8.0.
 
 Neither is the right answer for dense keys anyway: a directly-indexed
-`Int32Array` fills at 0.9–1.3 ns and looks up at 0.6 ns on every runtime, and
-a plain object looks up at 0.5–0.7 ns. If the keys really are dense, use the
-array.
+`Int32Array` fills at 0.9–1.3 ns and looks up at 0.6–0.7 ns on every runtime,
+and a plain object looks up at 0.5–0.8 ns. If the keys really are dense, use
+the array.
 
 ## Reading and writing in one crossing
 
@@ -170,28 +169,28 @@ each. Nanoseconds per key, against the alternative written out beside it:
 
 | workload | Bun 1.3.14 | Node 24.15.0 | Deno 2.9.4 | Chrome 151 | Firefox 153 |
 | --- | --- | --- | --- | --- | --- |
-| `increment` | 6.1 | 8.3 | 7.9 | 8.5 | 11.0 |
-| `get` + `set` | 10.7 | 13.8 | 12.9 | 14.4 | 13.8 |
-| `getOrInsert`, key absent | 8.3 | 10.3 | 9.8 | 10.7 | 10.6 |
-| `get`, then `set` if absent | 10.2 | 13.2 | 12.7 | 14.2 | 13.4 |
-| `getOrInsert`, key present | 5.6 | 8.3 | 7.8 | 8.8 | 8.7 |
-| `get`, then `set` if absent | 5.5 | 8.3 | 7.8 | 9.4 | 8.4 |
+| `increment` | 6.7 | 9.4 | 9.2 | 10.9 | 13.0 |
+| `get` + `set` | 12.0 | 15.6 | 15.0 | 17.9 | 16.2 |
+| `getOrInsert`, key absent | 8.8 | 12.0 | 12.0 | 13.7 | 12.6 |
+| `get`, then `set` if absent | 10.8 | 14.8 | 14.9 | 17.7 | 15.4 |
+| `getOrInsert`, key present | 6.7 | 9.4 | 9.6 | 11.6 | 10.6 |
+| `get`, then `set` if absent | 6.0 | 9.4 | 8.8 | 10.7 | 9.2 |
 
-`increment` wins on every engine — 1.25x on SpiderMonkey, 1.6–1.8x elsewhere
-— because the read and the write are one operation whichever way the key
-falls.
+`increment` wins on every engine, 1.25x on SpiderMonkey and 1.6–1.8x
+elsewhere, because the read and the write are one operation whichever way the
+key falls.
 
 **`getOrInsert` only wins when the key is absent**, and the last two rows are
 why: `get`-then-`set` puts its second crossing inside the `undefined` branch,
 so on a hit it never issues one and the two tie. Its gain therefore tracks
-the miss rate — 1.23x to 1.33x when nothing is present, nothing when
+the miss rate: 1.22x to 1.29x when nothing is present, nothing when
 everything is. Reach for it where misses are common, which is what memoizing
 is.
 
-Against `Map` the counting row is the one place a browser engine wins: 0.96x
-on Firefox, 1.39x to 1.49x everywhere else. The working set is 1,000 keys,
+Against `Map` the counting row is the one place a browser engine wins: 0.89x
+on Firefox, 1.26x to 1.35x everywhere else. The working set is 1,000 keys,
 small enough that `Map` stays in cache and the crossing is most of the
-budget — the same effect the crossover section describes, seen from the
+budget. It is the same effect the crossover section describes, seen from the
 other side.
 
 ## Memory
@@ -216,26 +215,36 @@ ceiling that is
 | `SwissU32ToU32` | 18 B | 20.6 B | 10.3 B |
 | `SwissU32ToU64` | 26 B | 29.7 B | 14.9 B |
 
-Two banks are reserved because a rehash needs somewhere to move entries to,
-and both are static arrays at the compiled ceiling. Only one holds entries at
-a time, so the live-bank column is what the data occupies and the both-banks
-column is what the module reserves for it. Against `Map`'s 37.4 B on V8 that
-is 3.6x less live, or 1.8x less counting the standby bank; against
-JavaScriptCore's 67.1 B, 6.5x and 3.3x.
+A rehash needs somewhere to move entries to, so a second bank exists, but
+only one holds entries at a time. The live-bank column is what the data
+occupies; the both-banks column is what the module addresses while a rehash
+is in flight. Against `Map`'s 37.4 B on V8 that is 3.6x less live, or 1.8x
+less counting the standby bank. Against JavaScriptCore's 67.1 B, 6.5x and
+3.3x.
 
-**An instance reserves its whole arena up front**: 21 MiB of linear memory
-for the u32 module, 29 MiB for the u64 one, whether it holds one entry or
-917,504. That is address space, committed page by page as the table touches
-it, so what a process actually resides tracks the entries rather than the
-reservation — 9 MiB at 500,000 u32 entries on Node. The reservation still
-matters twice over: every table is its own module instance, so ten tables
-reserve ten arenas, and a wasm32 module cannot exceed 4 GiB of them. Build a
-second pair of modules with a lower `SWISS_MAX_CAPACITY_LOG2` when the
-working set is known to be small — at `2^16` a u32 instance reserves 4.1 MiB
-and caps at 57,344 entries.
+**An instance grows with its table.** It starts at 1.25 MiB of linear memory
+for the u32 module and 1.75 MiB for the u64 one, then adds 9 or 13 bytes per
+slot as the table reaches each new bank. Resident memory at 500,000 entries
+on Node:
 
-A resident-set reading is the wrong instrument for the comparison and is
-reported by `--scenario=memory` only as a cross-check: it counts a WASM arena
+| | pre-sized with `create(500_000)` | grown from empty |
+| --- | --- | --- |
+| `SwissU32ToU32` | +10.8 MiB | +20.6 MiB |
+| `SwissU32ToU64` | +16.5 MiB | +23.6 MiB |
+
+Pre-sizing is worth roughly half the memory as well as the rehashes: a table
+that grows into its capacity keeps the pages of the banks it passed through.
+Memory is never returned, so an instance holds the high-water mark of every
+bank it used, measured at 1.8x to 1.9x the final bank across a fill.
+
+Every table is its own module instance, and each declares a `--max-memory`
+at its ceiling: 3.4 GiB for u32, 2.4 GiB for u64. That is address space the
+host reserves without committing, but a 32-bit or memory-constrained host
+may decline it at instantiation. Build with a lower
+`SWISS_MAX_CAPACITY_LOG2` to shrink what the module asks for.
+
+A resident-set reading is the wrong instrument for the comparison, and
+`--scenario=memory` reports it only as a cross-check. It counts a WASM bank
 in full the moment it is touched, while a `Map` disappears into heap pages
 the engine had already committed. Measured that way Deno reports its `Map` at
 15.5 B/entry, which is not a property of the `Map`.
@@ -257,8 +266,8 @@ T = c + g + r + a * mu(N)
 | `mu(N)` | mean latency of one such access, set by working-set size | 1–10 ns |
 
 Those terms are measured on JavaScriptCore; `c` is what differs most between
-engines, and it is visible in the tables above as the ~1–2 ns the V8 hosts
-add to every single-key row.
+engines, and it is visible in the tables above as the ~2 ns the V8 hosts add
+to every single-key row.
 
 `Map` pays no `c`, `g`, or `r`, and has `a = 2` as well — bucket table, then
 entry record. **So these tables win only when their smaller working set makes
@@ -291,13 +300,13 @@ reach the caller's own element load (`bun run bench --scenario=tagging`):
 
 | key source | Bun | Node | Deno |
 | --- | --- | --- | --- |
-| `Uint32Array`, keys `< 2^31` | 5.9 ns | 7.3 ns | 6.7 ns |
-| `Uint32Array`, keys `>= 2^31` | 5.7 ns | 7.3 ns | 6.7 ns |
-| plain `Array` (always a double) | 9.8 ns | 7.9 ns | 7.2 ns |
+| `Uint32Array`, keys `< 2^31` | 6.4 ns | 8.0 ns | 7.7 ns |
+| `Uint32Array`, keys `>= 2^31` | 6.2 ns | 8.1 ns | 7.6 ns |
+| plain `Array` (always a double) | 10.5 ns | 9.2 ns | 8.3 ns |
 
 Keys held in a plain `Array` are already boxed doubles before the binding
-sees them, and unboxing them costs ~1.7x on JavaScriptCore against ~1.1x on
-V8. Keep keys in a typed array; it is free where it does not matter and worth
+sees them, and unboxing them costs ~1.6x on JavaScriptCore against ~1.1x on
+V8. Keep keys in a typed array. It is free where it does not matter and worth
 a lot where it does.
 
 ## Why fill is measured twice
@@ -307,11 +316,12 @@ empty and pay for every internal rehash inside the timed region, so timing
 only a pre-sized table would compare against containers handed their final
 capacity for free.
 
-Growing from empty costs about 3x — 25.3 ns against 8.1 on Bun, 27.1 against
-9.9 on Node — the price of rehashing through 11 doublings (64 to 131,072
-slots), each re-probing every live entry. It still beats `Map` by 1.50x to
-2.7x, so the ranking never depended on the advantage. Pre-size anyway when
-the count is known; it is the cheapest optimization available here.
+Growing from empty costs about 3x: 27.5 ns against 8.5 on Bun, 30.5 against
+11.4 on Node. That is the price of rehashing through 11 doublings, 64 to
+131,072 slots, each re-probing every live entry. It still beats `Map` by
+1.37x to 2.3x, so the ranking never depended on the advantage. Pre-size
+anyway when the count is known. It is the cheapest optimization available
+here, and it also halves the memory the table ends up holding.
 
 Lookups need only one row: a grown table converges on exactly the capacity a
 pre-sized one starts with — both reach 131,072 slots at 100,000 entries — so
@@ -325,14 +335,14 @@ batch handed to one call changes:
 
 | batch | `getMany` (Bun / Node / Deno) | `setMany` (Bun / Node / Deno) |
 | --- | --- | --- |
-| 1 | 177 / 142 / 135 ns | 165 / 144 / 134 ns |
-| 8 | 24.5 / 20.8 / 20.8 ns | 41.7 / 24.9 / 25.0 ns |
-| 64 | 8.7 / 6.3 / 7.2 ns | 11.9 / 9.5 / 11.0 ns |
-| 512 | 5.2 / 4.5 / 5.4 ns | 8.2 / 8.6 / 8.6 ns |
-| 4,096 | 4.8 / 4.3 / 5.3 ns | 7.5 / 8.2 / 8.6 ns |
-| 100,000 | 5.4 / 4.8 / 5.7 ns | 7.4 / 8.6 / 8.0 ns |
+| 1 | 195 / 149 / 145 ns | 195 / 157 / 150 ns |
+| 8 | 27.1 / 22.1 / 21.8 ns | 32.6 / 24.8 / 25.4 ns |
+| 64 | 6.9 / 6.6 / 7.3 ns | 11.8 / 10.0 / 10.8 ns |
+| 512 | 5.0 / 4.5 / 5.6 ns | 7.9 / 8.4 / 9.0 ns |
+| 4,096 | 4.6 / 4.3 / 5.3 ns | 7.4 / 7.9 / 8.2 ns |
+| 100,000 | 4.6 / 4.9 / 5.9 ns | 7.2 / 7.8 / 8.3 ns |
 
-A batch of 1 is worse than the per-key API — it pays the staging setup with
+A batch of 1 is worse than the per-key API, paying the staging setup with
 nothing to divide it into. From ~512 the crossing has stopped mattering, and
 past ~4,096 the curve is flat: there is no reason to hand-tune batch sizes
 above that, and `maxBatch` chunking makes larger batches free anyway.
@@ -343,53 +353,55 @@ Holding entries fixed at 50,000 and varying capacity:
 
 | load | slots | Bun | Node | Deno |
 | --- | --- | --- | --- | --- |
-| 76% | 65,536 | 6.6 ns | 7.8 ns | 7.4 ns |
-| 38% | 131,072 | 6.4 ns | 7.4 ns | 7.0 ns |
-| 19% | 262,144 | 7.5 ns | 9.0 ns | 8.1 ns |
-| 10% | 524,288 | 9.4 ns | 10.5 ns | 9.7 ns |
+| 76% | 65,536 | 7.4 ns | 9.0 ns | 8.9 ns |
+| 38% | 131,072 | 7.2 ns | 8.8 ns | 8.6 ns |
+| 19% | 262,144 | 8.6 ns | 10.2 ns | 10.0 ns |
+| 10% | 524,288 | 10.1 ns | 12.2 ns | 11.7 ns |
 
-Running at the 7/8 ceiling costs nothing against running half empty — the
+Running at the 7/8 load factor costs nothing against running half empty. The
 group scan resolves in its first iteration either way. What does cost is the
-control array outgrowing cache: at 10% full the table is 30% to 42% slower
-than at 76%. Over-reserving is not free, so size `expectedEntries` to what you expect
-rather than padding it.
+control array outgrowing cache: at 10% full the table is 32% to 36% slower
+than at 76%. Over-reserving costs memory as well as speed, so size
+`expectedEntries` to what you expect rather than padding it.
 
 ## Whole-table operations
 
 | operation | Bun | Node | Deno |
 | --- | --- | --- | --- |
-| `clear()` | 4.2 µs | 3.5 µs | 3.0 µs |
-| `shrinkToFit()` after emptying | 155 µs | 59 µs | 67 µs |
-| `reserve()` forcing one rehash | 1.56 ms | 1.48 ms | 1.45 ms |
+| `clear()` | 5.6 µs | 4.1 µs | 3.4 µs |
+| `shrinkToFit()` after emptying | 144 µs | 59 µs | 60 µs |
+| `reserve()` forcing one rehash | 1.75 ms | 1.49 ms | 1.48 ms |
 
 `clear()` is a memset of the control bytes. The other two rehash, and a
-rehash is the expensive thing in this design — which is the whole argument
-for passing `expectedEntries` up front.
+rehash is the expensive thing in this design. That is the whole argument for
+passing `expectedEntries` up front.
 
 Capacity only ever rises on its own, and a scan visits every slot, so a table
 that peaked large and was then emptied keeps paying peak walk cost until
-`shrinkToFit()` hands the slots back: walking the 8 entries left from a peak
-of 100,000 costs 46–76 µs before the call and 1.4–1.5 µs after it.
+`shrinkToFit()` hands the slots back. Walking the 8 entries left from a peak
+of 100,000 costs 72–131 µs before the call and 1.3–1.9 µs after it. It
+recovers walk cost, not memory: the pages stay with the instance.
 
 ## Iteration is the one place the engine changes the answer
 
 | walk | Bun | Node | Deno | Chrome | Firefox |
 | --- | --- | --- | --- | --- | --- |
-| `keys()` | 8.1 ns | 7.9 ns | 7.5 ns | 6.0 ns | 6.1 ns |
-| `forEach` | 7.2 ns | 12.6 ns | 13.1 ns | 12.2 ns | 5.8 ns |
-| `Map.forEach` | 16.4 ns | 10.0 ns | 9.9 ns | 9.0 ns | 8.0 ns |
-| u64 `forEachLanes`, lanes kept | 4.9 ns | 11.6 ns | 11.4 ns | 11.7 ns | 5.9 ns |
-| u64 `forEach`, lanes kept | 6.3 ns | 14.3 ns | 15.5 ns | 14.6 ns | 12.9 ns |
+| `keys()` | 8.4 ns | 8.0 ns | 7.9 ns | 6.5 ns | 6.2 ns |
+| `forEach` | 6.6 ns | 13.2 ns | 13.8 ns | 12.9 ns | 6.0 ns |
+| `Map.forEach` | 17.0 ns | 10.3 ns | 10.4 ns | 9.4 ns | 8.3 ns |
+| u64 `forEachLanes`, lanes kept | 3.6 ns | 12.4 ns | 12.9 ns | 13.1 ns | 6.1 ns |
+| u64 `forEach`, lanes kept | 7.2 ns | 14.8 ns | 17.1 ns | 15.7 ns | 12.6 ns |
 
-`forEach` beats `Map.forEach` by 2.3x on JavaScriptCore and loses to it by
-25% to 30% on V8, where the per-entry callback through the WASM scan costs
-more than V8's own iteration. `keys()` is within 8.1 ns everywhere and is the
+`forEach` beats `Map.forEach` by 2.6x on JavaScriptCore and loses to it by
+28% to 37% on V8, where the per-entry callback through the WASM scan costs
+more than V8's own iteration. `keys()` is within 8.4 ns everywhere and is the
 walk to reach for when the values are not needed.
 
 `forEachLanes` exists for the u64 table because the boxed `{lo, hi}` object
 is only free while the JIT can prove it does not outlive the call. A caller
 that keeps the lanes does not let it prove that, and the lane-wise callback
-is then faster on every engine — by 29% on Bun and by 2.2x on Firefox.
+is then faster on every engine: 19% to 33% on V8, and about 2x on
+JavaScriptCore and SpiderMonkey.
 
 ## The two limits that cannot be engineered away
 
@@ -402,12 +414,12 @@ because it depends on how fast the engine's own `Map` is:
 
 | entries | Bun 1.3.14 | Node 24.15.0 | Deno 2.9.4 | Chrome 151 | Firefox 153 |
 | --- | --- | --- | --- | --- | --- |
-| 2,000 | 0.68x | 0.75x | 1.12x | 0.79x | 0.33x |
-| 8,000 | 0.94x | 1.81x | 2.92x | 2.40x | 1.71x |
-| 16,000 | 1.41x | 3.07x | 3.30x | 2.56x | 1.84x |
-| 32,000 | 1.27x | 3.19x | 3.42x | 2.83x | 1.94x |
-| 128,000 | 1.53x | 3.04x | 3.49x | 2.93x | 1.96x |
-| 512,000 | 1.39x | 2.68x | 3.14x | 2.58x | 1.78x |
+| 2,000 | 0.65x | 0.77x | 1.03x | 0.80x | 0.35x |
+| 8,000 | 0.94x | 1.81x | 2.71x | 2.26x | 1.69x |
+| 16,000 | 1.37x | 2.76x | 2.98x | 2.61x | 1.80x |
+| 32,000 | 1.26x | 2.82x | 3.08x | 2.70x | 1.79x |
+| 128,000 | 1.46x | 2.91x | 3.13x | 2.74x | 1.88x |
+| 512,000 | 1.65x | 2.81x | 3.27x | 2.66x | 1.63x |
 
 ![Speedup against Map as the table grows, one line per runtime, crossing 1x
 between 2,000 and 16,000 entries](assets/crossover.svg)
@@ -428,7 +440,7 @@ JavaScript engines cache a string's hash on the string object, so a
 copy and hash the bytes — `O(len)` against `O(1)`, per lookup — and no
 implementation choice removes that asymmetry.
 
-`InternedSwissMap` is therefore 1.3x to 2.9x slower than `Map<string, number>`
+`InternedSwissMap` is therefore 1.4x to 2.9x slower than `Map<string, number>`
 on repeated string lookups, on every engine, and always will be. Its purpose
 is different: intern once, then use the u32 ID for every subsequent
 operation, at which point the hot path is the numeric table and the string
@@ -450,8 +462,8 @@ The two charts are Vega-Lite specs with their data inlined, in
 with:
 
 ```bash
-bunx --package vega-lite vl2vg docs/assets/speedup.vl.json /tmp/speedup.vg.json
-bunx --package vega-cli vg2svg /tmp/speedup.vg.json docs/assets/speedup.svg
+bunx -p vega -p vega-lite vl2svg docs/assets/speedup.vl.json docs/assets/speedup.svg
+bunx -p vega -p vega-lite vl2svg docs/assets/crossover.vl.json docs/assets/crossover.svg
 ```
 
 `bun run bench` also runs under the other hosts directly, which is useful

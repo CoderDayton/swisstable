@@ -332,9 +332,10 @@ const compileEmbedded = embeddedModule(SWISS_U64_WASM_BASE64);
  * buffers can never overlap the table banks — an earlier revision picked the
  * offsets on the JavaScript side and silently aliased them.
  *
- * The views are built once: the modules are linked with initial memory equal
- * to maximum memory and never call `memory.grow`, so the backing buffer is
- * never detached and never reallocated.
+ * The addresses are fixed for the module's lifetime — the staging buffers
+ * are static data, below the heap the banks are laid out on — but the views
+ * over them are not: a `memory.grow` replaces the backing buffer, so
+ * {@link BulkScratch.rebind} builds them again.
  */
 class BulkScratch {
   /** Maximum keys per WASM call; larger batches are chunked. */
@@ -388,6 +389,21 @@ class BulkScratch {
   }
 
   /**
+   * Builds the views again over `buffer`, after a grow replaced the old one.
+   *
+   * The addresses are unchanged — the staging buffers are static data, below
+   * the heap the banks are laid out on — so only the buffer object is new.
+   */
+  rebind(buffer: ArrayBuffer): void {
+    if (this.released) return;
+
+    this.keys = new Uint32Array(buffer, this.keysPtr, this.maxBatch);
+    this.valsLo = new Uint32Array(buffer, this.valsLoPtr, this.maxBatch);
+    this.valsHi = new Uint32Array(buffer, this.valsHiPtr, this.maxBatch);
+    this.found = new Uint8Array(buffer, this.foundPtr, this.maxBatch);
+  }
+
+  /**
    * Drops the views onto the module's memory.
    *
    * A buffer stays reachable, and so uncollectable, while any view onto it
@@ -412,9 +428,11 @@ class BulkScratch {
  * module's memory and process it in one crossing — the widest margin over
  * `Map`, since the boundary cost is paid once per batch instead of per key.
  *
- * Capacity is fixed at build time: the module is freestanding and has no
- * allocator, so operations that would exceed it throw {@link RangeError}
- * rather than growing.
+ * The table grows itself: the module reaches each new bank by growing its
+ * linear memory, so an instance costs what its table costs rather than a
+ * fixed reservation. The ceiling is 58,720,256 entries, and an operation
+ * past it — or one the host refuses the memory for — throws
+ * {@link RangeError} rather than growing.
  *
  * @example
  * ```ts
@@ -450,8 +468,8 @@ export class SwissU32ToU64 {
    * View over the module's latched-result lanes.
    *
    * Reading them through linear memory keeps a lookup at one boundary
-   * crossing instead of three. The view is built once because the module's
-   * memory is fixed and never grows.
+   * crossing instead of three. Rebuilt by {@link SwissU32ToU64.resync} when
+   * a grow replaces the buffer it views.
    */
   private lastValue: Uint32Array;
 
@@ -609,7 +627,7 @@ export class SwissU32ToU64 {
     seed: number,
   ): Promise<SwissU32ToU64> {
     // Validated before the module is instantiated, so a bad seed costs a
-    // throw rather than a 29 MiB instance the caller never receives.
+    // throw rather than an instance the caller never receives.
     const checked = asWasmI32(seed, "seed");
 
     return SwissU32ToU64.fromInstance(
@@ -725,6 +743,10 @@ export class SwissU32ToU64 {
       "SwissU32ToU64",
     );
 
+    // Sizing the table for `expectedEntries` is itself a growth, so the
+    // views the constructor built are already stale by here.
+    table.resync();
+
     return table;
   }
 
@@ -754,6 +776,37 @@ export class SwissU32ToU64 {
    * Larger batches are chunked automatically; this only matters when sizing
    * batches to avoid the copy that chunking implies.
    */
+  /**
+   * Rebuilds every cached view, if the module has grown its memory.
+   *
+   * The table's banks live on the heap and the module grows linear memory to
+   * reach them, which replaces the backing `ArrayBuffer` and detaches every
+   * view over the old one. A detached typed array reports a length of 0,
+   * which is what this tests: a field load on a view the caller already
+   * holds, where reading `memory.buffer` would be a call into the engine's
+   * `Memory` object on a path that runs per `set`.
+   *
+   * Called after every export that can rehash, and before anything reads a
+   * view, so no view is ever observed detached from outside this class. That
+   * includes the calls that report a failure: an export can grow memory on
+   * its way to refusing, so the refusal has to leave the views rebuilt.
+   */
+  private resync(): void {
+    if (this.sizeView.length !== 0) return;
+
+    const wasm = this.wasm;
+    const buffer = wasm.memory.buffer;
+    const window = this.scanWindow;
+
+    this.lastValue = new Uint32Array(buffer, wasm.last_value_ptr(), 2);
+    this.scanKeys = new Uint32Array(buffer, wasm.scan_keys_ptr(), window);
+    this.scanValsLo = new Uint32Array(buffer, wasm.scan_values_lo_ptr(), window);
+    this.scanValsHi = new Uint32Array(buffer, wasm.scan_values_hi_ptr(), window);
+    this.sizeView = new Uint32Array(buffer, wasm.size_ptr(), 1);
+    this.capacityView = new Uint32Array(buffer, wasm.capacity_ptr(), 1);
+    this.scratch.rebind(buffer);
+  }
+
   get maxBatch(): number {
     return this.scratch.maxBatch;
   }
@@ -768,22 +821,21 @@ export class SwissU32ToU64 {
    *   capacity.
    */
   reserve(entries: number): void {
-    assertStatus(
-      this.wasm.reserve(asWasmI32(entries, "entries")),
-      "reserve",
-      "SwissU32ToU64",
-    );
+    const status = this.wasm.reserve(asWasmI32(entries, "entries"));
+    this.resync();
+    assertStatus(status, "reserve", "SwissU32ToU64");
   }
 
   /**
    * Releases the module instance backing this table.
    *
-   * One table is one instance, and an instance reserves its whole capacity
-   * of linear memory up front — 29 MiB by default — which nothing can
-   * reclaim while the instance is reachable. Dropping the last reference to
-   * the table lets the collector take it eventually; this is how to make
-   * "eventually" now, which is what a process building a table per request
-   * or per document needs.
+   * One table is one instance, and an instance holds every page its table
+   * ever grew into — memory is never handed back, not even by
+   * {@link SwissU32ToU64.shrinkToFit} — and nothing can reclaim it while the
+   * instance is reachable. Dropping the last reference to the table lets the
+   * collector take it eventually; this is how to make "eventually" now,
+   * which is what a process building a table per request or per document
+   * needs.
    *
    * Idempotent. Afterwards {@link SwissU32ToU64.size} and
    * {@link SwissU32ToU64.capacity} read 0, and every method that would touch
@@ -820,12 +872,15 @@ export class SwissU32ToU64 {
    * a bulk removal costs a comparison rather than a rehash.
    *
    * This rehashes, which invalidates any open iterator exactly as a growth
-   * rehash would.
+   * rehash would. It recovers walk cost, not memory: the pages the larger
+   * bank touched stay with the instance until it is disposed.
    *
    * @throws {Error} If the module reports a failure.
    */
   shrinkToFit(): void {
-    assertStatus(this.wasm.shrink_to_fit(), "shrinkToFit", "SwissU32ToU64");
+    const status = this.wasm.shrink_to_fit();
+    this.resync();
+    assertStatus(status, "shrinkToFit", "SwissU32ToU64");
   }
 
   /**
@@ -887,15 +942,13 @@ export class SwissU32ToU64 {
    *   or if the insert would exceed the compiled capacity.
    */
   set(key: number, lo: number, hi: number): this {
-    assertStatus(
-      this.wasm.set(
-        asWasmI32(key, "key"),
-        asWasmI32(lo, "lo"),
-        asWasmI32(hi, "hi"),
-      ),
-      "set",
-      "SwissU32ToU64",
+    const status = this.wasm.set(
+      asWasmI32(key, "key"),
+      asWasmI32(lo, "lo"),
+      asWasmI32(hi, "hi"),
     );
+    this.resync();
+    assertStatus(status, "set", "SwissU32ToU64");
     return this;
   }
 
@@ -940,15 +993,13 @@ export class SwissU32ToU64 {
    *   or if the insert would exceed the compiled capacity.
    */
   getOrInsert(key: number, lo: number, hi: number): U64Lanes {
-    assertStatus(
-      this.wasm.get_or_insert(
-        asWasmI32(key, "key"),
-        asWasmI32(lo, "lo"),
-        asWasmI32(hi, "hi"),
-      ),
-      "getOrInsert",
-      "SwissU32ToU64",
+    const status = this.wasm.get_or_insert(
+      asWasmI32(key, "key"),
+      asWasmI32(lo, "lo"),
+      asWasmI32(hi, "hi"),
     );
+    this.resync();
+    assertStatus(status, "getOrInsert", "SwissU32ToU64");
     return { lo: this.lastValue[0]!, hi: this.lastValue[1]! };
   }
 
@@ -967,15 +1018,13 @@ export class SwissU32ToU64 {
    *   or if the insert would exceed the compiled capacity.
    */
   increment(key: number, deltaLo = 1, deltaHi = 0): U64Lanes {
-    assertStatus(
-      this.wasm.increment(
-        asWasmI32(key, "key"),
-        asWasmI32(deltaLo, "deltaLo"),
-        asWasmI32(deltaHi, "deltaHi"),
-      ),
-      "increment",
-      "SwissU32ToU64",
+    const status = this.wasm.increment(
+      asWasmI32(key, "key"),
+      asWasmI32(deltaLo, "deltaLo"),
+      asWasmI32(deltaHi, "deltaHi"),
     );
+    this.resync();
+    assertStatus(status, "increment", "SwissU32ToU64");
     return { lo: this.lastValue[0]!, hi: this.lastValue[1]! };
   }
 
@@ -1043,16 +1092,19 @@ export class SwissU32ToU64 {
       stageU32(valsLo, this.scratch.valsLo, offset, chunk, "valsLo");
       stageU32(valsHi, this.scratch.valsHi, offset, chunk, "valsHi");
 
-      assertStatus(
-        this.wasm.set_many(
-          this.scratch.keysPtr,
-          this.scratch.valsLoPtr,
-          this.scratch.valsHiPtr,
-          chunk,
-        ),
-        "setMany",
-        "SwissU32ToU64",
+      const status = this.wasm.set_many(
+        this.scratch.keysPtr,
+        this.scratch.valsLoPtr,
+        this.scratch.valsHiPtr,
+        chunk,
       );
+
+      // A chunk can grow the table, and the next one stages through the
+      // same views this replaces. A chunk that runs out of capacity can have
+      // grown several times before it did, so this runs ahead of the throw.
+      this.resync();
+
+      assertStatus(status, "setMany", "SwissU32ToU64");
     }
   }
 

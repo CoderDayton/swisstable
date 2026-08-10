@@ -31,21 +31,21 @@ Docs: [API](docs/api.md) · [Design](docs/design.md) ·
 - One byte of metadata per slot, compared sixteen at a time with `wasm_simd128`.
 - 10.3 bytes per entry at full occupancy, 20.6 with the standby bank a rehash
   needs, against a measured 37 for `Map` on V8 and 67 on JavaScriptCore.
-- An instance reserves 21 MiB (u32) or 29 MiB (u64) up front and commits it
-  by page: an empty table costs 1.7 MiB RSS, each further one about 50 KiB.
-  Lower `SWISS_MAX_CAPACITY_LOG2` for many small tables — see
+- Holds up to 117,440,512 entries (u32) or 58,720,256 (u64).
+- An instance starts at 1.25 MiB (u32) or 1.75 MiB (u64) and grows with the
+  table, so a small table costs what a small table costs. See
   [Footprint](docs/design.md#footprint). `dispose()`, or a `using`
   declaration, hands an instance back without waiting for the collector.
 - Bulk `setMany`/`getMany`/`deleteMany` on both tables cross once per batch:
-  a 100,000-entry u32 fill is 6.2–6.7 ns/op against `Map`'s 44–65, and the
-  matching lookup 4.1–4.7 against 10–22.
+  a 100,000-entry u32 fill is 6.1–6.9 ns/op against `Map`'s 48–70, and the
+  matching lookup 3.9–4.9 against 11–24.
 - `getOrInsert` and `increment` do a read-modify-write in one crossing and
-  one probe: counting is 1.25–1.8x faster than `get` plus `set`.
-- No allocator — fixed linear memory, linked `-nostdlib`, never calls
-  `memory.grow`, nothing allocated on a hot path.
+  one probe. Inserting a missing key is 5.0–6.3x faster than `Map`.
+- No allocator. Linked `-nostdlib`, with the banks at computed offsets and
+  linear memory grown to reach them. Nothing allocates on a hot path.
 - Ships compiled ESM with type declarations, and the modules are compiled in:
   no `.wasm` to serve, no loader to write, no install step, no dependencies.
-- Runs in Node, Bun, Deno, bundlers, and browsers — anything with WebAssembly
+- Runs in Node, Bun, Deno, bundlers, and browsers. Anything with WebAssembly
   SIMD (Node 16.9+, Chrome 91+, Firefox 89+, Safari 16.4+), which
   `supportsSimd()` reports for the current runtime.
 
@@ -83,11 +83,11 @@ Four exports:
 | `StringInterner` | `string -> u32` | stable IDs in first-seen order |
 | `InternedSwissMap` | `string -> V` | string keys over a numeric table |
 
-Keys and values are strictly `u32` and anything else throws `RangeError`;
-capacity is fixed at build time (917,504 entries); a stored `0` is always
-distinguishable from an absent key. See [docs/api.md](docs/api.md) for every
-method and thrown error, and [`examples/`](examples/README.md) for five
-runnable programs.
+Keys and values are strictly `u32` and anything else throws `RangeError`.
+Capacity is bounded at 117,440,512 entries (u32) or 58,720,256 (u64). A
+stored `0` is always distinguishable from an absent key. See
+[docs/api.md](docs/api.md) for every method and thrown error, and
+[`examples/`](examples/README.md) for five runnable programs.
 
 Two operational notes. Each table seeds its hash from the runtime's CSPRNG,
 so a colliding key set cannot be computed offline and reused across
@@ -117,18 +117,18 @@ its own, probed in a shuffled order. i9-13900K on x64 Linux.
 
 | Workload | Bun 1.3 | Node 24 | Deno 2.9 | Chrome 151 | Firefox 153 |
 | --- | --- | --- | --- | --- | --- |
-| fill (pre-sized) | 8.3x | 6.4x | 5.6x | 4.2x | 5.2x |
-| lookup hit | 1.60x | 2.8x | 3.2x | 2.6x | 1.79x |
-| lookup miss | 1.38x | 3.3x | 3.4x | 2.6x | 1.73x |
-| `has` | 1.84x | 3.4x | 3.6x | 3.1x | 1.98x |
-| overwrite existing key | 2.3x | 2.7x | 2.9x | 2.7x | 3.2x |
-| delete | 5.6x | 5.5x | 5.4x | 4.3x | 4.3x |
-| churn (delete + reinsert) | 3.2x | 3.6x | 3.5x | 2.9x | 3.2x |
-| count (`increment`) | 1.41x | 1.39x | 1.47x | 1.49x | 0.96x |
-| u32 bulk fill (`setMany`) | 9.8x | 9.6x | 8.0x | 6.6x | 8.6x |
-| u32 bulk lookup (`getMany`) | 2.4x | 5.4x | 4.8x | 5.0x | 3.8x |
-| u64 bulk fill (`setMany`) | 6.0x | 8.0x | 6.9x | 6.2x | 9.1x |
-| u64 bulk lookup (`getMany`) | 1.56x | 3.8x | 3.7x | 3.2x | 2.3x |
+| fill (pre-sized) | 5.2x | 6.2x | 5.0x | 3.6x | 4.7x |
+| lookup hit | 1.50x | 2.7x | 2.8x | 2.3x | 1.60x |
+| lookup miss | 1.29x | 3.2x | 3.4x | 2.5x | 1.70x |
+| `has` | 1.77x | 3.2x | 3.5x | 2.9x | 1.86x |
+| overwrite existing key | 2.2x | 2.5x | 2.5x | 2.2x | 2.8x |
+| delete | 6.1x | 5.5x | 5.8x | 4.1x | 4.7x |
+| churn (delete + reinsert) | 3.3x | 3.6x | 3.5x | 2.6x | 3.2x |
+| count (`increment`) | 1.26x | 1.33x | 1.35x | 1.28x | 0.89x |
+| u32 bulk fill (`setMany`) | 8.4x | 11x | 8.3x | 7.6x | 9.2x |
+| u32 bulk lookup (`getMany`) | 2.7x | 5.6x | 4.9x | 5.4x | 3.6x |
+| u64 bulk fill (`setMany`) | 10x | 9.7x | 8.6x | 6.4x | 8.5x |
+| u64 bulk lookup (`getMany`) | 2.1x | 4.1x | 3.8x | 3.6x | 2.3x |
 
 The table costs about the same on every engine. The columns differ because
 `Map` does. Counting is the one row a browser engine takes: at 1,000 distinct

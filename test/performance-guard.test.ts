@@ -12,7 +12,10 @@ import { SwissU32ToU32, SwissU32ToU64 } from "../src/index.ts";
  *
  * Every assertion is a ratio against `Map` measured in the same process, so
  * a slow or contended machine moves both contenders together and the ratio
- * holds. The floors sit far below the measured margins (8.8x, 5.6x and 6.4x
+ * holds. Each contender is scored by its fastest round rather than its
+ * median: interference only ever makes a round slower, and it does not
+ * arrive evenly between the two, so a median carries whatever the host did
+ * during the run into the ratio. The floors sit far below the measured margins (8.8x, 5.6x and 6.4x
  * on Bun; 3.5x, 5.0x and 5.4x on the slowest engine measured) precisely so
  * that ordinary noise cannot reach them. A failure here means something
  * structural broke — a per-key boundary crossing on a bulk path, a lost
@@ -29,7 +32,7 @@ const RATIOS_ARE_MEANINGFUL =
 
 const ENTRIES = 50_000;
 
-/** Rounds per contender; the median is compared. */
+/** Rounds per contender; the fastest is compared. */
 const ROUNDS = 5;
 
 /**
@@ -59,13 +62,13 @@ interface Contender {
 }
 
 /**
- * Median nanoseconds per operation over {@link ROUNDS} rounds.
+ * Nanoseconds per operation in the fastest of {@link ROUNDS} rounds.
  *
  * `setup` runs before each round but outside the clock, so a workload that
  * consumes its own input — deleting every key — measures the operation
  * rather than the refill, and both contenders start each round alike.
  */
-function median({ setup, run }: Contender): number {
+function fastest({ setup, run }: Contender): number {
   for (let round = 0; round < WARMUP_ROUNDS; round += 1) {
     setup?.();
     run();
@@ -79,14 +82,26 @@ function median({ setup, run }: Contender): number {
     timings.push((Bun.nanoseconds() - started) / ENTRIES);
   }
 
-  timings.sort((a, b) => a - b);
-  return timings[timings.length >> 1]!;
+  return Math.min(...timings);
 }
 
-/** Asserts the table beats `Map` by at least {@link FLOOR}. */
+/**
+ * Asserts the table beats `Map` by at least {@link FLOOR}.
+ *
+ * The message carries both timings and the ratio, because the number is the
+ * whole diagnosis: a run that missed the floor by a hair is a busy host, and
+ * one that came in near parity is a structural regression.
+ */
 function expectFaster(label: string, table: Contender, map: Contender): void {
-  const speedup = median(map) / median(table);
-  expect(`${label} ${speedup >= FLOOR}`).toBe(`${label} true`);
+  const mapNs = fastest(map);
+  const tableNs = fastest(table);
+  const speedup = mapNs / tableNs;
+
+  expect(
+    speedup,
+    `${label}: ${speedup.toFixed(2)}x against Map, below the ${FLOOR.toFixed(2)}x floor ` +
+      `(table ${tableNs.toFixed(1)} ns/op, Map ${mapNs.toFixed(1)} ns/op)`,
+  ).toBeGreaterThanOrEqual(FLOOR);
 }
 
 describe("performance guard", () => {

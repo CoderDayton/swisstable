@@ -1,0 +1,51 @@
+name: Proposal
+description: A new method, a new table shape, or a change to existing behaviour.
+labels: [proposal]
+
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: >-
+        What you are trying to do, and where the current API makes it awkward
+        or impossible. Describe the workload rather than the API you have in
+        mind — the shape of the fix often falls out of it.
+    validations:
+      required: true
+
+  - type: textarea
+    id: today
+    attributes:
+      label: What you do today
+      description: The workaround, and what it costs — extra crossings, extra copies, extra code.
+      render: typescript
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like instead
+      description: A signature or a sketch is enough.
+      render: typescript
+
+  - type: dropdown
+    id: layer
+    attributes:
+      label: Where it would live
+      options:
+        - The JavaScript bindings only
+        - The native modules, so it needs a rebuild of the wasm
+        - Not sure
+    validations:
+      required: true
+
+  - type: markdown
+    attributes:
+      value: >-
+        Two constraints shape most answers here. The modules are freestanding
+        with no allocator, so anything needing dynamic memory does not fit.
+        And the package exists to remove boundary crossings — a method that
+        crosses once per key is usually better written by the caller in
+        JavaScript.

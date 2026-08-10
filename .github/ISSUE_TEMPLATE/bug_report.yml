@@ -1,0 +1,83 @@
+name: Bug report
+description: A table gives a wrong answer, throws when it should not, or will not load.
+labels: [bug]
+
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        If you believe the problem is exploitable, close this and file a
+        private advisory instead — see SECURITY.md.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you saw, and what you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: >-
+        A script we can run. Keys matter — the table's layout depends on the
+        exact key set, so a paraphrase of the sequence often does not
+        reproduce. If the table was built with `createWithSeed` or
+        `loadWithSeed`, include the seed; an unseeded table draws a fresh one
+        per instance and the failure may not repeat.
+      render: typescript
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: swisstable version
+      placeholder: "1.0.0"
+    validations:
+      required: true
+
+  - type: input
+    id: runtime
+    attributes:
+      label: Runtime and version
+      description: Include the bundler if one is involved.
+      placeholder: "Node 22.11.0 / Bun 1.3.14 / Chrome 131 via Vite 6"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: category
+    attributes:
+      label: Closest description
+      options:
+        - A lookup returned the wrong value, or missed a key that was inserted
+        - A method threw when it should not have
+        - Iteration skipped, repeated, or corrupted entries
+        - The module would not load or instantiate
+        - Memory use or performance is far off what the docs state
+        - Something else
+    validations:
+      required: true
+
+  - type: textarea
+    id: error
+    attributes:
+      label: Error output
+      description: The full message and stack, if there was one.
+      render: shell
+
+  - type: checkboxes
+    id: ruled-out
+    attributes:
+      label: Ruled out
+      description: >-
+        These four account for most reports. Each is documented behaviour, so
+        confirming you are not hitting one saves a round trip.
+      options:
+        - label: Keys and values are within the documented ranges — anything outside `u32` throws.
+        - label: The table is under its capacity ceiling of 917,504 entries.
+        - label: The runtime supports WebAssembly SIMD (Node 16.9+, Chrome 91+, Firefox 89+, Safari 16.4+).
+        - label: No instance is shared across workers, and no iterator is held across a rehash.

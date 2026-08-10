@@ -1,0 +1,19 @@
+# Blank issues stay open so a question has somewhere to go: the two forms
+# alongside this file cover defects and proposals, and nothing else.
+blank_issues_enabled: true
+
+# A vulnerability must not arrive as a public issue, so the private route is
+# offered here rather than left to be discovered in SECURITY.md.
+contact_links:
+  - name: Report a vulnerability
+    url: https://github.com/CoderDayton/swisstable/security/advisories/new
+    about: >-
+      Anything you believe is exploitable goes through a private advisory, not
+      a public issue. See SECURITY.md for what is in scope.
+
+  - name: Read the API reference first
+    url: https://github.com/CoderDayton/swisstable/blob/main/docs/api.md
+    about: >-
+      Capacity, seeding, threading, and the cases where Map is the better
+      choice are all documented. Most "should I use this for X" questions are
+      answered there.

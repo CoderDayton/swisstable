@@ -15,17 +15,25 @@ import { SwissU32ToU32, SwissU32ToU64 } from "../src/index.ts";
  * holds. Each contender is scored by its fastest round rather than its
  * median: interference only ever makes a round slower, and it does not
  * arrive evenly between the two, so a median carries whatever the host did
- * during the run into the ratio. The floors sit far below the measured margins (8.8x, 5.6x and 6.4x
- * on Bun; 3.5x, 5.0x and 5.4x on the slowest engine measured) precisely so
- * that ordinary noise cannot reach them. A failure here means something
- * structural broke — a per-key boundary crossing on a bulk path, a lost
- * pre-size, an accidental copy — not that the machine was busy.
+ * during the run into the ratio.
  *
- * The ratio tests still need a machine whose timings mean something. Hosted
- * macOS and Windows runners are co-tenanted virtual machines whose noise is
- * not symmetric between contenders, so on CI they run on Linux only; a red
- * build there is a real regression rather than a busy host. Everywhere else,
- * including every local run on any platform, they always run.
+ * {@link FLOOR} is set from what a regression looks like, not from the
+ * margin. What this catches is the order-of-magnitude kind — work repeated
+ * per key that should not be, a lost pre-size — which puts the table at or
+ * below `Map` and so fails against any floor above parity. What it does not
+ * catch is a lost bulk path: crossing once per key rather than once per
+ * batch costs `setMany` about a sixth of its margin, and no floor separates
+ * that from a busy host. `bun run bench` is where that shows.
+ *
+ * Setting the floor near the measured margin therefore buys nothing, and
+ * costs a false failure whenever the host is busy: contention does not reach
+ * the two contenders equally, and a run competing with a compile has been
+ * seen at less than half the ratio the same machine gives when idle.
+ *
+ * On CI the ratios run on Linux only. Hosted macOS and Windows runners are
+ * co-tenanted virtual machines whose noise is not symmetric between
+ * contenders. Everywhere else, including every local run on any platform,
+ * they always run.
  */
 const RATIOS_ARE_MEANINGFUL =
   process.env.CI === undefined || process.platform === "linux";
@@ -40,13 +48,18 @@ const ROUNDS = 5;
  *
  * The table's set path needs several passes over 50,000 keys before the
  * engine tiers it up, and a single warm-up leaves the first timed rounds
- * running at roughly twice the steady-state cost — enough to push the
- * ratio under {@link FLOOR} on a floor the steady state clears fivefold.
+ * running at roughly twice the steady-state cost.
  */
 const WARMUP_ROUNDS = 5;
 
-/** How far below the measured margin a run may fall before it is a bug. */
-const FLOOR = 2.0;
+/**
+ * Smallest speedup over `Map` a run may report before it is a bug.
+ *
+ * Held just above parity. `bun run bench` and docs/performance.md are where
+ * the actual margins live; restating one here would only turn a routine
+ * measurement change into a failing test.
+ */
+const FLOOR = 1.25;
 
 /** Sparse keys, which is the distribution the package is built for. */
 const KEYS = new Uint32Array(ENTRIES);

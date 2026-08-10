@@ -54,6 +54,65 @@ describe("growth under steady-state churn", () => {
     expect(table.capacity).toBeGreaterThan(startCapacity);
   });
 
+  test("reserve accounts for growth spent on deleted entries", async () => {
+    /**
+     * Builds a table whose capacity fits `live` entries but whose growth is
+     * already spent, half of it on entries since deleted. Capacity alone
+     * says the entries fit; only the growth budget says whether the next
+     * insert rehashes.
+     */
+    async function tombstoned() {
+      const table = await SwissU32ToU32.create(65_536);
+      const capacity = table.capacity;
+      const live = Math.floor((capacity * 7) / 8);
+
+      for (let key = 0; key < live; key += 1) table.set(key, key);
+      for (let key = 0; key < live / 2; key += 1) table.delete(key);
+
+      return { table, capacity, live, refill: live / 2 };
+    }
+
+    /**
+     * Refills the table with a walk open, and reports whether the walk
+     * survived. A rehash bumps the generation, which the walk detects at its
+     * next window — so the capacity has to span more than one window, which
+     * is why this is built at 65,536 entries rather than a handful.
+     */
+    function refillDuringWalk(
+      table: SwissU32ToU32,
+      capacity: number,
+      refill: number,
+    ): boolean {
+      const walk = table.keys();
+      walk.next();
+
+      for (let i = 0; i < refill; i += 1) table.set(capacity * 4 + i, 1);
+
+      try {
+        [...walk];
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
+    const reserved = await tombstoned();
+    reserved.table.reserve(reserved.live);
+
+    expect(
+      refillDuringWalk(reserved.table, reserved.capacity, reserved.refill),
+    ).toBe(true);
+
+    // The same refill without the reserve rehashes, which is what makes the
+    // assertion above a claim about reserve rather than about the table
+    // having had room all along.
+    const bare = await tombstoned();
+
+    expect(refillDuringWalk(bare.table, bare.capacity, bare.refill)).toBe(
+      false,
+    );
+  });
+
   test("churn at the load factor stays within a small multiple of an empty table", async () => {
     // `atLoadFactor` is resolved against the capacity the table actually
     // allocated, not the requested one — they differ by a doubling, and
@@ -70,9 +129,8 @@ describe("growth under steady-state churn", () => {
 
       for (let key = 0; key < target; key += 1) table.set(key, key);
 
-      // Enough pairs that one run spans milliseconds rather than the tens of
-      // microseconds an earlier version measured, where a single GC pause
-      // preceding the test decided the result.
+      // Enough pairs that one run spans milliseconds. At tens of
+      // microseconds a single GC pause preceding the run decides the result.
       const pairs = 50_000;
       const fresh = table.capacity * 4;
 

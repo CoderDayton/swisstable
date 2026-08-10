@@ -83,7 +83,7 @@ bun run build:js   # src/*.ts   -> dist/js/*.js + .d.ts
 
 bun test           # 246 tests across 24 suites
 bun run typecheck  # tsc --noEmit
-bun run check:ubsan  # rebuild with UBSan trapping and exercise every path
+bun run check:ubsan  # rebuild with UBSan trapping and exercise the arithmetic
 bun run smoke      # the built package under plain Node
 bun run smoke:browser  # the built package in Chrome or Firefox
 bun run bench      # throughput against Map, Object, Int32Array (this runtime)
@@ -134,7 +134,10 @@ at `load()` as a `TypeError`, so tests are what catch it.
 
 `MAX_CAPACITY` is set by `MAX_CAPACITY_LOG2`, a power-of-two exponent
 defaulting to 20 via `#ifndef` and overridable with the
-`SWISS_MAX_CAPACITY_LOG2` environment variable at build time. Linear memory is
+`SWISS_MAX_CAPACITY_LOG2` environment variable at build time. It is accepted
+in `[4, 25]`, enforced identically in `native/swiss_core.h` and
+`scripts/build-wasm.ts`: below 4 a bank holds less than one SIMD group, and
+above 25 `h1()` has no bits left to address the extra slots with. Linear memory is
 derived from it in `scripts/build-wasm.ts` (bytes-per-slot times slots, plus
 fixed overhead), so there is no second figure to keep in step — but if you add
 a static array, raise that target's `overheadBytes`. The statics have to fit

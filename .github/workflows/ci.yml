@@ -185,10 +185,32 @@ jobs:
 
       # Rebuilds the sources with UndefinedBehaviorSanitizer trapping, then
       # drives them through growth, compaction, tombstone reuse, the group
-      # scan, and the bulk API. The shipped modules are compiled without it,
+      # scan, the seeded hash, the bulk API, and the upsert paths including
+      # the u64 lane arithmetic. The shipped modules are compiled without it,
       # so this is the only place UB in native/*.c would be reported.
-      - name: Build with UBSan and exercise every path
+      - name: Build with UBSan and exercise the arithmetic
         run: bun run check:ubsan
+
+  audit:
+    name: Audit dependencies
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      # The package ships no runtime dependencies, so this covers the build
+      # and test tooling only. It runs anyway: an advisory against something
+      # that produces the published artifact is worth the same attention as
+      # one against something the artifact carries.
+      - name: Audit
+        run: bun audit
 
   test:
     name: Test on ${{ matrix.os }}
@@ -229,6 +251,21 @@ jobs:
       # Loads dist/wasm, which the build job produced.
       - name: Test
         run: bun test
+
+      # The examples are what a reader copies first, so a broken one is a
+      # broken introduction to the package. Running them proves they execute
+      # against the built modules, not that they still do what their comments
+      # say — `bun run typecheck` already covers that they compile. Linux only:
+      # they exercise the same platform-independent code the suite does.
+      - name: Run the examples
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          for example in examples/*.ts; do
+            echo "::group::$example"
+            bun run "$example"
+            echo "::endgroup::"
+          done
 
       # bun test runs the TypeScript sources under Bun, which says nothing
       # about whether the emitted JavaScript loads under the runtime most

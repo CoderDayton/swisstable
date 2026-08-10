@@ -99,9 +99,9 @@ export interface SwissU64WasmExports extends ScanExports {
   /** Address of the staging key buffer. */
   bulk_keys_ptr(): number;
   /** Address of the staging low-lane buffer. */
-  bulk_vals_lo_ptr(): number;
+  bulk_values_lo_ptr(): number;
   /** Address of the staging high-lane buffer. */
-  bulk_vals_hi_ptr(): number;
+  bulk_values_hi_ptr(): number;
   /** Address of the staging flag buffer. */
   bulk_flags_ptr(): number;
 
@@ -116,9 +116,9 @@ export interface SwissU64WasmExports extends ScanExports {
   /** Address of the scan key buffer. */
   scan_keys_ptr(): number;
   /** Address of the scan low-lane buffer. */
-  scan_vals_lo_ptr(): number;
+  scan_values_lo_ptr(): number;
   /** Address of the scan high-lane buffer. */
-  scan_vals_hi_ptr(): number;
+  scan_values_hi_ptr(): number;
   /** Slots one `scan` visits. */
   scan_window(): number;
   /** Counter bumped by every rehash, clear, and init. */
@@ -286,8 +286,8 @@ export function lanesToSpan(lanes: U64Lanes): Span {
 /**
  * Exports the bindings call. Every one is listed, not a representative
  * few: {@link BulkScratch} and the constructor invoke the pointer and
- * capacity accessors immediately, so a module missing one used to surface
- * as a bare "is not a function" instead of the intended TypeError.
+ * capacity accessors immediately, so a module missing one would otherwise
+ * surface as a bare "is not a function" instead of the intended TypeError.
  */
 const REQUIRED_U64_EXPORTS = [
   "set_seed",
@@ -307,14 +307,14 @@ const REQUIRED_U64_EXPORTS = [
   "delete_many",
   "bulk_capacity",
   "bulk_keys_ptr",
-  "bulk_vals_lo_ptr",
-  "bulk_vals_hi_ptr",
+  "bulk_values_lo_ptr",
+  "bulk_values_hi_ptr",
   "bulk_flags_ptr",
   "scan",
   "scan_window",
   "scan_keys_ptr",
-  "scan_vals_lo_ptr",
-  "scan_vals_hi_ptr",
+  "scan_values_lo_ptr",
+  "scan_values_hi_ptr",
   "generation",
   "size",
   "capacity",
@@ -375,8 +375,8 @@ class BulkScratch {
     }
 
     this.keysPtr = wasm.bulk_keys_ptr() >>> 0;
-    this.valsLoPtr = wasm.bulk_vals_lo_ptr() >>> 0;
-    this.valsHiPtr = wasm.bulk_vals_hi_ptr() >>> 0;
+    this.valsLoPtr = wasm.bulk_values_lo_ptr() >>> 0;
+    this.valsHiPtr = wasm.bulk_values_hi_ptr() >>> 0;
     this.foundPtr = wasm.bulk_flags_ptr() >>> 0;
 
     const buffer = wasm.memory.buffer;
@@ -494,8 +494,8 @@ export class SwissU32ToU64 {
     const buffer = wasm.memory.buffer;
     const window = this.scanWindow;
     this.scanKeys = new Uint32Array(buffer, wasm.scan_keys_ptr(), window);
-    this.scanValsLo = new Uint32Array(buffer, wasm.scan_vals_lo_ptr(), window);
-    this.scanValsHi = new Uint32Array(buffer, wasm.scan_vals_hi_ptr(), window);
+    this.scanValsLo = new Uint32Array(buffer, wasm.scan_values_lo_ptr(), window);
+    this.scanValsHi = new Uint32Array(buffer, wasm.scan_values_hi_ptr(), window);
 
     this.sizeView = new Uint32Array(buffer, wasm.size_ptr(), 1);
     this.capacityView = new Uint32Array(buffer, wasm.capacity_ptr(), 1);

@@ -56,10 +56,12 @@ const DEFAULT_MAX_CAPACITY_LOG2 = 20;
 const MIN_MAX_CAPACITY_LOG2 = 4;
 
 /**
- * Largest exponent whose banks still address inside wasm32's 4 GiB, with
- * room to spare for the staging buffers.
+ * Largest exponent h1() has bits for: it discards the 7 the fingerprint
+ * consumes, leaving 25, and a wider mask would leave the upper half of the
+ * slot space unreachable as a probe start. Enforced identically in
+ * native/swiss_core.h, which the sources also compile standalone against.
  */
-const MAX_MAX_CAPACITY_LOG2 = 26;
+const MAX_MAX_CAPACITY_LOG2 = 25;
 
 function maxCapacityLog2(): number {
   const raw = Bun.env.SWISS_MAX_CAPACITY_LOG2;
@@ -212,14 +214,14 @@ const TARGETS: readonly WasmTarget[] = [
       "delete_many",
       "bulk_capacity",
       "bulk_keys_ptr",
-      "bulk_vals_lo_ptr",
-      "bulk_vals_hi_ptr",
+      "bulk_values_lo_ptr",
+      "bulk_values_hi_ptr",
       "bulk_flags_ptr",
       "scan",
       "scan_window",
       "scan_keys_ptr",
-      "scan_vals_lo_ptr",
-      "scan_vals_hi_ptr",
+      "scan_values_lo_ptr",
+      "scan_values_hi_ptr",
       "generation",
       "size",
       "capacity",

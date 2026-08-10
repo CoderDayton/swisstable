@@ -9,7 +9,7 @@
  * The engine — probing, growth, deletion, iteration, and their invariants —
  * lives in swiss_core.h, shared with swiss_u32.c. This file supplies what
  * the payload shape decides — the Entry lanes, the has_get() output lanes,
- * and the set() export — plus the bulk API, which only this module has.
+ * the set() export, and the lane-splitting half of the bulk API.
  *
  * Value packing:
  *   u64 value = (hi << 32) | lo
@@ -283,17 +283,17 @@ int32_t get_many(
 
 /* Addresses of the value lanes. Constant for the module's lifetime. */
 
-__attribute__((export_name("bulk_vals_lo_ptr")))
-uint32_t bulk_vals_lo_ptr(void) { return (uint32_t)(uintptr_t)g_bulk_vals_lo; }
+__attribute__((export_name("bulk_values_lo_ptr")))
+uint32_t bulk_values_lo_ptr(void) { return (uint32_t)(uintptr_t)g_bulk_vals_lo; }
 
-__attribute__((export_name("bulk_vals_hi_ptr")))
-uint32_t bulk_vals_hi_ptr(void) { return (uint32_t)(uintptr_t)g_bulk_vals_hi; }
+__attribute__((export_name("bulk_values_hi_ptr")))
+uint32_t bulk_values_hi_ptr(void) { return (uint32_t)(uintptr_t)g_bulk_vals_hi; }
 
 __attribute__((export_name("scan_keys_ptr")))
 uint32_t scan_keys_ptr(void) { return (uint32_t)(uintptr_t)g_scan_keys; }
 
-__attribute__((export_name("scan_vals_lo_ptr")))
-uint32_t scan_vals_lo_ptr(void) { return (uint32_t)(uintptr_t)g_scan_vals_lo; }
+__attribute__((export_name("scan_values_lo_ptr")))
+uint32_t scan_values_lo_ptr(void) { return (uint32_t)(uintptr_t)g_scan_vals_lo; }
 
-__attribute__((export_name("scan_vals_hi_ptr")))
-uint32_t scan_vals_hi_ptr(void) { return (uint32_t)(uintptr_t)g_scan_vals_hi; }
+__attribute__((export_name("scan_values_hi_ptr")))
+uint32_t scan_values_hi_ptr(void) { return (uint32_t)(uintptr_t)g_scan_vals_hi; }

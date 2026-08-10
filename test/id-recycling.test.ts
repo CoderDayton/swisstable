@@ -121,7 +121,7 @@ describe("StringInterner with recycling", () => {
     expect(interner.lookup("c")).toBeUndefined();
     expect(interner.size).toBe(1);
 
-    // And it went back to the pool rather than being lost.
+    // It went back to the pool rather than being lost.
     expect(interner.intern("d")).toBe(recycled);
   });
 });

@@ -76,9 +76,14 @@ it. Where the caller keeps its keys still matters; see
 **Capacity is fixed at build time.** The modules are freestanding and link
 without an allocator, so the ceiling is `1 << 20` slots — 917,504 live
 entries at the 7/8 load factor. Requests past it throw `RangeError`. Rebuild
-with `SWISS_MAX_CAPACITY_LOG2` set to a different power-of-two exponent to
-move it either way; the build script sizes linear memory from the same
-number.
+with `SWISS_MAX_CAPACITY_LOG2` set to a different power-of-two exponent in
+`[4, 25]` to move it either way; the build script sizes linear memory from the
+same number.
+
+Run a table below its ceiling, not at it. A table holding close to the maximum
+while inserting and deleting at the same rate has no room left to grow into,
+so it compacts on every insert instead of amortizing — raise the exponent, or
+shard across instances.
 
 **Each module instance owns exactly one table, and reserves its whole budget
 up front.** The banks are static arrays, so an instance reserves 21 MiB (u32)
@@ -334,7 +339,7 @@ Misses in `getMany` are reported through `found`, and their values are
 zeroed, so output buffers never carry stale values from a previous batch.
 `setMany` is **not atomic** on a capacity ceiling — see
 [Rules that apply everywhere](#rules-that-apply-everywhere).
-| `reserve(entries)` | `void` | Grows in place, preserving contents. No-op if the capacity already suffices. |
+| `reserve(entries)` | `void` | Makes room for `entries` total without a further rehash, preserving contents. Rehashes when growth spent on since-deleted entries is what stands in the way, even where the capacity would suffice. No-op when the remaining growth already covers it. |
 | `shrinkToFit()` | `void` | Rehashes down to the smallest capacity holding the live entries. No-op if already there. |
 | `clear()` | `void` | Empties the table but **retains capacity**. Follow with `shrinkToFit()` to hand the slots back. |
 | `dispose()` | `void` | Releases the module instance. Idempotent, and aliased as `Symbol.dispose` so a table works with `using`. Afterwards `size` and `capacity` read 0, and every method that would touch the instance throws. An iterator opened beforehand keeps walking, and keeps the instance alive until it ends. |

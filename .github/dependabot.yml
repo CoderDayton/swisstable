@@ -1,0 +1,23 @@
+version: 2
+
+updates:
+  # The published package has no runtime dependencies, so these are the build
+  # and test tooling. They still decide what the artifact is compiled from.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: deps
+
+  # Both workflows pin every action to a commit SHA rather than a tag, which
+  # is what makes them safe on pull requests and what makes them invisible to
+  # a human reading for version drift. This is the only thing that reports a
+  # pinned SHA has fallen behind.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: ci

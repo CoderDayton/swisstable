@@ -1,0 +1,13 @@
+# Review is required on everything; these paths are called out because a
+# change to them is not contained by the test suite.
+#
+# native/ and scripts/build-wasm.ts decide the bytes every consumer runs, and
+# a mistake there is a miscompile rather than a failing assertion. The release
+# workflow holds the publish credential.
+
+*                             @CoderDayton
+
+/native/                      @CoderDayton
+/scripts/build-wasm.ts        @CoderDayton
+/scripts/toolchain.ts         @CoderDayton
+/.github/workflows/release.yml @CoderDayton

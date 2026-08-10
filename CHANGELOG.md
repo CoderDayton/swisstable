@@ -8,7 +8,7 @@ The public API is the exports of `swisstable` and the two `.wasm` subpaths.
 The `*WasmExports` interfaces mirror the native sources, are marked
 `@internal`, and change without a major version.
 
-## Unreleased
+## 1.0.0 - 2026-08-09
 
 Initial release.
 

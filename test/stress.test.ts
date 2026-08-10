@@ -71,8 +71,8 @@ describe("capacity ceiling", () => {
   });
 
   // A full table has no room for a new key, but overwriting one that is
-  // already present needs none. Regression: set() once reserved space before
-  // checking for the key, so this threw.
+  // already present needs none, so set() has to look for the key before it
+  // reserves space rather than after.
   test("overwrites at capacity but rejects a new key", async () => {
     const table = await SwissU32ToU32.create(MAX_ENTRIES);
     for (let i = 0; i < MAX_ENTRIES; i += 1) table.set(i, i);

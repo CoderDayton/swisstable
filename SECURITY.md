@@ -68,7 +68,7 @@ worker its own instance.
 rather than growing. An input that drives a table past 917,504 entries is a
 capacity-planning problem in the calling service.
 
-**Every instance reserves its full linear memory up front** — 20 MiB for
+**Every instance reserves its full linear memory up front** — 21 MiB for
 `SwissU32ToU32`, 29 MiB for `SwissU32ToU64` — committed by page, so an empty
 one costs about 1.7 MiB RSS. Code that creates a table per request and never
 calls `dispose()` will accumulate them until the collector runs.

@@ -40,8 +40,8 @@ interface RawExports {
   delete_many(k: number, deleted: number, count: number): number;
   bulk_capacity(): number;
   bulk_keys_ptr(): number;
-  bulk_vals_lo_ptr(): number;
-  bulk_vals_hi_ptr(): number;
+  bulk_values_lo_ptr(): number;
+  bulk_values_hi_ptr(): number;
   bulk_flags_ptr(): number;
 }
 
@@ -62,8 +62,8 @@ describe("bulk exports validate their own arguments", () => {
     wasm.init(1024);
     maxBatch = wasm.bulk_capacity() >>> 0;
     keysPtr = wasm.bulk_keys_ptr() >>> 0;
-    loPtr = wasm.bulk_vals_lo_ptr() >>> 0;
-    hiPtr = wasm.bulk_vals_hi_ptr() >>> 0;
+    loPtr = wasm.bulk_values_lo_ptr() >>> 0;
+    hiPtr = wasm.bulk_values_hi_ptr() >>> 0;
     flagsPtr = wasm.bulk_flags_ptr() >>> 0;
 
     for (let key = 0; key < 500; key += 1) wasm.set(key, key, 0);

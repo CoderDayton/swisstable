@@ -1,9 +1,16 @@
 #!/usr/bin/env bun
 /**
  * Builds the modules with UndefinedBehaviorSanitizer in trapping mode and
- * drives them through a workload that reaches every path the shipped build
- * takes: growth, in-place compaction, tombstone reuse, the SIMD group scan,
- * and the u64 bulk API.
+ * drives them through the arithmetic worth checking: growth, in-place
+ * compaction, tombstone reuse, the SIMD group scan, the seeded hash, the
+ * bulk API on both modules, and the upsert paths — including the u64
+ * lane-crossing shifts, which are the only 64-bit arithmetic in the sources.
+ *
+ * It is not a coverage run. The capacity ceiling and the argument-rejection
+ * paths are left to the Bun suite, which reaches them far more cheaply than
+ * filling 917,504 slots here would. -fsanitize=undefined also excludes
+ * unsigned-integer-overflow, so mix_u32()'s multiplies go unchecked; they
+ * are defined behaviour, and the table depends on them wrapping.
  *
  * Trapping mode lowers each UBSan report to an `unreachable` instruction, so
  * it needs no runtime and links under -nostdlib. Undefined behaviour that
@@ -85,6 +92,7 @@ function build(): void {
 interface TableExports {
   readonly memory: WebAssembly.Memory;
   init(expectedEntries: number): number;
+  set_seed(seed: number): number;
   has_get(key: number): number;
   delete_key(key: number): number;
   shrink_to_fit(): number;
@@ -118,6 +126,8 @@ interface U32Exports extends TableExports {
 
 interface U64Exports extends TableExports {
   set(key: number, lo: number, hi: number): number;
+  get_or_insert(key: number, lo: number, hi: number): number;
+  increment(key: number, deltaLo: number, deltaHi: number): number;
   set_many(keys: number, lo: number, hi: number, count: number): number;
   get_many(
     keys: number,
@@ -129,11 +139,11 @@ interface U64Exports extends TableExports {
   delete_many(keys: number, deleted: number, count: number): number;
   bulk_capacity(): number;
   bulk_keys_ptr(): number;
-  bulk_vals_lo_ptr(): number;
-  bulk_vals_hi_ptr(): number;
+  bulk_values_lo_ptr(): number;
+  bulk_values_hi_ptr(): number;
   bulk_flags_ptr(): number;
-  scan_vals_lo_ptr(): number;
-  scan_vals_hi_ptr(): number;
+  scan_values_lo_ptr(): number;
+  scan_values_hi_ptr(): number;
 }
 
 async function instantiate<T extends TableExports>(name: string): Promise<T> {
@@ -194,6 +204,9 @@ async function exerciseU32(): Promise<number> {
   const memory = new DataView(wasm.memory.buffer);
 
   assert(wasm.init(0) === STATUS_OK, module, "init failed");
+  // Seeded, so mix_u32() runs on something other than the zero seed the
+  // module holds until a binding sets one.
+  assert(wasm.set_seed(0xc0ffee01) === STATUS_OK, module, "set_seed failed");
 
   const lastValue = wasm.last_value_ptr();
   const keysPtr = wasm.scan_keys_ptr();
@@ -374,25 +387,36 @@ async function exerciseU64(): Promise<number> {
   const memory = new DataView(wasm.memory.buffer);
 
   assert(wasm.init(0) === STATUS_OK, module, "init failed");
+  assert(wasm.set_seed(0xc0ffee02) === STATUS_OK, module, "set_seed failed");
+
+  // Only the low lane is compared by checkScan; the high lane is tracked
+  // alongside so the scan can be held to it too, which a scan that staged
+  // the low lane correctly and the high lane from the wrong entry would
+  // otherwise pass.
+  const expected = new Map<number, number>();
+  const expectedHi = new Map<number, number>();
 
   const lastValue = wasm.last_value_ptr();
   const scanKeys = wasm.scan_keys_ptr();
-  const scanLo = wasm.scan_vals_lo_ptr();
-  const readStaged = (i: number): [number, number] => [
-    memory.getUint32(scanKeys + i * 4, true),
-    memory.getUint32(scanLo + i * 4, true),
-  ];
+  const scanLo = wasm.scan_values_lo_ptr();
+  const scanHi = wasm.scan_values_hi_ptr();
+  const readStaged = (i: number): [number, number] => {
+    const key = memory.getUint32(scanKeys + i * 4, true);
+    assert(
+      memory.getUint32(scanHi + i * 4, true) === expectedHi.get(key),
+      module,
+      `scan staged the wrong high lane for ${key}`,
+    );
+    return [key, memory.getUint32(scanLo + i * 4, true)];
+  };
 
   const bulkKeys = wasm.bulk_keys_ptr();
-  const bulkLo = wasm.bulk_vals_lo_ptr();
-  const bulkHi = wasm.bulk_vals_hi_ptr();
+  const bulkLo = wasm.bulk_values_lo_ptr();
+  const bulkHi = wasm.bulk_values_hi_ptr();
   const bulkFlags = wasm.bulk_flags_ptr();
   const batch = Math.min(BATCH, wasm.bulk_capacity());
 
   const next = random(0x9e3779b9);
-  // Only the low lane is compared against; the high lane is derived from it
-  // so a batch that crossed the lanes still shows up as a mismatch.
-  const expected = new Map<number, number>();
   let operations = 0;
 
   while (operations < OPERATIONS) {
@@ -410,7 +434,10 @@ async function exerciseU64(): Promise<number> {
       module,
       "set_many failed",
     );
-    for (const key of keys) expected.set(key, (key ^ 0xa5a5a5a5) >>> 0);
+    for (const key of keys) {
+      expected.set(key, (key ^ 0xa5a5a5a5) >>> 0);
+      expectedHi.set(key, ~key >>> 0);
+    }
 
     assert(
       wasm.get_many(bulkKeys, bulkLo, bulkHi, bulkFlags, batch) === STATUS_OK,
@@ -444,12 +471,16 @@ async function exerciseU64(): Promise<number> {
       module,
       `delete_many removed ${removed}, expected ${distinct}`,
     );
-    for (let i = 0; i < removals; i++) expected.delete(keys[i]!);
+    for (let i = 0; i < removals; i++) {
+      expected.delete(keys[i]!);
+      expectedHi.delete(keys[i]!);
+    }
 
     // Single-key paths share the engine but not the entry points.
     const key = next() % KEY_SPACE;
     assert(wasm.set(key, key, 0) === STATUS_OK, module, `set(${key}) failed`);
     expected.set(key, key);
+    expectedHi.set(key, 0);
     assert(wasm.has_get(key) === 1, module, `has_get(${key}) missed`);
     assert(
       memory.getUint32(lastValue, true) === key,
@@ -464,7 +495,90 @@ async function exerciseU64(): Promise<number> {
   assert(wasm.shrink_to_fit() === STATUS_OK, module, "shrink_to_fit failed");
   checkScan(module, wasm, expected, readStaged);
 
+  exerciseU64Upserts(wasm, memory, next, expected, expectedHi);
+  checkScan(module, wasm, expected, readStaged);
+  operations += OPERATIONS / 4;
+
   return operations;
+}
+
+/**
+ * Drives the u64 get_or_insert and increment.
+ *
+ * increment holds the only 64-bit arithmetic in the sources — it reassembles
+ * the lanes, adds, and splits them again — so it is the one place a shift
+ * past the word width or a lane crossing could hide, and the reason this
+ * exists separately from the u32 counterpart.
+ */
+function exerciseU64Upserts(
+  wasm: U64Exports,
+  memory: DataView,
+  next: () => number,
+  expected: Map<number, number>,
+  expectedHi: Map<number, number>,
+): void {
+  const module = "swiss_u64";
+  const lastValue = wasm.last_value_ptr();
+
+  const readLatch = (): [lo: number, hi: number] => [
+    memory.getUint32(lastValue, true),
+    memory.getUint32(lastValue + 4, true),
+  ];
+
+  for (let op = 0; op < OPERATIONS / 4; op++) {
+    const key = next() % KEY_SPACE;
+
+    if (next() % 2 === 0) {
+      const lo = next();
+      const hi = next();
+      assert(
+        wasm.get_or_insert(key, lo, hi) === STATUS_OK,
+        module,
+        `get_or_insert(${key}) failed`,
+      );
+
+      const present = expected.has(key);
+      const storedLo = present ? expected.get(key)! : lo;
+      const storedHi = present ? expectedHi.get(key)! : hi;
+      expected.set(key, storedLo);
+      expectedHi.set(key, storedHi);
+
+      const [gotLo, gotHi] = readLatch();
+      assert(
+        gotLo === storedLo && gotHi === storedHi,
+        module,
+        `get_or_insert(${key}) latched the wrong lanes`,
+      );
+    } else {
+      // Deltas span the full 64 bits, so the low lane carries often and the
+      // add is not a 32-bit one in disguise.
+      const deltaLo = next();
+      const deltaHi = next();
+      assert(
+        wasm.increment(key, deltaLo, deltaHi) === STATUS_OK,
+        module,
+        `increment(${key}) failed`,
+      );
+
+      const current =
+        (BigInt(expectedHi.get(key) ?? 0) << 32n) |
+        BigInt(expected.get(key) ?? 0);
+      const delta = (BigInt(deltaHi) << 32n) | BigInt(deltaLo);
+      const sum = BigInt.asUintN(64, current + delta);
+
+      const storedLo = Number(sum & 0xffff_ffffn);
+      const storedHi = Number(sum >> 32n);
+      expected.set(key, storedLo);
+      expectedHi.set(key, storedHi);
+
+      const [gotLo, gotHi] = readLatch();
+      assert(
+        gotLo === storedLo && gotHi === storedHi,
+        module,
+        `increment(${key}) latched the wrong lanes`,
+      );
+    }
+  }
 }
 
 build();

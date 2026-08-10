@@ -233,8 +233,8 @@ their addresses:
 ```c
 uint32_t bulk_capacity(void);     // 65536 keys
 uint32_t bulk_keys_ptr(void);
-uint32_t bulk_vals_lo_ptr(void);
-uint32_t bulk_vals_hi_ptr(void);
+uint32_t bulk_values_lo_ptr(void);
+uint32_t bulk_values_hi_ptr(void);
 uint32_t bulk_flags_ptr(void);
 ```
 
@@ -243,7 +243,7 @@ module exports their addresses, so JavaScript never picks an offset that
 could alias the table banks.
 
 `scan` stages into a second set of buffers of its own, reached through
-`scan_keys_ptr`, `scan_vals_lo_ptr`, and `scan_vals_hi_ptr`. Sharing the bulk
+`scan_keys_ptr`, `scan_values_lo_ptr`, and `scan_values_hi_ptr`. Sharing the bulk
 buffers would be correct for the shipped binding, which copies each window
 out before it issues anything else, and wrong for anyone else holding the
 instance: a caller that staged a batch, walked the table, then issued the
@@ -325,7 +325,7 @@ and `create()` routes through `load()` for the same reason.
 
 Capacity is `1 << 20` slots per bank, giving 917,504 live entries at the 7/8
 load factor. Override it at build time with `SWISS_MAX_CAPACITY_LOG2`, a
-power-of-two exponent in `[4, 26]` — a power of two because the mask
+power-of-two exponent in `[4, 25]` — a power of two because the mask
 arithmetic depends on it. The C sources take it as `-DMAX_CAPACITY_LOG2` and
 fall back to 20 via `#ifndef`, and the build script sizes linear memory from
 the same number, so there are no longer two places to keep in step.

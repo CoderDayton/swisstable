@@ -91,13 +91,17 @@
  * scripts/build-wasm.ts applies the same bounds, but the sources compile
  * standalone with -DMAX_CAPACITY_LOG2 and would otherwise miscompute in
  * silence. Below 4 a bank holds less than one SIMD group, so a group load
- * would run past it. Above 26 the two banks and the staging buffers no
- * longer address inside wasm32's 4 GiB; further out still, MAX_LIVE()'s
- * 32-bit product wraps at 30 and every load-factor decision inverts, and
- * at 32 the shift below is undefined.
+ * would run past it. Above 25 h1() runs out of bits: it discards the 7 the
+ * fingerprint consumes, so it yields 25, and a wider mask would leave the
+ * upper half of the slot space unreachable as a probe start — still correct,
+ * since probing enumerates every group regardless, but with probe lengths
+ * roughly doubled and the load factor no longer describing the table.
+ * Further out the two banks and the staging buffers stop addressing inside
+ * wasm32's 4 GiB at 27, MAX_LIVE()'s 32-bit product wraps at 30, and at 32
+ * the shift below is undefined.
  */
-#if MAX_CAPACITY_LOG2 < 4 || MAX_CAPACITY_LOG2 > 26
-#error "MAX_CAPACITY_LOG2 must be in [4, 26]"
+#if MAX_CAPACITY_LOG2 < 4 || MAX_CAPACITY_LOG2 > 25
+#error "MAX_CAPACITY_LOG2 must be in [4, 25]"
 #endif
 
 #define MAX_CAPACITY (1u << MAX_CAPACITY_LOG2)
@@ -508,6 +512,9 @@ static int32_t ensure_insert_space(void) {
     g_mask = initial_capacity - 1u;
     g_size = 0;
     g_growth_left = MAX_LIVE(initial_capacity);
+    /* Creating the slot space is an event a cursor cannot be held across,
+     * the same as init() and clear(); see g_generation. */
+    g_generation += 1u;
     return STATUS_OK;
   }
 
@@ -522,6 +529,12 @@ static int32_t ensure_insert_space(void) {
      * Only the load factor decides that the table is full, so the ceiling
      * stays MAX_LIVE(MAX_CAPACITY) entries. A table already at MAX_CAPACITY
      * cannot grow, and falls through to an in-place compaction instead.
+     *
+     * The fall-through is also where the 25/32 line stops protecting the
+     * table: doubling is unavailable, so a workload sitting just under
+     * MAX_LIVE(MAX_CAPACITY) and alternating insert with delete compacts on
+     * every insert, at O(MAX_CAPACITY) each. Raise the exponent or shard
+     * rather than running a table at its ceiling under churn.
      */
     return STATUS_CAPACITY_EXCEEDED;
   }
@@ -652,17 +665,36 @@ int32_t init(uint32_t expected_entries) {
 }
 
 /*
- * Grows the table so `entries` fit without a further rehash, preserving
- * its contents. A no-op when the current capacity already suffices.
+ * Grows the table so `entries` total fit without a further rehash,
+ * preserving its contents. A no-op when the live bank already has room.
  */
 __attribute__((export_name("reserve")))
 int32_t reserve(uint32_t entries) {
   if (g_capacity == 0) return init(entries);
-  if (entries <= MAX_LIVE(g_capacity)) return STATUS_OK;
 
-  const uint32_t next_capacity = capacity_for_entries(entries);
-  if (entries > MAX_LIVE(next_capacity)) return STATUS_CAPACITY_EXCEEDED;
+  /*
+   * An insert consumes growth only when it takes an EMPTY slot, so
+   * g_growth_left is the worst-case budget, and capacity alone does not
+   * decide whether the next insert rehashes. A table whose growth went to
+   * since-deleted entries has the capacity for `entries` and rehashes on
+   * the next one regardless.
+   */
+  if (entries <= g_size || entries - g_size <= g_growth_left) {
+    return STATUS_OK;
+  }
 
+  uint32_t next_capacity = g_capacity;
+
+  if (entries > MAX_LIVE(g_capacity)) {
+    next_capacity = capacity_for_entries(entries);
+    if (entries > MAX_LIVE(next_capacity)) return STATUS_CAPACITY_EXCEEDED;
+  }
+
+  /*
+   * Otherwise `entries` fit at this capacity and only the tombstones are in
+   * the way, so a rehash in place is enough: it restores growth_left to
+   * MAX_LIVE(capacity) - size, which covers them by the test above.
+   */
   return rehash(next_capacity);
 }
 

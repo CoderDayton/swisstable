@@ -31,14 +31,14 @@ describe("scan and bulk staging buffers", () => {
 
     const scan = [
       ["scan_keys", Number(wasm.scan_keys_ptr!()), window * 4],
-      ["scan_vals_lo", Number(wasm.scan_vals_lo_ptr!()), window * 4],
-      ["scan_vals_hi", Number(wasm.scan_vals_hi_ptr!()), window * 4],
+      ["scan_vals_lo", Number(wasm.scan_values_lo_ptr!()), window * 4],
+      ["scan_vals_hi", Number(wasm.scan_values_hi_ptr!()), window * 4],
     ] as const;
 
     const bulk = [
       ["bulk_keys", Number(wasm.bulk_keys_ptr!()), batch * 4],
-      ["bulk_vals_lo", Number(wasm.bulk_vals_lo_ptr!()), batch * 4],
-      ["bulk_vals_hi", Number(wasm.bulk_vals_hi_ptr!()), batch * 4],
+      ["bulk_vals_lo", Number(wasm.bulk_values_lo_ptr!()), batch * 4],
+      ["bulk_vals_hi", Number(wasm.bulk_values_hi_ptr!()), batch * 4],
       ["bulk_flags", Number(wasm.bulk_flags_ptr!()), batch],
     ] as const;
 
@@ -93,8 +93,8 @@ describe("scan and bulk staging buffers", () => {
 
     const batch = Number(wasm.bulk_capacity!());
     const keysPtr = Number(wasm.bulk_keys_ptr!());
-    const loPtr = Number(wasm.bulk_vals_lo_ptr!());
-    const hiPtr = Number(wasm.bulk_vals_hi_ptr!());
+    const loPtr = Number(wasm.bulk_values_lo_ptr!());
+    const hiPtr = Number(wasm.bulk_values_hi_ptr!());
 
     const buffer = wasm.memory.buffer;
     const keys = new Uint32Array(buffer, keysPtr, batch);
@@ -104,8 +104,8 @@ describe("scan and bulk staging buffers", () => {
     // Something for the walk to find, so scan() has entries to stage.
     for (let i = 0; i < 500; i += 1) wasm.set!(i, i * 11, i * 13);
 
-    // Stage a batch, then walk the table before issuing it — the ordering
-    // the shared buffers used to make silently wrong.
+    // Stage a batch, then walk the table before issuing it: the ordering a
+    // scan sharing the bulk buffers would corrupt without saying so.
     const COUNT = 8;
     for (let i = 0; i < COUNT; i += 1) {
       keys[i] = 90_000 + i;
@@ -122,7 +122,7 @@ describe("scan and bulk staging buffers", () => {
 
     expect(Number(wasm.set_many!(keysPtr, loPtr, hiPtr, COUNT))).toBe(0);
 
-    // And the module must have stored those, not the walk's entries.
+    // The module must have stored those, not the walk's entries.
     for (let i = 0; i < COUNT; i += 1) {
       expect(wasm.has_get!(90_000 + i)).toBe(1);
       const latched = new Uint32Array(buffer, Number(wasm.last_value_ptr!()), 2);

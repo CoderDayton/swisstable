@@ -53,6 +53,22 @@
  */
 #define SCAN_WINDOW BULK_CAPACITY
 
+/*
+ * Slots this module's table can reach, as a power-of-two exponent.
+ *
+ * One lower than swiss_u32.c: a 12-byte payload makes each bank half again
+ * as wide, and three of them have to address inside wasm32 — see the
+ * _Static_assert in swiss_core.h. At 7/8 that is 58,720,256 live entries.
+ *
+ * It costs address space, not memory: an instance reserves its static data
+ * and grows into a bank only as the table reaches it.
+ *
+ * Guarded so scripts/build-wasm.ts can override it with -D.
+ */
+#ifndef MAX_CAPACITY_LOG2
+#define MAX_CAPACITY_LOG2 26
+#endif
+
 #include "swiss_core.h"
 
 /*
@@ -103,8 +119,8 @@ static int32_t set_one(uint32_t key, uint32_t lo, uint32_t hi) {
   const int32_t status = upsert_slot(key, &slot);
   if (status != STATUS_OK) return status;
 
-  g_entries[g_active_bank][slot].lo = lo;
-  g_entries[g_active_bank][slot].hi = hi;
+  g_entries[slot].lo = lo;
+  g_entries[slot].hi = hi;
 
   return STATUS_OK;
 }
@@ -137,7 +153,7 @@ int32_t get_or_insert(uint32_t key, uint32_t lo, uint32_t hi) {
   const int32_t status = upsert_slot_tracked(key, &slot, &inserted);
   if (status != STATUS_OK) return status;
 
-  Entry *entry = &g_entries[g_active_bank][slot];
+  Entry *entry = &g_entries[slot];
 
   if (inserted) {
     entry->lo = lo;
@@ -164,7 +180,7 @@ int32_t increment(uint32_t key, uint32_t delta_lo, uint32_t delta_hi) {
   const int32_t status = upsert_slot_tracked(key, &slot, &inserted);
   if (status != STATUS_OK) return status;
 
-  Entry *entry = &g_entries[g_active_bank][slot];
+  Entry *entry = &g_entries[slot];
 
   const uint64_t current =
     inserted ? 0u : ((uint64_t)entry->hi << 32) | (uint64_t)entry->lo;
@@ -270,8 +286,8 @@ int32_t get_many(
     if (slot == UINT32_MAX) {
       los[i] = 0; his[i] = 0; found[i] = 0;
     } else {
-      los[i] = g_entries[g_active_bank][slot].lo;
-      his[i] = g_entries[g_active_bank][slot].hi;
+      los[i] = g_entries[slot].lo;
+      his[i] = g_entries[slot].hi;
       found[i] = 1;
     }
   }

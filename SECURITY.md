@@ -22,9 +22,10 @@ memory and nothing else, and cannot reach past it — a bug in the C is
 confined to the instance's memory by the WebAssembly sandbox, which is the
 main reason the table is compiled rather than written in JavaScript.
 
-The modules are built `-nostdlib` with no allocator and never call
-`memory.grow`, so there is no allocation path to exhaust and no `malloc` to
-corrupt.
+The modules are built `-nostdlib` with no allocator, so there is no `malloc`
+to corrupt. Linear memory grows only when a rehash reaches for its next
+bank. A host that refuses the growth gets a capacity error, and the table is
+left exactly as it was.
 
 ## In scope
 
@@ -64,14 +65,25 @@ plain memory with no atomics, and sharing an instance across workers
 corrupts it. Share the compiled `WebAssembly.Module` instead and give each
 worker its own instance.
 
-**Capacity is fixed at build time.** Exceeding it throws `RangeError`
-rather than growing. An input that drives a table past 917,504 entries is a
-capacity-planning problem in the calling service.
+**Capacity is bounded** at 117,440,512 entries for `SwissU32ToU32` and
+58,720,256 for `SwissU32ToU64`. Exceeding it throws `RangeError` rather than
+growing. If untrusted input decides how many entries a table holds, that is
+a capacity-planning problem in the calling service. The ceiling is high
+enough that such input reaches host memory first.
 
-**Every instance reserves its full linear memory up front** — 21 MiB for
-`SwissU32ToU32`, 29 MiB for `SwissU32ToU64` — committed by page, so an empty
-one costs about 1.7 MiB RSS. Code that creates a table per request and never
-calls `dispose()` will accumulate them until the collector runs.
+**An instance never hands memory back.** It starts at 1.25 MiB
+(`SwissU32ToU32`) or 1.75 MiB (`SwissU32ToU64`) and grows with the table.
+Neither `clear()` nor `shrinkToFit()` returns pages, so an instance holds
+the high-water mark of every bank it used. Code that creates a table per
+request and never calls `dispose()` accumulates them until the collector
+runs.
+
+**Each module declares a large maximum memory**, 3.4 GiB for
+`SwissU32ToU32` and 2.4 GiB for `SwissU32ToU64`. This is address space, not
+a reservation, and no page is committed until a table reaches it. A
+memory-constrained or 32-bit host may still decline it at instantiation,
+which surfaces as a construction failure. Build with a lower
+`SWISS_MAX_CAPACITY_LOG2` for those hosts.
 
 ## Supported versions
 

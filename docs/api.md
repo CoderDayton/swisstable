@@ -44,10 +44,10 @@ validated. That cost is real and you only pay it for a source that needs it:
 
 | Source | `getMany` over 100k keys |
 | --- | --- |
-| `Uint32Array`, `Int32Array` | 8.1 ns/key |
-| `Float64Array` | 8.9 ns/key |
-| plain `number[]` | 16.9 ns/key |
-| `BigUint64Array` | 82.9 ns/key |
+| `Uint32Array`, `Int32Array` | 5.3 ns/key |
+| `Float64Array` | 8.1 ns/key |
+| plain `number[]` | 8.0 ns/key |
+| `BigUint64Array` | 32 ns/key |
 
 If you control the data, keep it in a `Uint32Array`. The rest exist so
 interop is possible, not so it is free.
@@ -73,43 +73,42 @@ machine int32, which is why keys above `2^31` cost no more than keys below
 it. Where the caller keeps its keys still matters; see
 [performance.md](performance.md#where-the-callers-keys-are-stored).
 
-**Capacity is fixed at build time.** The modules are freestanding and link
-without an allocator, so the ceiling is `1 << 20` slots — 917,504 live
-entries at the 7/8 load factor. Requests past it throw `RangeError`. Rebuild
-with `SWISS_MAX_CAPACITY_LOG2` set to a different power-of-two exponent in
-`[4, 25]` to move it either way; the build script sizes linear memory from the
-same number.
+**Capacity is bounded.** The u32 module holds `1 << 27` slots, or
+117,440,512 live entries at the 7/8 load factor. The u64 module holds
+`1 << 26` slots, or 58,720,256 entries; its entries are wider, so three of
+its banks run out of wasm32 address space an exponent earlier.
+
+Requests past the ceiling throw `RangeError`, and so does an operation the
+host refuses to grow linear memory for. Rebuild with a lower
+`SWISS_MAX_CAPACITY_LOG2` to cap what a module asks the host for.
 
 Run a table below its ceiling, not at it. A table holding close to the maximum
 while inserting and deleting at the same rate has no room left to grow into,
-so it compacts on every insert instead of amortizing — raise the exponent, or
+so it compacts on every insert instead of amortizing. Raise the exponent or
 shard across instances.
 
-**Each module instance owns exactly one table, and reserves its whole budget
-up front.** The banks are static arrays, so an instance reserves 21 MiB (u32)
-or 29 MiB (u64) of linear memory from instantiation whether it holds one
-entry or its maximum. The reservation is address space and is committed page
-by page as the table touches it, so a small table still resides small — but
-two tables mean two instances and twice the reservation. See
-[performance.md](performance.md#memory) for what an entry costs. `create()`
-shares one compiled module across every table it makes; with `load`, compile
-once with `WebAssembly.compile` and pass the module in each time. Several
-instances alongside each other are shown in
-[`examples/04-multiple-tables.ts`](../examples/04-multiple-tables.ts). For
-many small tables, build a second pair of modules with a lower
-`SWISS_MAX_CAPACITY_LOG2`: at `2^16` a u32 instance costs 4.1 MiB instead of
-21, capped at 57,344 entries.
+**Each module instance owns exactly one table, and grows into it.** An
+instance starts at 1.25 MiB (u32) or 1.75 MiB (u64), which is its staging
+buffers and stack. From there it grows linear memory as the table reaches
+each new bank, so an instance costs what it holds rather than what it could
+hold. See [performance.md](performance.md#memory) for what an entry costs.
+
+`create()` shares one compiled module across every table it makes. With
+`load`, compile once with `WebAssembly.compile` and pass the module in each
+time. Several instances alongside each other are shown in
+[`examples/04-multiple-tables.ts`](../examples/04-multiple-tables.ts).
 
 **Dropping a table does not release it promptly.** Its memory belongs to the
 `WebAssembly.Instance` behind it and comes back when the garbage collector
 runs, not when the last reference goes out of scope — so a table built per
-request holds its reservation until then, and a burst of them holds several
-at once. Call `dispose()`, or bind the table with `using`, to hand the
+request holds its memory until then, and a burst of them holds several at
+once. Call `dispose()`, or bind the table with `using`, to hand the
 instance back at a point you choose. Reusing one long-lived table and
 calling `clear()` between rounds avoids the question entirely: one pass over
-the control bytes, no new reservation. Linear memory never shrinks, so
-neither `clear()` nor `shrinkToFit()` returns pages to the host; they ready
-the table for the next round rather than shrink the process.
+the control bytes, and no bank it has not already grown into. Linear memory
+never shrinks, so neither `clear()` nor `shrinkToFit()` returns pages to the
+host; they ready the table for the next round rather than shrink the
+process. An instance holds the high-water mark of every bank it ever used.
 
 **A stored `0` is never confused with an absent key.** Presence is reported
 separately from the value, so no sentinel is overloaded anywhere in the API.
@@ -134,7 +133,7 @@ is involved, so this behaves identically on every runtime.
 
 The module is compiled on the first call and shared by every later one, so
 only instantiation is paid per table. Measured on Bun 1.3.14 / x64 Linux:
-1.49 ms for the first table, 152 µs for each one after, against 276 µs when
+2.2 ms for the first table, 167 µs for each one after, against 259 µs when
 recompiling bytes on every call.
 
 `expectedEntries` behaves as it does for `load`.
@@ -193,7 +192,7 @@ already compiled with `WebAssembly.compile`; pass the compiled module when
 creating several tables, to skip validation and codegen each time.
 
 `expectedEntries` sizes the table up front. It is the cheapest optimization
-available here — filling a pre-sized table is ~3.2x faster than growing one
+available here: filling a pre-sized table is 2.7x to 3.2x faster than growing one
 from empty, because growth rehashes through every doubling.
 
 Seeding matches `create`: random per instance, with `loadWithSeed(wasmBytes,
@@ -288,8 +287,8 @@ table.increment(key);                        // one of each
 ```
 
 `increment` always saves a crossing, because the read and the write are one
-operation whichever way the key falls. Counting 100,000 keys costs 6.1 ns
-each on Bun against 10.7 for `get` plus `set`; the gain is **1.25x to 1.8x**
+operation whichever way the key falls. Counting 100,000 keys costs 6.7 ns
+each on Bun against 12.0 for `get` plus `set`; the gain is **1.25x to 1.8x**
 depending on the engine.
 
 **`getOrInsert` only saves one when the key is absent.** Written out, the
@@ -299,7 +298,7 @@ second crossing is inside the branch:
 if (table.get(key) === undefined) table.set(key, value);   // hit: 1, miss: 2
 ```
 
-So the gain tracks the miss rate: **1.23x to 1.33x** over keys none of which
+So the gain tracks the miss rate: **1.22x to 1.29x** over keys none of which
 are present, and nothing at all over keys that are all present, where the two
 tie on every engine. Reach for it where misses are common, which is what
 memoizing is; on a read-mostly table `get` is still the right call.
@@ -315,12 +314,12 @@ reproduce with `bun run bench --scenario=upsert`.
 
 These stage a whole batch into memory the module owns and cross the boundary
 once per chunk instead of once per key — the widest margin over `Map` in the
-suite. Over 100,000 sparse keys on Bun, `setMany` fills at 6.6 ns/key against
-8.1 for a `set` loop and 65.1 for `Map`; `getMany` reads at 4.2 ns/key
-against 6.6 for a `get` loop and 10.0 for `Map`.
+suite. Over 100,000 sparse keys on Bun, `setMany` fills at 6.1 ns/key against
+8.5 for a `set` loop and 51.2 for `Map`; `getMany` reads at 3.9 ns/key
+against 5.1 for a `get` loop and 10.6 for `Map`.
 
-That 4.2 is with an `out` buffer passed back in; allocating fresh result
-arrays each call costs 5.6. Reuse them on a hot loop:
+That figure is with an `out` buffer passed back in. Allocating fresh result
+arrays each call costs 6.3 against 4.2. Reuse them on a hot loop:
 
 ```ts
 table.setMany(keys, values);
@@ -340,8 +339,8 @@ zeroed, so output buffers never carry stale values from a previous batch.
 `setMany` is **not atomic** on a capacity ceiling — see
 [Rules that apply everywhere](#rules-that-apply-everywhere).
 | `reserve(entries)` | `void` | Makes room for `entries` total without a further rehash, preserving contents. Rehashes when growth spent on since-deleted entries is what stands in the way, even where the capacity would suffice. No-op when the remaining growth already covers it. |
-| `shrinkToFit()` | `void` | Rehashes down to the smallest capacity holding the live entries. No-op if already there. |
-| `clear()` | `void` | Empties the table but **retains capacity**. Follow with `shrinkToFit()` to hand the slots back. |
+| `shrinkToFit()` | `void` | Rehashes down to the smallest capacity holding the live entries. No-op if already there. Recovers walk cost, not memory. |
+| `clear()` | `void` | Empties the table but **retains capacity**. Follow with `shrinkToFit()` to hand the slots back. Neither returns memory to the host. |
 | `dispose()` | `void` | Releases the module instance. Idempotent, and aliased as `Symbol.dispose` so a table works with `using`. Afterwards `size` and `capacity` read 0, and every method that would touch the instance throws. An iterator opened beforehand keeps walking, and keeps the instance alive until it ends. |
 
 ### Iteration
@@ -361,8 +360,8 @@ compiled ceiling.
 so the cost tracks the slot space rather than what is in it — and capacity
 only ever rises on its own: `reserve` and the growth path raise it, `clear`
 retains it, and a `delete` leaves a tombstone rather than a freed slot. A
-table that peaked at 100k entries and now holds 8 takes 41–72 µs per walk;
-`shrinkToFit()` brings that to 1.3–1.5 µs. Call it after a bulk removal on a
+table that peaked at 100k entries and now holds 8 takes 72–131 µs per walk;
+`shrinkToFit()` brings that to 1.3–1.9 µs. Call it after a bulk removal on a
 long-lived table that is walked repeatedly.
 
 **Order is unspecified.** It is slot order, which depends on the hash and
@@ -399,8 +398,8 @@ table.reserve(500_000);   // rehashes
 ```
 
 **Cost.** `forEach` allocates nothing per entry, and over 100k entries it
-beats `Map.prototype.forEach` by 2.3x on JavaScriptCore while losing to it by
-about 25% on V8. The iterator protocol is more expensive everywhere:
+beats `Map.prototype.forEach` by 2.6x on JavaScriptCore while losing to it by
+28% to 37% on V8. The iterator protocol is more expensive everywhere:
 `keys()`, `values()`, and `entries()` allocate a result record per entry the
 way the built-ins do, and `entries()` runs slower than `Map`'s, whose
 iterator is engine-internal. Prefer `forEach` when the values are needed and
@@ -454,8 +453,8 @@ value argument, so it must box the two lanes into a `U64Lanes` per entry.
 calls `callback(lo, hi, key, table)` and allocates nothing. When the callback
 discards the lanes the two run at the same speed, because escape analysis
 removes the object; when it keeps them it cannot, and `forEachLanes` is
-faster on every engine — by 29% on Bun, by 2.2x on Firefox. Prefer it on a hot
-path.
+faster on every engine: 19% to 33% on V8, and about 2x on JavaScriptCore and
+SpiderMonkey. Prefer it on a hot path.
 
 ```ts
 table.forEachLanes((lo, hi, key) => {

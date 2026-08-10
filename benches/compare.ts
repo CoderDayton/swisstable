@@ -544,15 +544,15 @@ function memorySummary(): string | null {
         `The tables are not on the heap and are not measured the same way. A ` +
         `slot costs ${report.slotBytes.u32} B (u32) or ` +
         `${report.slotBytes.u64} B (u64) of linear memory, both banks ` +
-        `counted — at the 7/8 load ceiling that is ` +
+        `counted. At the 7/8 load factor that is ` +
         `${perEntry(report.slotBytes.u32)} B/entry and ` +
         `${perEntry(report.slotBytes.u64)} B/entry, of which ` +
         `${perEntry(report.slotBytes.u32 / 2)} B and ` +
         `${perEntry(report.slotBytes.u64 / 2)} B are the live bank the ` +
-        `entries are actually in. An instance reserves ` +
-        `${(report.reservedBytes.u32 / (1024 * 1024)).toFixed(0)} MiB (u32) or ` +
-        `${(report.reservedBytes.u64 / (1024 * 1024)).toFixed(0)} MiB (u64) of ` +
-        `address space up front, committed page by page as it is touched.`
+        `entries are actually in. An instance starts at ` +
+        `${(report.reservedBytes.u32 / (1024 * 1024)).toFixed(2)} MiB (u32) or ` +
+        `${(report.reservedBytes.u64 / (1024 * 1024)).toFixed(2)} MiB (u64) ` +
+        `and grows linear memory as the table reaches each new bank.`
       );
     }
   }

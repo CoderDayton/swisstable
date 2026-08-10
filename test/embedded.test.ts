@@ -44,7 +44,7 @@ describe("create()", () => {
   });
 
   test("rejects an expected count beyond the compiled capacity", async () => {
-    await expect(SwissU32ToU32.create(2_000_000)).rejects.toThrow(RangeError);
+    await expect(SwissU32ToU32.create(200_000_000)).rejects.toThrow(RangeError);
   });
 
   // The compiled module is shared, so a caller must not be able to observe

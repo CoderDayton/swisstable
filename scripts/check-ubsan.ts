@@ -198,10 +198,45 @@ function checkScan(
   );
 }
 
+/**
+ * A `DataView` over a module's linear memory that survives a grow.
+ *
+ * The banks are reached by growing memory, which replaces the backing
+ * `ArrayBuffer` and detaches every view over it. The bindings rebuild theirs;
+ * this harness drives the raw exports, so it has to do the same. The check
+ * is buffer identity: a grow hands `memory.buffer` back as a new object, and
+ * a detached `DataView` throws even on `byteLength`.
+ */
+class Linear {
+  private view: DataView;
+
+  constructor(private readonly memory: WebAssembly.Memory) {
+    this.view = new DataView(memory.buffer);
+  }
+
+  private live(): DataView {
+    const buffer = this.memory.buffer;
+    if (this.view.buffer !== buffer) this.view = new DataView(buffer);
+    return this.view;
+  }
+
+  getUint8(offset: number): number {
+    return this.live().getUint8(offset);
+  }
+
+  getUint32(offset: number, littleEndian: boolean): number {
+    return this.live().getUint32(offset, littleEndian);
+  }
+
+  setUint32(offset: number, value: number, littleEndian: boolean): void {
+    this.live().setUint32(offset, value, littleEndian);
+  }
+}
+
 async function exerciseU32(): Promise<number> {
   const module = "swiss_u32";
   const wasm = await instantiate<U32Exports>(module);
-  const memory = new DataView(wasm.memory.buffer);
+  const memory = new Linear(wasm.memory);
 
   assert(wasm.init(0) === STATUS_OK, module, "init failed");
   // Seeded, so mix_u32() runs on something other than the zero seed the
@@ -274,7 +309,7 @@ async function exerciseU32(): Promise<number> {
  */
 function exerciseU32Upserts(
   wasm: U32Exports,
-  memory: DataView,
+  memory: Linear,
   next: () => number,
   expected: Map<number, number>,
 ): void {
@@ -323,7 +358,7 @@ function exerciseU32Upserts(
  */
 function exerciseU32Bulk(
   wasm: U32Exports,
-  memory: DataView,
+  memory: Linear,
   next: () => number,
   expected: Map<number, number>,
 ): void {
@@ -384,7 +419,7 @@ function exerciseU32Bulk(
 async function exerciseU64(): Promise<number> {
   const module = "swiss_u64";
   const wasm = await instantiate<U64Exports>(module);
-  const memory = new DataView(wasm.memory.buffer);
+  const memory = new Linear(wasm.memory);
 
   assert(wasm.init(0) === STATUS_OK, module, "init failed");
   assert(wasm.set_seed(0xc0ffee02) === STATUS_OK, module, "set_seed failed");
@@ -512,7 +547,7 @@ async function exerciseU64(): Promise<number> {
  */
 function exerciseU64Upserts(
   wasm: U64Exports,
-  memory: DataView,
+  memory: Linear,
   next: () => number,
   expected: Map<number, number>,
   expectedHi: Map<number, number>,

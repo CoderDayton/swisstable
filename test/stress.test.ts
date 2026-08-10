@@ -7,8 +7,18 @@ import {
   SwissU32ToU64,
 } from "../src/index.ts";
 
-/** Live entries at the 7/8 load factor over `1 << 20` slots. */
-const MAX_ENTRIES = 917_504;
+/**
+ * Live entries at the 7/8 load factor over the module's `1 << 27` slots.
+ *
+ * Reaching it would take about 1.2 GiB of banks and several minutes, so
+ * nothing here fills to it — what the tests below check is that a request
+ * past it is refused cleanly, and that ordinary tables well short of it
+ * grow without limit.
+ */
+const MAX_ENTRIES = ((1 << 27) * 7) / 8;
+
+/** Entries filled by the tests that want a table spanning many rehashes. */
+const MANY_ENTRIES = 1_400_000;
 
 /** xorshift32, so a failure reproduces from the seed alone. */
 function rng(seed: number): () => number {
@@ -56,30 +66,53 @@ describe("differential against Map", () => {
 });
 
 describe("capacity ceiling", () => {
-  test("fills to the compiled maximum and reads every entry back", async () => {
-    const table = await SwissU32ToU32.create(MAX_ENTRIES);
+  test("grows past the 2^20 slots the module used to top out at", async () => {
+    const table = await SwissU32ToU32.create();
 
-    for (let i = 0; i < MAX_ENTRIES; i += 1) table.set(i, i ^ 0xa5a5);
+    for (let i = 0; i < MANY_ENTRIES; i += 1) table.set(i, i ^ 0xa5a5);
 
-    expect(table.size).toBe(MAX_ENTRIES);
+    expect(table.size).toBe(MANY_ENTRIES);
 
     let wrong = 0;
-    for (let i = 0; i < MAX_ENTRIES; i += 1) {
+    for (let i = 0; i < MANY_ENTRIES; i += 1) {
       if (table.get(i) !== (i ^ 0xa5a5)) wrong += 1;
     }
     expect(wrong).toBe(0);
   });
 
-  // A full table has no room for a new key, but overwriting one that is
-  // already present needs none, so set() has to look for the key before it
-  // reserves space rather than after.
-  test("overwrites at capacity but rejects a new key", async () => {
-    const table = await SwissU32ToU32.create(MAX_ENTRIES);
-    for (let i = 0; i < MAX_ENTRIES; i += 1) table.set(i, i);
+  test("fills a pre-sized table and reads every entry back", async () => {
+    const table = await SwissU32ToU32.create(MANY_ENTRIES);
 
-    expect(() => table.set(5, 12_345)).not.toThrow();
-    expect(table.get(5)).toBe(12_345);
-    expect(() => table.set(MAX_ENTRIES + 1, 1)).toThrow(RangeError);
+    for (let i = 0; i < MANY_ENTRIES; i += 1) table.set(i, i ^ 0xa5a5);
+
+    expect(table.size).toBe(MANY_ENTRIES);
+
+    let wrong = 0;
+    for (let i = 0; i < MANY_ENTRIES; i += 1) {
+      if (table.get(i) !== (i ^ 0xa5a5)) wrong += 1;
+    }
+    expect(wrong).toBe(0);
+  });
+
+  // A refusal has to leave the table exactly as it was: reserve() computes
+  // its target capacity and checks the ceiling before it rehashes anything.
+  test("a refused reserve leaves every entry in place", async () => {
+    const table = await SwissU32ToU32.create(1000);
+    for (let i = 0; i < 1000; i += 1) table.set(i, i);
+
+    const before = table.capacity;
+
+    expect(() => table.reserve(MAX_ENTRIES + 1)).toThrow(RangeError);
+
+    expect(table.capacity).toBe(before);
+    expect(table.size).toBe(1000);
+
+    let wrong = 0;
+    for (let i = 0; i < 1000; i += 1) if (table.get(i) !== i) wrong += 1;
+    expect(wrong).toBe(0);
+
+    table.set(1, 12_345);
+    expect(table.get(1)).toBe(12_345);
   });
 
   test("rejects a create beyond capacity without poisoning later creates", async () => {
@@ -142,7 +175,7 @@ describe("reserve", () => {
     table.reserve(10);
     expect(table.capacity).toBe(before);
 
-    expect(() => table.reserve(2_000_000)).toThrow(RangeError);
+    expect(() => table.reserve(MAX_ENTRIES + 1)).toThrow(RangeError);
     expect(table.capacity).toBe(before);
 
     table.set(1, 1);

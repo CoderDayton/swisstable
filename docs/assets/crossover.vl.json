@@ -58,27 +58,27 @@
           {
             "entries": 2000,
             "runtime": "Bun 1.3",
-            "speedup": 0.68
+            "speedup": 0.65
           },
           {
             "entries": 2000,
             "runtime": "Node 24",
-            "speedup": 0.75
+            "speedup": 0.77
           },
           {
             "entries": 2000,
             "runtime": "Deno 2.9",
-            "speedup": 1.12
+            "speedup": 1.03
           },
           {
             "entries": 2000,
             "runtime": "Chrome 151",
-            "speedup": 0.79
+            "speedup": 0.8
           },
           {
             "entries": 2000,
             "runtime": "Firefox 153",
-            "speedup": 0.33
+            "speedup": 0.35
           },
           {
             "entries": 8000,
@@ -93,117 +93,117 @@
           {
             "entries": 8000,
             "runtime": "Deno 2.9",
-            "speedup": 2.92
+            "speedup": 2.71
           },
           {
             "entries": 8000,
             "runtime": "Chrome 151",
-            "speedup": 2.4
+            "speedup": 2.26
           },
           {
             "entries": 8000,
             "runtime": "Firefox 153",
-            "speedup": 1.71
+            "speedup": 1.69
           },
           {
             "entries": 16000,
             "runtime": "Bun 1.3",
-            "speedup": 1.41
+            "speedup": 1.37
           },
           {
             "entries": 16000,
             "runtime": "Node 24",
-            "speedup": 3.07
+            "speedup": 2.76
           },
           {
             "entries": 16000,
             "runtime": "Deno 2.9",
-            "speedup": 3.3
+            "speedup": 2.98
           },
           {
             "entries": 16000,
             "runtime": "Chrome 151",
-            "speedup": 2.56
+            "speedup": 2.61
           },
           {
             "entries": 16000,
             "runtime": "Firefox 153",
-            "speedup": 1.84
+            "speedup": 1.8
           },
           {
             "entries": 32000,
             "runtime": "Bun 1.3",
-            "speedup": 1.27
+            "speedup": 1.26
           },
           {
             "entries": 32000,
             "runtime": "Node 24",
-            "speedup": 3.19
+            "speedup": 2.82
           },
           {
             "entries": 32000,
             "runtime": "Deno 2.9",
-            "speedup": 3.42
+            "speedup": 3.08
           },
           {
             "entries": 32000,
             "runtime": "Chrome 151",
-            "speedup": 2.83
+            "speedup": 2.7
           },
           {
             "entries": 32000,
             "runtime": "Firefox 153",
-            "speedup": 1.94
+            "speedup": 1.79
           },
           {
             "entries": 128000,
             "runtime": "Bun 1.3",
-            "speedup": 1.53
+            "speedup": 1.46
           },
           {
             "entries": 128000,
             "runtime": "Node 24",
-            "speedup": 3.04
+            "speedup": 2.91
           },
           {
             "entries": 128000,
             "runtime": "Deno 2.9",
-            "speedup": 3.49
+            "speedup": 3.13
           },
           {
             "entries": 128000,
             "runtime": "Chrome 151",
-            "speedup": 2.93
+            "speedup": 2.74
           },
           {
             "entries": 128000,
             "runtime": "Firefox 153",
-            "speedup": 1.96
+            "speedup": 1.88
           },
           {
             "entries": 512000,
             "runtime": "Bun 1.3",
-            "speedup": 1.39
+            "speedup": 1.65
           },
           {
             "entries": 512000,
             "runtime": "Node 24",
-            "speedup": 2.68
+            "speedup": 2.81
           },
           {
             "entries": 512000,
             "runtime": "Deno 2.9",
-            "speedup": 3.14
+            "speedup": 3.27
           },
           {
             "entries": 512000,
             "runtime": "Chrome 151",
-            "speedup": 2.58
+            "speedup": 2.66
           },
           {
             "entries": 512000,
             "runtime": "Firefox 153",
-            "speedup": 1.78
+            "speedup": 1.63
           }
         ]
       },

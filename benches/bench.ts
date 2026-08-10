@@ -1424,11 +1424,10 @@ async function shrinkScenario(peak: number, remaining: number): Promise<void> {
 /**
  * Bytes of linear memory each slot costs.
  *
- * Two banks are reserved so a rehash has somewhere to move entries to, and
- * both are static arrays sized to the compiled ceiling — so a slot costs its
- * per-bank layout twice, whether or not a rehash is in progress. Kept in
- * step with `bankBytesPerSlot` in scripts/build-wasm.ts, which is what the
- * modules are actually linked against.
+ * Each module addresses two banks so a rehash has somewhere to move entries
+ * to, and the address extent a table holds covers both — so a slot costs its
+ * per-bank layout twice. Kept in step with `bankBytesPerSlot` in
+ * scripts/build-wasm.ts, which is the per-bank half of the same number.
  */
 const U32_BYTES_PER_SLOT = 2 * (1 + 8);
 const U64_BYTES_PER_SLOT = 2 * (1 + 12);
@@ -1681,9 +1680,9 @@ async function memoryScenario(keys: Uint32Array): Promise<void> {
       `in the live bank alone`,
   );
   console.log(
-    `  linear memory reserved per instance: ` +
-      `${(reserved.u32 / (1024 * 1024)).toFixed(0)} MiB (u32), ` +
-      `${(reserved.u64 / (1024 * 1024)).toFixed(0)} MiB (u64)`,
+    `  linear memory an instance starts at: ` +
+      `${(reserved.u32 / (1024 * 1024)).toFixed(2)} MiB (u32), ` +
+      `${(reserved.u64 / (1024 * 1024)).toFixed(2)} MiB (u64)`,
   );
 }
 

@@ -117,9 +117,34 @@ could place a key ahead of a live duplicate further along the same sequence.
 ## Two banks instead of an allocator
 
 The modules link `-nostdlib` and have no allocator, so a rehash cannot
-allocate a new table. Instead each module statically reserves **two** banks
-and rehashes by copying live entries from the active one into the idle one,
-then swapping.
+allocate a new table. Instead each module addresses **two** banks and
+rehashes by copying live entries from the active one into the idle one, then
+swapping.
+
+A bank is a computed offset above the module's static data, not a static
+array, and the module grows linear memory to reach one before writing to it.
+Static arrays would have to be sized at the ceiling, and `wasm-ld` reserves
+all static data at instantiation, so the largest table a module could hold
+would set what every instance paid for.
+
+Growing extends linear memory without moving what is already in it, so a
+pointer held across a grow stays valid. Only views built on the JavaScript
+side are detached, and the bindings rebuild those.
+
+Placement alternates with the bank index: bank 0 at the base of the heap,
+bank 1 two of its own lengths above it. Consecutive banks are then always
+disjoint, which is all a rehash needs, since only the old and the new are
+ever live together. Banks of the same parity overlap and reuse pages already
+committed, so repeated compaction at one capacity ping-pongs between two
+fixed regions rather than walking up a heap that can never shrink. A
+`reserve()` crossing several doublings at once produces a bank too large for
+the anchor to clear; that one goes directly above the live bank instead.
+
+Address extent is 3x a bank on the odd index and 1.5x on the even one, and
+which one a fill ends on depends on how many rehashes it took. The 3x case
+is what sets each module's ceiling, because three banks have to address
+inside wasm32's 4 GiB. Resident memory is lower, since same-parity banks
+share pages: measured at 1.8x to 1.9x a bank across a fill.
 
 The cost is double the memory. The benefit is that nothing on any path
 allocates, the module has no libc dependency, and capacity is knowable at
@@ -148,34 +173,33 @@ Interleaving removes one from the critical path — worth ~3 ns per lookup at
 
 ## Footprint
 
-The banks are fixed static arrays and the module links with
-`--initial-memory == --max-memory`, so an instance reserves its whole linear
-memory — 21 MiB for u32, 29 MiB for u64 — the moment it is instantiated,
-whether it holds one entry or its maximum.
+An instance reserves its static data and stack, 1.25 MiB for u32 and
+1.75 MiB for u64, and nothing proportional to the ceiling. Most of that is
+the staging buffers the bulk and scan APIs use, sized by `BULK_CAPACITY` and
+`SCAN_WINDOW` rather than by `MAX_CAPACITY`.
 
-Both figures are derived from `MAX_CAPACITY`, not written down beside it:
-`scripts/build-wasm.ts` computes them from bytes-per-slot times the slot
-count plus fixed overhead, so lowering `SWISS_MAX_CAPACITY_LOG2` shrinks the
-reservation instead of leaving it stranded at the default. At `2^16` a u32
-instance costs 4.1 MiB and a u64 instance 4.6 MiB, which is the build to
-reach for when the workload is many small tables rather than one large one.
+From there it grows with the table: 9 bytes per slot for u32, 13 for u64,
+against a capacity that is the next power of two above `entries * 8 / 7`.
+The `--max-memory` the module declares is the three-bank extent at its
+ceiling, 3.4 GiB for u32 and 2.4 GiB for u64. That is address space the host
+reserves and does not commit.
 
-Reserved is not resident. The host commits pages as they are touched, and an
+Declared is not resident. The host commits pages as they are touched, and an
 empty table touches only the control bytes of its initial 64 slots. Measured
-on x64 Linux:
+on x64 Linux with the module already compiled:
 
 | | RSS | virtual |
 | --- | --- | --- |
-| empty u32 table | +1.7 MiB | +15.6 MiB |
-| 64 empty u32 tables | +5.0 MiB | — |
-| one table after 900k inserts | +32.9 MiB | +16.6 MiB |
+| empty u32 table | +0.3 MiB | +0.0 MiB |
+| 64 empty u32 tables | +4.8 MiB | +1.0 MiB |
+| one table after 900k inserts | +26.3 MiB | +0.0 MiB |
 
-Two things follow. The first is that address space is claimed up front:
-virtual size barely moves across a fill that adds 27 MiB of resident memory.
-The second is that the marginal cost of an extra instance is small — roughly
-50 KiB once the first has paid for module compilation — so a program holding
-dozens of tables is fine, and the fixed cost that matters is per *process*,
-not per table.
+Two things follow. The first is that the declared maximum is not claimed:
+virtual size does not move across a fill that adds 26 MiB of resident
+memory, even though the module declares 3.4 GiB it may grow into. The second
+is that the marginal cost of an extra instance is about 75 KiB, so a program
+holding dozens of tables is fine, and the fixed cost that matters is per
+*process*, not per table.
 
 What this does not buy back is the small-table case. The reason `Map` wins
 below ~8k entries is the boundary crossing, not the footprint; see
@@ -192,10 +216,18 @@ the value from it. A packed `u64` return would instead box a `BigInt` on
 every lookup — ~14 ns, more than a second crossing would cost — and could not
 distinguish a stored `0` from absence anyway.
 
-**Views are built once.** The modules are linked with initial memory equal to
-maximum memory and never call `memory.grow`, so the backing `ArrayBuffer` is
-never detached or reallocated and a view stays valid for the module's
-lifetime.
+**Views are rebuilt after a grow.** A `memory.grow` replaces the backing
+`ArrayBuffer` and detaches every view over it, so each binding re-derives
+its cached views after any call that can rehash. The test is the length of a
+view it already holds: a detached typed array reports 0, which costs a field
+load, where reading `memory.buffer` would be a call into the engine's
+`Memory` object on a path that runs per `set`. The addresses never move,
+because every buffer the views cover is static data sitting below the heap.
+
+An open walk needs no such check. A grow only happens inside a rehash, a
+rehash bumps the generation counter, and the walk tests that counter before
+each window, so it is abandoned rather than allowed to read through a
+detached view.
 
 **`size` and `capacity` are read the same way**, through `size_ptr()` and
 `capacity_ptr()`. They are properties on the JavaScript side, and a property
@@ -323,12 +355,18 @@ that actually catches it is in the bindings — `load()` verifies every
 expected symbol is present on the instance and throws `TypeError` otherwise,
 and `create()` routes through `load()` for the same reason.
 
-Capacity is `1 << 20` slots per bank, giving 917,504 live entries at the 7/8
-load factor. Override it at build time with `SWISS_MAX_CAPACITY_LOG2`, a
-power-of-two exponent in `[4, 25]` — a power of two because the mask
-arithmetic depends on it. The C sources take it as `-DMAX_CAPACITY_LOG2` and
-fall back to 20 via `#ifndef`, and the build script sizes linear memory from
-the same number, so there are no longer two places to keep in step.
+Capacity is `1 << 27` slots per bank for u32, giving 117,440,512 live
+entries at the 7/8 load factor, and `1 << 26` for u64, giving 58,720,256.
+They differ because a u64 entry is wider and three of its banks run out of
+address space an exponent earlier. Each source carries its own exponent and
+asserts it against `sizeof(Entry)` at compile time.
+
+Override it at build time with `SWISS_MAX_CAPACITY_LOG2`, a power-of-two
+exponent in `[4, 29]`. A power of two because the mask arithmetic depends on
+it. The C sources take it as `-DMAX_CAPACITY_LOG2` and fall back to their
+own value via `#ifndef`. Lowering it caps how far one table can grow and how
+much address space the module asks the host for. It does not change what an
+instance reserves at construction, which is fixed by the staging buffers.
 
 ## Embedding
 

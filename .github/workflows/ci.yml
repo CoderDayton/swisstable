@@ -70,7 +70,7 @@ jobs:
       # Zig carries its own clang, lld, and headers, so the same release
       # compiles the same bytes on every host. The compare job below holds
       # that claim to account rather than asserting it in a comment.
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wasm-${{ matrix.os }}
           path: dist/wasm/*.wasm
@@ -106,7 +106,7 @@ jobs:
       # Handed to the test jobs rather than rebuilt there. A consumer installs
       # this package, never compiles it, so the artifact every platform should
       # be tested against is one build's output.
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: runner.os == 'Linux'
         with:
           name: dist
